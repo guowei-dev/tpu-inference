@@ -374,8 +374,8 @@ def make_rpa_kernel(config: schedule_lib.RPAConfig):
     out_shape = [
         jax.ShapeDtypeStruct(
             (
-                config.num_kv_heads,
                 config.total_q_tokens,
+                config.num_kv_heads,
                 config.num_q_heads_per_kv_head // q_packing,
                 q_packing,
                 config.head_dim,

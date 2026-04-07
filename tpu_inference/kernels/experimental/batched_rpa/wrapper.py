@@ -93,7 +93,7 @@ def prepare_inputs(
         aligned_num_q_heads_per_kv_head // q_packing,
         q_packing,
         aligned_head_dim,
-    ).swapaxes(0, 1))
+    ))
 
     # Pad keys and values head_dim
     actual_num_kv_heads_x2 = actual_num_kv_heads * 2
@@ -652,8 +652,7 @@ def ragged_paged_attention(
 
     # slice back to original shape if padded
     o_hbm_alias_q_hbm = (
-        o_hbm_alias_q_hbm[:, :, :num_q_heads_per_kv_head, :actual_head_dim].
-        transpose(1, 0, 2, 3).reshape(total_q_tokens, actual_num_q_heads,
+        o_hbm_alias_q_hbm[:, :, :num_q_heads_per_kv_head, :actual_head_dim].reshape(total_q_tokens, actual_num_q_heads,
                                       actual_head_dim))
 
     return o_hbm_alias_q_hbm, kv_cache

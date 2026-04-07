@@ -311,13 +311,15 @@ class BatchingORef(pipeline.BufferedRef):
             q_sz = jax.lax.select(is_last_k == 1, q_sz, 0)
             dma_list.append((q_src, q_sz, b))
 
+        num_kv_heads = o_hbm.shape[1]
         for i in range(len(dma_list)):
             q_src, q_sz, b = dma_list[i]
-            tpu_primitives.make_async_copy(
-                vmem_src.at[b, :, pl.ds(0, q_sz)],
-                o_hbm.at[:, pl.ds(q_src, q_sz)],
-                sem,
-            ).start()
+            for k in range(num_kv_heads):
+                tpu_primitives.make_async_copy(
+                    vmem_src.at[b, k, pl.ds(0, q_sz)],
+                    o_hbm.at[pl.ds(q_src, q_sz), k],
+                    sem,
+                ).start()
 
     def wait_out(
         self,
@@ -329,7 +331,7 @@ class BatchingORef(pipeline.BufferedRef):
         slot = self.current_wait_out_slot
         sem = self.sem_sends.at[slot]
         block_idx = grid_indices[0]
-
+        num_kv_heads = o_hbm.shape[1]
         total_sz = 0
         for b in range(self.batch_size):
             idx = block_idx * self.batch_size + b
@@ -340,8 +342,8 @@ class BatchingORef(pipeline.BufferedRef):
 
         flat_ref = o_hbm.reshape((-1, *o_hbm.shape[2:]))
         tpu_primitives.make_async_copy(
-            flat_ref.at[pl.ds(0, total_sz * o_hbm.shape[0])],
-            flat_ref.at[pl.ds(0, total_sz * o_hbm.shape[0])],
+            flat_ref.at[pl.ds(0, total_sz * num_kv_heads)],
+            flat_ref.at[pl.ds(0, total_sz * num_kv_heads)],
             sem,
         ).wait()
 
@@ -407,15 +409,16 @@ class BatchingQRef(pipeline.BufferedRef):
         for b in range(self.batch_size):
             q_src, q_sz = schedule.get_dma_q(block_idx, b)
             dma_list.append((q_src, q_sz, b))
+        num_kv_heads = q_hbm.shape[1]
 
         for i in range(len(dma_list)):
             q_src, q_sz, b = dma_list[i]
-            tpu_primitives.make_async_copy(
-                q_hbm.at[:, pl.ds(q_src, q_sz)],
-                vmem_dst.at[b, :, pl.ds(0, q_sz)],
-                sem,
-            ).start()
-
+            for k in range(num_kv_heads):
+                tpu_primitives.make_async_copy(
+                    q_hbm.at[pl.ds(q_src, q_sz), k],
+                    vmem_dst.at[b, k, pl.ds(0, q_sz)],
+                    sem,
+                ).start()
     def wait_in(
         self,
         src_ref: tuple[jax.Array, rpa_schedule.RPASchedule],
