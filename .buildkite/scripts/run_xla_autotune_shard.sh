@@ -52,23 +52,32 @@ AUTOTUNE_BASELINE_RUNS="${AUTOTUNE_BASELINE_RUNS:-3}"
 SHARED_ROOT="/tmp/kernel_tuning/xla_autotune"
 ARTIFACT_DIR_HOST="${SHARED_ROOT}/shard_${SLICE_INDEX}_of_${SLICE_COUNT}"
 ARTIFACT_DIR_CONTAINER="${ARTIFACT_DIR_HOST}"
+
+# Always wipe any leftover artifact dir from a previous build on this agent
+# VM so a re-trigger never picks up stale per-trial JSONs that the watcher
+# would publish before the new run overwrites them.
+rm -rf "${ARTIFACT_DIR_HOST}"
 mkdir -p "${ARTIFACT_DIR_HOST}"
 
 echo "[xla-autotune] shard ${SLICE_INDEX}/${SLICE_COUNT} → ${ARTIFACT_DIR_HOST}"
 
 # --------------------------------------------------------------------------
-# Host-side watcher: uploads each *.json + summary.jsonl exactly once as
-# soon as it appears.  Polls every 20 s.
+# Host-side watcher: uploads each *.json + summary.jsonl whenever the file
+# is new OR has been modified since the last upload (mtime-based). The
+# autotuner rewrites these files in place across trials, so we cannot
+# upload each filename only once.
 # --------------------------------------------------------------------------
 (
   cd "${ARTIFACT_DIR_HOST}"
-  declare -A UPLOADED=()
+  declare -A LAST_MTIME=()
   while true; do
     shopt -s nullglob
     for f in *.json summary.jsonl; do
-      if [[ -f "$f" && -z "${UPLOADED[$f]:-}" ]]; then
+      [[ -f "$f" ]] || continue
+      cur_mtime=$(stat -c %Y "$f" 2>/dev/null || echo 0)
+      if [[ "${LAST_MTIME[$f]:-0}" != "$cur_mtime" ]]; then
         if buildkite-agent artifact upload "$f"; then
-          UPLOADED["$f"]=1
+          LAST_MTIME["$f"]=$cur_mtime
         fi
       fi
     done

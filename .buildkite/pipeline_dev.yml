@@ -24,6 +24,22 @@
 #   .buildkite/xla_autotune/autotuner.py     OFAT driver
 #   .buildkite/xla_autotune/vllm_test_framework.py
 #
+# First-startup mitigation notes
+# ──────────────────────────────
+# The 397B model precompile is ~90 min cold-cache because every shard
+# sweeps ~36 backbone shapes (token_buckets × num_reqs).  Mitigations
+# wired up today:
+#   * Persistent JAX cache (run_in_docker.sh pulls from GCS at start and
+#     pushes back on exit) — gives warm-cache hits for baselines once a
+#     prior build has populated GCS.
+#   * Persistent model-weights cache at /mnt/disks/persist/models — weights
+#     load only once per agent VM lifetime.
+#   * Per-shard within-trial cache reuse — baseline_02/03 reuse the
+#     baseline_01 cache and finish in ~10 min instead of ~100 min.
+# Not mitigable: each *candidate* trial uses a unique extra XLA flag, so
+# its JAX cache key never hits a pre-warmed entry — candidate compile is
+# always cold (~90 min).
+#
 # Trigger via API (fork branch — full 40-char SHA, branch namespacing):
 #   curl -s -X POST -H "Authorization: Bearer $BUILDKITE_API_TOKEN" \
 #     -H "Content-Type: application/json" \

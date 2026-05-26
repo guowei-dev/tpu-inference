@@ -25,7 +25,7 @@ class VLLMTestResult:
     error_message: str = ""
 
 # =====================================================================
-# 用户配置区域 (User Configuration Area)
+# User Configuration Area
 # =====================================================================
 # DEFAULT_MODEL_NAME = "Qwen/Qwen3-0.6B"
 # DEFAULT_MODEL_NAME = "Qwen/Qwen3-30B-A3B-FP8"
@@ -35,7 +35,7 @@ DEFAULT_MODEL_NAME = "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8"
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8000
 
-# 模型特定配置
+# Model-specific vllm serve args
 MODEL_CONFIGS = {
     "Qwen/Qwen3-0.6B": [
         "--tensor-parallel-size=8",
@@ -101,7 +101,7 @@ MODEL_CONFIGS = {
     ]
 }
 
-# 模型特定环境变量配置
+# Model-specific env vars
 MODEL_ENV_CONFIGS = {
     "Qwen/Qwen3-30B-A3B-FP8": {
         "PHASED_PROFILING_DIR": "",
@@ -120,7 +120,7 @@ MODEL_ENV_CONFIGS = {
     }
 }
 
-# 环境变量
+# Default env / XLA flag settings
 XPROF_GCS_BASE = "gs://guoweij-inference-test/vllm-profile"
 EXTRA_XLA_FLAGS = [
     # "--xla_dump_hlo_as_proto",
@@ -237,7 +237,7 @@ if not os.environ.get("VLLM_IN_AUTOTUNER"):
     EXTRA_LIBTPU_INIT_ARGS.extend(autotuned_result_list)
 
 
-# Benchmark Serving 配置p
+# Benchmark Serving configs
 BENCHMARK_SCRIPT_PATH = "/workspace/bench_serving/benchmark_serving.py"
 MODEL_BENCHMARK_CONFIGS = {
     "Qwen/Qwen3.5-397B-A17B-FP8": [
@@ -256,7 +256,7 @@ MODEL_BENCHMARK_CONFIGS = {
         {"random-input-len": 512, "random-output-len": 256},
     ]
 }
-# 其他 benchmark_serving 参数
+# Other benchmark_serving args
 BENCHMARK_ARGS = {
     # "--num-warmups": "64",
     "--ignore-eos": True,
@@ -294,6 +294,11 @@ class VLLMTestParam:
     tpu_inference_commit: str = None
     vllm_commit: str = None
     torchtpu_vllm_commit: str = None
+    # Number of benchmark warmup runs to perform before the measured run.
+    # The vllm server itself is already precompiled; this is benchmark-client
+    # warmup (first-connection latency, HTTP keepalive, request scheduler
+    # state). The measured run is the last one; warmup results are discarded.
+    warmup_runs: int = 1
 
 
 
@@ -306,7 +311,7 @@ class VLLMTestFramework:
         self.dry_run = dry_run
         self.server_process = None
         
-        # 1. 创建实验目录
+        # 1. Create experiment directory
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.base_log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts/log")
         if self.params.tag:
@@ -316,7 +321,7 @@ class VLLMTestFramework:
         self.exp_dir = os.path.join(self.base_log_dir, folder_name)
         os.makedirs(self.exp_dir, exist_ok=True)
         
-        # 2. 初始化框架主日志
+        # 2. Initialise the framework main log
         self.main_log_file = os.path.join(self.exp_dir, "framework_main.log")
         logging.basicConfig(
             level=logging.INFO,
@@ -327,38 +332,38 @@ class VLLMTestFramework:
             ]
         )
         self.logger = logging.getLogger(__name__)
-        self.logger.info(f"实验目录已创建: {self.exp_dir}")
+        self.logger.info(f"Experiment directory created: {self.exp_dir}")
         
-        # 3. 清理旧实验目录
+        # 3. Clean up stale experiment directories
         self.cleanup_old_experiments()
         
-        # 4. 切换指定仓库的 commit
+        # 4. Check out requested repo commits
         self.checkout_repositories()
 
     def cleanup_old_experiments(self):
-        """清理旧的实验目录，只保留最新的3个，其余移动到 backup 目录"""
+        """Trim stale experiment directories — keep the latest 3 live, move the rest to backup."""
         backup_dir = os.path.join(self.base_log_dir, "backup")
         os.makedirs(backup_dir, exist_ok=True)
         
         import glob
         import shutil
         
-        # 获取所有匹配 EXP_ 的目录
+        # List all directories that match EXP_*
         exp_dirs = [d for d in glob.glob(os.path.join(self.base_log_dir, "EXP_*")) if os.path.isdir(d)]
-        # 按名称排序
+        # Sort by name
         exp_dirs.sort()
         
         if len(exp_dirs) > 3:
             dirs_to_move = exp_dirs[:-3]
-            self.logger.info(f"发现实验目录数量超过3个，正在清理 (保留最新的3个)...")
+            self.logger.info("More than 3 experiment directories found; trimming to the latest 3...")
             for d in dirs_to_move:
-                self.logger.info(f"移动 {d} 到 {backup_dir}")
+                self.logger.info(f"Moving {d} to {backup_dir}")
                 try:
                     shutil.move(d, backup_dir)
                 except Exception as e:
-                    self.logger.error(f"移动失败: {e}")
+                    self.logger.error(f"Move failed: {e}")
                     
-        # 清理 backup 目录中超过限制的旧实验
+        # Trim backup directory down to max_backups entries
         backup_dirs = [d for d in glob.glob(os.path.join(backup_dir, "EXP_*")) if os.path.isdir(d)]
         backup_dirs.sort()
         
@@ -372,16 +377,16 @@ class VLLMTestFramework:
             dirs_to_delete = []
             
         if dirs_to_delete:
-            self.logger.info(f"发现 backup 目录中实验数量超过 {max_backups} 个，正在清理...")
+            self.logger.info(f"Backup directory exceeds {max_backups} entries; pruning...")
             for d in dirs_to_delete:
-                self.logger.info(f"删除备份: {d}")
+                self.logger.info(f"Deleting backup: {d}")
                 try:
                     shutil.rmtree(d)
                 except Exception as e:
-                    self.logger.error(f"删除失败: {e}")
+                    self.logger.error(f"Delete failed: {e}")
 
     def checkout_repositories(self):
-        """根据传入的 commit hash 切换 tpu_inference, vllm 和 torchtpu_vllm 仓库"""
+        """Check out the supplied commit hashes for the tpu_inference, vllm and torchtpu_vllm repos."""
         repos = [
             ("tpu_inference", "/workspace/tpu_inference", self.params.tpu_inference_commit),
             ("vllm", "/workspace/vllm", self.params.vllm_commit),
@@ -389,13 +394,13 @@ class VLLMTestFramework:
         ]
         for name, path, commit in repos:
             if commit:
-                self.logger.info(f"准备切换 {name} 仓库 (路径: {path}) 至 commit: {commit}")
+                self.logger.info(f"Checking out {name} repo (path: {path}) at commit: {commit}")
                 if self.dry_run:
-                    self.logger.info(f"[Dry Run] 模拟执行: git checkout {commit} in {path}")
+                    self.logger.info(f"[Dry Run] Would run: git checkout {commit} in {path}")
                     continue
                 
                 if not os.path.exists(path):
-                    self.logger.error(f"仓库路径不存在: {path}，无法切换 commit。")
+                    self.logger.error(f"Repository path does not exist: {path}; cannot check out commit.")
                     raise FileNotFoundError(f"Repository path not found: {path}")
                 
                 try:
@@ -407,14 +412,14 @@ class VLLMTestFramework:
                         text=True,
                         check=True
                     )
-                    self.logger.info(f"{name} 仓库成功切换至 {commit}。\n输出信息: {result.stdout.strip()}")
+                    self.logger.info(f"{name} repo checked out at {commit}.\nOutput: {result.stdout.strip()}")
                 except subprocess.CalledProcessError as e:
-                    self.logger.error(f"{name} 仓库切换 commit 失败!\n错误信息: {e.stdout.strip()}")
+                    self.logger.error(f"{name} repo checkout FAILED.\nError: {e.stdout.strip()}")
                     raise RuntimeError(f"Failed to checkout {commit} in {path}") from e
 
 
     def setup_environment(self):
-        """设置并记录环境变量"""
+        """Configure the subprocess environment and record it to disk."""
         self.env = os.environ.copy()
         xla_flags = self.params.extra_xla_flags.copy()
         if self.params.dump_xla:
@@ -424,13 +429,13 @@ class VLLMTestFramework:
         for k, v in self.params.extra_env.items():
             self.env[k] = v  
         
-        # 注入模型特定的环境变量
+        # Inject model-specific env vars
         model_specific_env = self.params.model_env_configs.get(self.params.model_name, {})
         for k, v in model_specific_env.items():
             self.env[k] = v
         
         if self.params.verbose_debug_log:
-            self.logger.info("启用详细调试日志 (Verbose Debug Logs)")
+            self.logger.info("Verbose debug logs enabled")
             for k, v in self.params.verbose_debug_env.items():
                 self.env[k] = v
 
@@ -442,7 +447,7 @@ class VLLMTestFramework:
             if "PHASED_PROFILING_DIR" in self.env:
                 self.env.pop("PHASED_PROFILING_DIR")
         
-        # 将本次实验的关键配置写入文件
+        # Write the key configuration for this experiment to disk
         info_path = os.path.join(self.exp_dir, "experiment_info.txt")
         with open(info_path, "w") as f:
             f.write(f"Model Name: {self.params.model_name}\n")
@@ -470,25 +475,25 @@ class VLLMTestFramework:
 
     def _run_task(self, task_name, cmd_list, log_path=None, mode="w", result=None):
         """
-        核心执行逻辑：
-        1. 记录 .cmd 文件（包含具体的执行命令）
-        2. 记录 .log 文件（标准输出和错误）
+        Core execution flow:
+          1. Record a .cmd file containing the exact command that was run.
+          2. Record a .log file with stdout and stderr.
         """
         cmd_str = " ".join(cmd_list)
-        self.logger.info(f"开始执行任务 [{task_name}]")
+        self.logger.info(f"Starting task [{task_name}]")
         
         if result is not None:
             result.commands_run.append(cmd_list)
 
-        # 保存执行的具体命令
+        # Save the exact command that was run
         with open(os.path.join(self.exp_dir, f"task_{task_name}.cmd"), "w") as f:
             f.write(cmd_str)
 
         if self.dry_run:
-            self.logger.info(f"[Dry Run] 模拟执行命令: {cmd_str}")
+            self.logger.info(f"[Dry Run] Would run: {cmd_str}")
             return 0
 
-        # 执行命令并将输出重定向到独立的 log 文件
+        # Run the command and redirect its output to a dedicated log file
         if log_path is None:
             log_path = os.path.join(self.exp_dir, f"task_{task_name}.log")
         with open(log_path, mode) as log_file:
@@ -512,11 +517,11 @@ class VLLMTestFramework:
                     sys.stdout.write(char)
                     sys.stdout.flush()
             except KeyboardInterrupt:
-                print(f"\n[Ctrl+C] 正在终止任务 [{task_name}]...")
+                print(f"\n[Ctrl+C] Terminating task [{task_name}]...")
                 process.terminate()
                 process.wait()
-                print(f"任务 [{task_name}] 已终止。")
-                self.logger.warning(f"任务 [{task_name}] 被用户中断。")
+                print(f"Task [{task_name}] terminated.")
+                self.logger.warning(f"Task [{task_name}] interrupted by user.")
                 return 130
                 
             process.wait()
@@ -529,21 +534,21 @@ class VLLMTestFramework:
                     raise RuntimeError(f"Server crashed with code {server_code}")
 
         if process.returncode == 0:
-            self.logger.info(f"任务 [{task_name}] 执行成功。")
+            self.logger.info(f"Task [{task_name}] succeeded.")
         else:
-            self.logger.error(f"任务 [{task_name}] 失败，返回码: {process.returncode}。请查看 {log_path}")
+            self.logger.error(f"Task [{task_name}] FAILED with return code {process.returncode}. See {log_path}")
         return process.returncode
 
     def start_server(self):
-        """启动服务端，日志存入实验目录"""
-        self.logger.info("正在启动 vLLM Server...")
+        """Launch the vllm server, streaming its log to the experiment directory."""
+        self.logger.info("Starting vLLM server...")
         
-        # 根据模型名构建命令
+        # Build the vllm serve command for the chosen model
         cmd = ["vllm", "serve", self.params.model_name, "--port", str(self.params.port)]
         
-        # 获取模型特定配置
+        # Pick up model-specific vllm serve args
         extra_args = self.params.model_configs.get(self.params.model_name, [])
-        # 替换环境变量（如 ${HF_HOME}）
+        # Expand env-var placeholders such as ${HF_HOME}
         processed_args = []
         for arg in extra_args:
             if "${HF_HOME}" in arg and "HF_HOME" in os.environ:
@@ -553,16 +558,16 @@ class VLLMTestFramework:
         cmd.extend(processed_args)
         
         if self.dry_run:
-            self.logger.info(f"[Dry Run] 模拟启动 vLLM Server: {' '.join(cmd)}")
+            self.logger.info(f"[Dry Run] Would start vLLM server: {' '.join(cmd)}")
             return
 
         server_log_path = os.path.join(self.exp_dir, "vllm_server.log")
         
-        # 记录服务端命令
+        # Persist the server launch command
         with open(os.path.join(self.exp_dir, "vllm_server.cmd"), "w") as f:
             f.write(" ".join(cmd))
 
-        # 使用 PIPE 捕获输出，由守护线程处理日志和控制台打印
+        # Capture stdout via PIPE; a daemon thread writes to the log and to the console
         self.server_process = subprocess.Popen(
             cmd, env=self.env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, preexec_fn=os.setsid, text=True, errors='replace'
         )
@@ -584,69 +589,69 @@ class VLLMTestFramework:
             self._wait_for_port()
         finally:
             self.printing_server_output = False
-            self.logger.info("Server 启动阶段结束，停止控制台打印输出。")
+            self.logger.info("Server startup phase complete; stopping console output.")
 
     def _wait_for_port(self):
-        self.logger.info(f"等待端口 {self.params.port} 就绪...")
+        self.logger.info(f"Waiting for port {self.params.port} to be ready...")
         start = time.time()
         # while time.time() - start < 360000000000000000000000:
         while True:
             # Check if the server process has died
             if self.server_process and self.server_process.poll() is not None:
                 returncode = self.server_process.poll()
-                self.logger.error(f"Server 进程已退出，返回码: {returncode}")
+                self.logger.error(f"Server process exited; return code: {returncode}")
                 raise RuntimeError(f"Server failed to start with return code {returncode}")
                 
             try:
                 with socket.create_connection((self.params.host, self.params.port), timeout=1):
-                    self.logger.info("Server 已就绪。")
+                    self.logger.info("Server ready.")
                     return
             except:
                 elapsed = time.time() - start
-                self.logger.info(f"服务器尚未就绪，已等待 {int(elapsed)} 秒...")
+                self.logger.info(f"Server not ready yet; waited {int(elapsed)}s...")
                 time.sleep(10)
-        raise TimeoutError("Server 启动超时。")
+        raise TimeoutError("Server startup timed out.")
 
     def stop_server(self):
-            """优化后的进程组关闭逻辑"""
+            """Optimised process-group shutdown logic."""
             if not self.server_process:
-                self.logger.info("没有正在运行的 Server 进程。")
+                self.logger.info("No running server process.")
                 return
 
             pid = self.server_process.pid
-            self.logger.info(f"开始关闭 Server 进程组 (PID: {pid})...")
+            self.logger.info(f"Closing server process group (PID: {pid})...")
 
             try:
-                # 获取进程组 ID (在 start_server 中通过 os.setsid 创建了新组)
+                # Get the process-group ID (a new group was created in start_server via os.setsid).
                 pgid = os.getpgid(pid)
                 
-                # 1. 尝试优雅终止 (SIGTERM)
+                # 1. Try a graceful shutdown via SIGTERM.
                 os.killpg(pgid, signal.SIGTERM)
                 
-                # 2. 等待进程退出，设置超时时间 (GPU 释放通常较慢，建议 15-20s)
+                # 2. Wait for the process to exit, with a timeout (TPU release is slow, ~15-20s).
                 try:
                     self.server_process.wait(timeout=20)
-                    self.logger.info("Server 进程组已优雅退出。")
+                    self.logger.info("Server process group exited gracefully.")
                 except subprocess.TimeoutExpired:
-                    # 3. 超时仍未退出，执行强杀 (SIGKILL)
-                    self.logger.warning(f"Server (PID: {pid}) 在 20s 内未退出，正在强制杀掉整个进程组...")
+                    # 3. Still alive after the timeout — force-kill with SIGKILL.
+                    self.logger.warning(f"Server (PID: {pid}) did not exit within 20s; force-killing the whole process group...")
                     os.killpg(pgid, signal.SIGKILL)
                     
-                    # 再次 wait 以彻底回收僵尸进程
+                    # Wait again to fully reap the zombie process.
                     self.server_process.wait()
-                    self.logger.info("Server 进程组已被强制终止，显存应已释放。")
+                    self.logger.info("Server process group force-killed; device memory should be released.")
                     
             except ProcessLookupError:
-                self.logger.info("进程已提前退出或不存在。")
+                self.logger.info("Process already exited or does not exist.")
             except Exception as e:
-                self.logger.error(f"关闭 Server 时发生未知错误: {e}")
+                self.logger.error(f"Unexpected error while shutting down server: {e}")
             finally:
                 self.server_process = None
 
-    # --- 具体的业务任务 ---
+    # --- Concrete business tasks ---
 
     def run_mmlu(self):
-        # 使用 API 接口和 uvx 运行
+        # Run via the OpenAI-compatible API and uvx.
         cmd = [
             "uvx", "--with", "lm-evaluation-harness@", "lm_eval", 
             "--model", "openai", 
@@ -657,8 +662,8 @@ class VLLMTestFramework:
         self._run_task("mmlu", cmd)
 
     def run_evalplus(self, dataset="humaneval"):
-        # 使用 uvx 运行
-        # 提前创建 evalplus 需要的目录
+        # Run via uvx.
+        # Create the directory evalplus expects up front.
         os.makedirs(os.path.join(self.exp_dir, "evalplus", dataset), exist_ok=True)
         cmd = [
             "uvx", "--from", "evalplus==0.3.1", "evalplus.evaluate", 
@@ -672,74 +677,97 @@ class VLLMTestFramework:
         self._run_task(dataset, cmd)
 
     def run_benchmark_serving(self, result=None):
-        """运行 benchmark_serving 测试"""
+        """Run the benchmark_serving client.
+
+        Each (input_len, output_len) config is executed `warmup_runs + 1`
+        times back-to-back against the same already-warm vllm server.  All
+        but the last execution are warmup passes whose result JSONs are
+        ignored; only the metrics from the final pass are recorded.
+        """
         if result is None:
             result = VLLMTestResult()
-            
-        self.logger.info("开始执行 Benchmark Serving 测试")
-        
+
+        self.logger.info("Starting benchmark_serving runs")
+
         summary_log_path = os.path.join(self.exp_dir, "benchmark_serving_all.log")
         with open(summary_log_path, "w") as f:
             f.write(f"=== Benchmark Serving Results {datetime.now()} ===\n")
-            
+
         configs = self.params.model_benchmark_configs.get(self.params.model_name, [
             {"random-input-len": 8192, "random-output-len": 1024}
         ])
-        
-        result.success = True # Assume success unless a task fails
-        
+
+        result.success = True  # Assume success unless a task fails
+
+        warmup_runs = max(0, int(getattr(self.params, "warmup_runs", 0)))
+        total_passes = warmup_runs + 1
+
         for config in configs:
             input_len = config.get("random-input-len")
             output_len = config.get("random-output-len")
-            
-            task_name = f"benchmark_{input_len}_{output_len}"
-            self.logger.info(f"正在运行配置: input_len={input_len}, output_len={output_len}")
-            
-            cmd = ["python3", self.params.benchmark_script_path]
-            
-            # 添加默认参数
-            for k, v in self.params.benchmark_args.items():
-                if isinstance(v, bool) and v:
-                    cmd.append(k)
-                else:
-                    cmd.append(f"{k}={str(v)}")
-                    
-            # 添加当前测试的特定参数
-            cmd.append(f"--random-input-len={input_len}")
-            cmd.append(f"--random-output-len={output_len}")
-            cmd.append(f"--model={self.params.model_name}")
-            cmd.append(f"--port={str(self.params.port)}")
-            cmd.append(f"--result-dir={self.exp_dir}")
-            
-            current_dt = datetime.now().strftime("%Y%m%d_%H%M%S")
-            result_filename = f"{task_name}_result_{current_dt}.json"
-            cmd.append(f"--result-filename={result_filename}")
-            
-            returncode = self._run_task(task_name, cmd, log_path=summary_log_path, mode="a", result=result)
-            
-            if returncode != 0:
-                result.success = False
-                result.error_message += f"Task {task_name} failed with code {returncode}. "
-                continue
-                
-            if self.dry_run:
-                # Provide default results for dry run
-                result.metrics[task_name] = {
-                    'request_throughput': 10.0,
-                    'output_throughput': 100.0,
-                    'total_token_throughput': 1000.0,
-                    'mean_ttft_ms': 50.0,
-                    'mean_tpot_ms': 5.0
-                }
-                self.logger.info(f"[Dry Run] 为 {task_name} 填充默认结果。")
+
+            base_task_name = f"benchmark_{input_len}_{output_len}"
+            self.logger.info(
+                f"Running config input_len={input_len} output_len={output_len} "
+                f"with {warmup_runs} warmup + 1 measured pass(es)"
+            )
+
+            measured_result_path = None
+            measured_task_name = base_task_name
+
+            for pass_idx in range(total_passes):
+                is_measured = (pass_idx == total_passes - 1)
+                kind = "measured" if is_measured else f"warmup{pass_idx + 1}"
+                task_name = base_task_name if is_measured else f"{base_task_name}_{kind}"
+
+                cmd = ["python3", self.params.benchmark_script_path]
+                for k, v in self.params.benchmark_args.items():
+                    if isinstance(v, bool) and v:
+                        cmd.append(k)
+                    else:
+                        cmd.append(f"{k}={str(v)}")
+                cmd.append(f"--random-input-len={input_len}")
+                cmd.append(f"--random-output-len={output_len}")
+                cmd.append(f"--model={self.params.model_name}")
+                cmd.append(f"--port={str(self.params.port)}")
+                cmd.append(f"--result-dir={self.exp_dir}")
+
+                current_dt = datetime.now().strftime("%Y%m%d_%H%M%S")
+                result_filename = f"{task_name}_result_{current_dt}.json"
+                cmd.append(f"--result-filename={result_filename}")
+
+                returncode = self._run_task(
+                    task_name, cmd, log_path=summary_log_path, mode="a", result=result,
+                )
+
+                if returncode != 0:
+                    result.success = False
+                    result.error_message += f"Task {task_name} failed with code {returncode}. "
+                    break
+
+                if self.dry_run:
+                    if is_measured:
+                        result.metrics[measured_task_name] = {
+                            'request_throughput': 10.0,
+                            'output_throughput': 100.0,
+                            'total_token_throughput': 1000.0,
+                            'mean_ttft_ms': 50.0,
+                            'mean_tpot_ms': 5.0,
+                        }
+                        self.logger.info(f"[Dry Run] Filled default metrics for {measured_task_name}.")
+                    continue
+
+                if is_measured:
+                    measured_result_path = os.path.join(self.exp_dir, result_filename)
+
+            if self.dry_run or not result.success:
                 continue
 
-            result_path = os.path.join(self.exp_dir, result_filename)
-            if os.path.exists(result_path):
+            if measured_result_path and os.path.exists(measured_result_path):
                 try:
-                    with open(result_path, "r") as f:
+                    with open(measured_result_path, "r") as f:
                         res_data = json.load(f)
-                    
+
                     req_thr = res_data.get('request_throughput', 'N/A')
                     tok_thr = res_data.get('output_throughput', 'N/A')
                     tot_thr = res_data.get('total_token_throughput', 'N/A')
@@ -756,32 +784,33 @@ class VLLMTestFramework:
                         'total_token_throughput': tot_thr,
                         'mean_ttft_ms': ttft,
                         'mean_tpot_ms': tpot,
+                        'warmup_runs': warmup_runs,
                     })
-                    result.metrics[task_name] = flat
+                    result.metrics[measured_task_name] = flat
 
                     def fmt(val):
                         return f"{val:.2f}" if isinstance(val, (int, float)) else str(val)
 
-                    self.logger.info(f"\n" + "="*10 + f" {task_name} 关键结果 " + "="*10)
-                    self.logger.info(f"吞吐量 (Request/s): {fmt(req_thr)}")
-                    self.logger.info(f"吞吐量 (Output Token/s): {fmt(tok_thr)}")
-                    self.logger.info(f"吞吐量 (Total Token/s): {fmt(tot_thr)}")
-                    self.logger.info(f"平均 TTFT (ms): {fmt(ttft)}")
-                    self.logger.info(f"平均 TPOT (ms): {fmt(tpot)}")
-                    self.logger.info("="*30 + "\n")
+                    self.logger.info(f"\n" + "=" * 10 + f" {measured_task_name} key metrics " + "=" * 10)
+                    self.logger.info(f"Throughput (Request/s): {fmt(req_thr)}")
+                    self.logger.info(f"Throughput (Output Token/s): {fmt(tok_thr)}")
+                    self.logger.info(f"Throughput (Total Token/s): {fmt(tot_thr)}")
+                    self.logger.info(f"Mean TTFT (ms): {fmt(ttft)}")
+                    self.logger.info(f"Mean TPOT (ms): {fmt(tpot)}")
+                    self.logger.info("=" * 30 + "\n")
                 except Exception as e:
-                    self.logger.error(f"读取结果文件失败: {e}")
+                    self.logger.error(f"Failed to read result file: {e}")
                     result.success = False
-                    result.error_message += f"Failed to read result file for {task_name}: {e}. "
+                    result.error_message += f"Failed to read result file for {measured_task_name}: {e}. "
             else:
-                self.logger.warning(f"未找到结果文件: {result_path}")
+                self.logger.warning(f"Measured result file not found: {measured_result_path}")
                 result.success = False
-                result.error_message += f"Result file not found for {task_name}. "
-                
+                result.error_message += f"Result file not found for {measured_task_name}. "
+
         return result
 
     def execute_task(self, tasks: List[VLLMTestTask]) -> List[VLLMTestResult]:
-        """从外部调用执行指定任务列表"""
+        """Execute the supplied task list from an external caller."""
         results = []
         
         self.setup_environment()
@@ -833,78 +862,78 @@ if __name__ == "__main__":
         exit(0 if result.success else 1)
 
     try:
-        # 在线任务
+        # Interactive / online task loop.
         framework.start_server()
         def display_help():
-            print("\n" + "="*10 + " 接口API & HELP " + "="*10)
-            print("1 + Enter : 执行 HumanEval")
-            print("2 + Enter : 执行 MBPP")
-            print("3 + Enter : 执行 Benchmark Serving")
-            print("exit or Ctrl+C * 2 : 退出 Server")
+            print("\n" + "="*10 + " API & HELP " + "="*10)
+            print("1 + Enter : Run HumanEval")
+            print("2 + Enter : Run MBPP")
+            print("3 + Enter : Run Benchmark Serving")
+            print("exit or Ctrl+C * 2 : Exit server")
             print(f"XProf Dir : {framework.env.get('PHASED_PROFILING_DIR')}")
             print("=" * 34)
 
         display_help()
         
         ctrl_c_count = 0
-        # print("\n开始执行 HumanEval...")
+        # print("\nStarting HumanEval...")
         # framework.run_evalplus(dataset="humaneval")
         # warmup
-        print("\n开始执行 Benchmark Serving (warmup)...")
+        print("\nRunning Benchmark Serving (warmup)...")
         framework.run_benchmark_serving()
         # first run
-        print("\n开始执行 Benchmark Serving (first run)...")
+        print("\nRunning Benchmark Serving (first run)...")
         framework.run_benchmark_serving()
 
         framework.run_evalplus(dataset="humaneval")
         # framework.run_evalplus(dataset="mbpp")
         display_help()
-        framework.printing_server_output = True # 默认显示server输出
+        framework.printing_server_output = True  # Show server output by default
         
         while True:
             try:
-                user_input = input("请输入命令 > ").strip()
-                ctrl_c_count = 0 # 重置 Ctrl+C 计数
+                user_input = input("Enter command > ").strip()
+                ctrl_c_count = 0  # Reset Ctrl+C counter
                 
                 if user_input == "1":
                     framework.printing_server_output = False
-                    print("\n开始执行 HumanEval...")
+                    print("\nStarting HumanEval...")
                     framework.run_evalplus(dataset="humaneval")
                     framework.printing_server_output = True
                     display_help()
                 elif user_input == "2":
                     framework.printing_server_output = False
-                    print("\n开始执行 MBPP...")
+                    print("\nStarting MBPP...")
                     framework.run_evalplus(dataset="mbpp")
                     framework.printing_server_output = True
                     display_help()
                 elif user_input == "3":
                     framework.printing_server_output = False
-                    print("\n开始执行 Benchmark Serving...")
+                    print("\nStarting Benchmark Serving...")
                     framework.run_benchmark_serving()
                     framework.printing_server_output = True
                     display_help()
                 elif user_input == "exit":
-                    print("收到 exit 命令，准备退出...")
+                    print("Received exit command; shutting down...")
                     break
                 elif user_input == "":
                     display_help()
                 else:
-                    print(f"无效输入: {user_input}")
+                    print(f"Invalid input: {user_input}")
                     display_help()
                     
             except KeyboardInterrupt:
                 ctrl_c_count += 1
                 if ctrl_c_count >= 2:
-                    print("\n连续收到两次 Ctrl+C，准备退出...")
+                    print("\nReceived Ctrl+C twice; exiting...")
                     break
-                print("\n按 Ctrl+C 再次确认退出，或输入 exit 退出。")
+                print("\nPress Ctrl+C again to confirm exit, or type exit.")
                 time.sleep(0.5)
                 display_help()
             
     except KeyboardInterrupt:
-        print("\n收到停止信号，准备关闭 Server...")
+        print("\nReceived stop signal; shutting down server...")
         
     finally:
         framework.stop_server()
-        print(f"\n实验完成。所有数据已保存至: {framework.exp_dir}")
+        print(f"\nExperiment complete. All data saved to: {framework.exp_dir}")
