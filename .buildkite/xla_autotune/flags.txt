@@ -1,0 +1,11 @@
+# First 10 flags from tpu_comp_env_tuning.json — OFAT autotune
+--xla_tpu_enable_flash_attention=false
+--xla_tpu_prefuse_self_attention=true
+--xla_tpu_enable_pincer_short_fusion_emitter=true
+--xla_tpu_enable_multi_level_nested_loop_fusion=true
+--xla_tpu_enable_async_all_to_all=true
+--xla_tpu_force_async_all_to_all=true
+--xla_tpu_communication_computation_optimization=true
+--xla_tpu_enable_async_collective_fusion=false
+--tpu_use_continuations=true
+--xla_tpu_enable_brkga_latency_hiding_scheduler=true
