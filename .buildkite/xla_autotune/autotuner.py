@@ -49,18 +49,6 @@ for _p in (_SELF_DIR, _REPO_ROOT):
     if _p and _p not in sys.path:
         sys.path.insert(0, _p)
 
-# IMPORTANT: do NOT set VLLM_IN_AUTOTUNER here.  When that env var is
-# unset, the framework appends its hard-coded autotuned_result_list of
-# ~15 production-tuned XLA flags to LIBTPU_INIT_ARGS — and *that is the
-# same string* production CI uses, so the GCS-backed JAX compile cache
-# already contains entries keyed on it.  Stripping those defaults gives
-# us a unique cache key with zero hits → ~90 min cold compile per trial.
-#
-# vLLM's recompilation guard would raise on every trial because each
-# candidate flag forces re-lowering of at least some HLO modules.
-# Disable it inside the autotuner.
-os.environ["VLLM_XLA_CHECK_RECOMPILATION"] = "0"
-
 from vllm_test_framework import (  # noqa: E402
     VLLMTestFramework,
     VLLMTestParam,
@@ -179,13 +167,10 @@ def _build_test_param(
     p = VLLMTestParam()
     p.model_name = model
     p.tag = tag
-    # Per vllm_test_framework convention: XLA / libtpu autotune flags go
-    # into LIBTPU_INIT_ARGS, not XLA_FLAGS.
-    #
-    # Critical: APPEND extra_flags to whatever the framework's default
-    # already contains (the production-tuned autotuned_result_list).
-    # Overwriting here would break the GCS JAX cache match — see the note
-    # at the top of this file.
+    # Append candidate / baseline flags AFTER the framework's default
+    # production-tuned LIBTPU set.  Overwriting would mint a fresh
+    # LIBTPU_INIT_ARGS string that the GCS JAX compile cache has no
+    # entries for → ~90 min cold compile per trial.
     p.extra_libtpu_init_args = list(p.extra_libtpu_init_args) + list(extra_flags)
     for k, v in (base_param_overrides or {}).items():
         # Allow `_`-prefixed keys (e.g. `_comment`) as JSON-comment metadata.
