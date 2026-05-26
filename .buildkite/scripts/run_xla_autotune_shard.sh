@@ -45,6 +45,11 @@ SLICE_COUNT="${2:?usage: $0 <slice_index> <slice_count>}"
 AUTOTUNE_MODEL="${AUTOTUNE_MODEL:-Qwen/Qwen3.5-397B-A17B-FP8}"
 AUTOTUNE_TARGET_METRIC="${AUTOTUNE_TARGET_METRIC:-total_token_throughput}"
 AUTOTUNE_BASELINE_RUNS="${AUTOTUNE_BASELINE_RUNS:-3}"
+# Both paths are relative to the tpu_inference repo root (= the docker
+# working directory).  Defaults run the full production sweep; override
+# in the pipeline step to switch into the smoke-test config.
+AUTOTUNE_FLAGS="${AUTOTUNE_FLAGS:-.buildkite/xla_autotune/flags.txt}"
+AUTOTUNE_CONFIG="${AUTOTUNE_CONFIG:-.buildkite/xla_autotune/config.json}"
 
 # Reuse the /tmp/kernel_tuning mount that run_in_docker.sh already binds
 # both inside and outside docker — gives us a shared artifact directory
@@ -125,8 +130,8 @@ set +e
   set -euo pipefail
   cd /workspace/tpu_inference
   python3 .buildkite/xla_autotune/autotuner.py \
-    --flag-list-file .buildkite/xla_autotune/flags.txt \
-    --benchmark-args-json .buildkite/xla_autotune/config.json \
+    --flag-list-file '${AUTOTUNE_FLAGS}' \
+    --benchmark-args-json '${AUTOTUNE_CONFIG}' \
     --model '${AUTOTUNE_MODEL}' \
     --target-metric '${AUTOTUNE_TARGET_METRIC}' \
     --scheduler ofat \

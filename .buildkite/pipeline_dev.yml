@@ -76,22 +76,24 @@ steps:
   # For the staged flags.txt (10 flags) with matrix=4:
   #   shard 1 → flags 1-3, shard 2 → flags 4-6, shard 3 → flags 7-9,
   #   shard 4 → flag 10.  Every shard additionally runs 3 baselines.
-  - label: "tpu7x [xla-autotune] shard {{matrix}}/4"
-    key: tpu7x_xla_autotune_shard
+  - label: "tpu7x [xla-autotune-smoke] shard 1/1"
+    key: tpu7x_xla_autotune_smoke
     depends_on: tpu7x_build_docker
     env:
       USE_PREBUILT_IMAGE: "1"
       TPU_VERSION: "tpu7x"
-      # Forwarded into the docker container by run_in_docker.sh (already
-      # in its ENV_VARS pass-through list).
       MODEL_IMPL_TYPE: "vllm"
       NEW_MODEL_DESIGN: "1"
-      # Forwarded into the shard script (host-side):
       AUTOTUNE_MODEL: "Qwen/Qwen3.5-397B-A17B-FP8"
       AUTOTUNE_TARGET_METRIC: "total_token_throughput"
-      AUTOTUNE_BASELINE_RUNS: "3"
-    matrix: ["1", "2", "3", "4"]
+      AUTOTUNE_BASELINE_RUNS: "1"
+      # Smoke mode: point the autotuner at the smoke flag list + minimal
+      # benchmark config. Each trial then completes in ~10-15 min instead
+      # of ~110 min, so we can validate the cache-hit fix BEFORE committing
+      # to the full multi-hour sweep.
+      AUTOTUNE_FLAGS: ".buildkite/xla_autotune/flags.smoke.txt"
+      AUTOTUNE_CONFIG: ".buildkite/xla_autotune/config.smoke.json"
     agents:
       queue: tpu_v7x_8_queue
     commands:
-      - .buildkite/scripts/run_xla_autotune_shard.sh {{matrix}} 4
+      - .buildkite/scripts/run_xla_autotune_shard.sh 1 1
