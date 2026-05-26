@@ -34,30 +34,24 @@ from typing import Any, Dict, List, Optional
 # Production defaults
 # ---------------------------------------------------------------------------
 
-# 15-flag production-tuned XLA / libtpu set used by tpu-inference CI.
-# Listed individually here for readability.  Serialised back into a single
-# trailing-comma-terminated string so the resulting LIBTPU_INIT_ARGS env
-# var byte-matches what production sets — and that's the string the GCS
-# JAX compile cache is keyed on, so any deviation costs ~90 min of cold
-# recompile per trial.
-_PRODUCTION_LIBTPU_FLAGS: List[str] = [
-    "--xla_always_enable_all_gather_2d_asymmetric=true",
-    "--xla_tpu_vmem_scavenging_mode=SAFE",
-    "--xla_tpu_flowdown_critical_nodes=false",
-    "--xla_sc_num_serialized_tables_to_optimize_hbm=65536",
-    "--xla_tpu_enable_domain_passes=true",
-    "--xla_tpu_enable_expression_constant_splitter=false",
-    "--xla_tpu_relayout_group_size_threshold_for_reduce_scatter=65536",
-    "--xla_tpu_use_single_sparse_core_for_all_reduce_offload=true",
-    "--xla_tpu_enable_glp_ring_reordering=false",
-    "--xla_tpu_enable_async_pincer_short_emitter_for_cf=true",
-    "--xla_sc_hbm_spill_stack=0",
-    "--xla_collective_optimize_constant_table=ENABLED",
-    "--xla_jf_fusion_max_instruction_count_for_window_config=65536",
-    "--xla_enable_post_msa_sync_slice_fusion=true",
-    "--xla_tpu_enable_all_experimental_scheduler_features=true",
-]
-PRODUCTION_LIBTPU_FLAGS_STRING: str = ",".join(_PRODUCTION_LIBTPU_FLAGS) + ","
+# NOTE on LIBTPU_INIT_ARGS format:
+#
+# libtpu parses the LIBTPU_INIT_ARGS env var with SPACE as the flag
+# separator.  Each entry must be a single `--flag=value` pair; an entry
+# that contains a comma is treated as one flag whose value happens to
+# contain commas, which libtpu then rejects with:
+#
+#   ERROR: Illegal value 'true,--xla_tpu_...,...' for flag --xla_...
+#
+# The original vllm_test_framework hid a 15-flag set inside a single
+# trailing-comma-joined string and conditionally appended it under the
+# VLLM_IN_AUTOTUNER guard — code that, on closer inspection, has been
+# dead since landing because libtpu refuses to parse it.  We therefore
+# do NOT inject any "default" XLA tuning flags here.  Callers (the
+# autotuner, anyone driving the framework directly) supply their own
+# list of independent `--flag=value` strings via
+# VLLMTestParam.extra_libtpu_init_args; the framework simply
+# space-joins them and exports the result as LIBTPU_INIT_ARGS.
 
 
 DEFAULT_MODEL: str = "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8"
@@ -203,11 +197,10 @@ class VLLMTestParam:
     host: str = DEFAULT_HOST
     port: int = DEFAULT_PORT
 
-    # --- XLA / libtpu flags applied to the vllm serve subprocess.  Defaults
-    # to the 15-flag production string so the GCS JAX compile cache hits. ---
-    extra_libtpu_init_args: List[str] = field(
-        default_factory=lambda: [PRODUCTION_LIBTPU_FLAGS_STRING]
-    )
+    # --- XLA / libtpu flags appended (space-joined) into LIBTPU_INIT_ARGS
+    # on the vllm serve subprocess.  Each entry must be a single
+    # `--flag=value` pair (libtpu uses space as the flag separator). ---
+    extra_libtpu_init_args: List[str] = field(default_factory=list)
 
     # --- benchmark client ---
     benchmark_script_path: str = DEFAULT_BENCHMARK_SCRIPT_PATH

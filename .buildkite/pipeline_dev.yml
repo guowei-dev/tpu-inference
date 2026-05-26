@@ -86,7 +86,9 @@ steps:
       NEW_MODEL_DESIGN: "1"
       AUTOTUNE_MODEL: "Qwen/Qwen3.5-397B-A17B-FP8"
       AUTOTUNE_TARGET_METRIC: "total_token_throughput"
-      AUTOTUNE_BASELINE_RUNS: "1"
+      # 2 baselines (identical flags) so we can compare init-2 vs init-1
+      # and detect whether the persistent JAX cache is even working.
+      AUTOTUNE_BASELINE_RUNS: "2"
       # Smoke mode: point the autotuner at the smoke flag list + minimal
       # benchmark config. Each trial then completes in ~10-15 min instead
       # of ~110 min, so we can validate the cache-hit fix BEFORE committing
