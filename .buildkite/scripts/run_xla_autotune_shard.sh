@@ -62,17 +62,34 @@ mkdir -p "${ARTIFACT_DIR_HOST}"
 echo "[xla-autotune] shard ${SLICE_INDEX}/${SLICE_COUNT} → ${ARTIFACT_DIR_HOST}"
 
 # --------------------------------------------------------------------------
-# Host-side watcher: uploads each *.json + summary.jsonl whenever the file
-# is new OR has been modified since the last upload (mtime-based). The
-# autotuner rewrites these files in place across trials, so we cannot
-# upload each filename only once.
+# Host-side watcher.  Two responsibilities:
+#
+#   (1) Per-trial JSONs at top level (baseline_NN.json / cand_NNN.json) and
+#       summary.jsonl: re-upload whenever mtime advances, so progressive
+#       updates surface in BK without waiting for the shard to finish.
+#
+#   (2) Per-trial log bundles under logs/<tag>_EXP_<ts>/: each bundle is
+#       written by vllm_test_framework.py and finalised by the autotuner
+#       with a sibling marker file `<tag>_EXP_<ts>.done`.  When the marker
+#       appears, every file inside the bundle is uploaded once; this gives
+#       BK a complete, consistent log dir per trial — server log, env
+#       dump (experiment_info.txt), benchmark stdout, the _tag.txt
+#       descriptor, etc.
+#
+# All uploads run from $SHARED_ROOT so artifact paths in BK include the
+# shard prefix (e.g. `shard_2_of_4/logs/autotune_cand_003_EXP_.../...`),
+# which doubles as the descriptive tag in the BK UI.
 # --------------------------------------------------------------------------
+SHARD_DIRNAME="shard_${SLICE_INDEX}_of_${SLICE_COUNT}"
 (
-  cd "${ARTIFACT_DIR_HOST}"
+  cd "${SHARED_ROOT}"
   declare -A LAST_MTIME=()
+  declare -A UPLOADED_BUNDLE=()
   while true; do
     shopt -s nullglob
-    for f in *.json summary.jsonl; do
+
+    # (1) Top-level trial JSONs + summary.
+    for f in "${SHARD_DIRNAME}"/*.json "${SHARD_DIRNAME}/summary.jsonl"; do
       [[ -f "$f" ]] || continue
       cur_mtime=$(stat -c %Y "$f" 2>/dev/null || echo 0)
       if [[ "${LAST_MTIME[$f]:-0}" != "$cur_mtime" ]]; then
@@ -81,6 +98,22 @@ echo "[xla-autotune] shard ${SLICE_INDEX}/${SLICE_COUNT} → ${ARTIFACT_DIR_HOST
         fi
       fi
     done
+
+    # (2) Completed trial log bundles.
+    for marker in "${SHARD_DIRNAME}"/logs/*.done; do
+      [[ -f "$marker" ]] || continue
+      bundle_dir="${marker%.done}"
+      [[ -d "$bundle_dir" ]] || continue
+      bundle_key="$bundle_dir"
+      if [[ -z "${UPLOADED_BUNDLE[$bundle_key]:-}" ]]; then
+        # Upload every file inside the bundle dir, preserving the
+        # `shard_K_of_N/logs/<trial_id>_EXP_<ts>/...` path.
+        if buildkite-agent artifact upload "${bundle_dir}/**/*"; then
+          UPLOADED_BUNDLE["$bundle_key"]=1
+        fi
+      fi
+    done
+
     sleep 20
   done
 ) &
@@ -104,17 +137,15 @@ set +e
 RC=$?
 set -e
 
-# Stop the watcher, then do a final upload pass for anything that landed
-# between its last tick and the docker exit.
+# Stop the watcher, then do a final recursive upload pass for anything
+# that landed between its last tick and the docker exit — both top-level
+# JSONs and every per-trial log bundle, complete or partial.
 kill "${WATCH_PID}" 2>/dev/null || true
 wait "${WATCH_PID}" 2>/dev/null || true
 
 (
-  cd "${ARTIFACT_DIR_HOST}"
-  shopt -s nullglob
-  for f in *.json summary.jsonl; do
-    [[ -f "$f" ]] && buildkite-agent artifact upload "$f" || true
-  done
+  cd "${SHARED_ROOT}"
+  buildkite-agent artifact upload "${SHARD_DIRNAME}/**/*" || true
 )
 
 exit "${RC}"

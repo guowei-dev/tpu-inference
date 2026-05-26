@@ -12,7 +12,7 @@ import atexit
 import argparse
 from enum import Enum
 from dataclasses import dataclass, field
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
 class VLLMTestTask(Enum):
     RUN_BENCHMARK_SERVING = "run_benchmark_serving"
@@ -299,6 +299,12 @@ class VLLMTestParam:
     # warmup (first-connection latency, HTTP keepalive, request scheduler
     # state). The measured run is the last one; warmup results are discarded.
     warmup_runs: int = 1
+    # Override for the per-experiment log directory root.  When None the
+    # framework writes under `<this_file>/scripts/log/` (legacy behaviour).
+    # The autotuner sets this to an artifact-mounted path so every trial's
+    # full log bundle (vllm server log, env dump, benchmark stdout, etc.)
+    # is reachable by the host-side Buildkite artifact watcher.
+    base_log_dir: Optional[str] = None
 
 
 
@@ -311,9 +317,15 @@ class VLLMTestFramework:
         self.dry_run = dry_run
         self.server_process = None
         
-        # 1. Create experiment directory
+        # 1. Create experiment directory.  If params.base_log_dir is set,
+        # use it (e.g. the autotuner points this at a host-mounted artifact
+        # path); otherwise fall back to the legacy in-tree `scripts/log/`.
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.base_log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts/log")
+        self.base_log_dir = (
+            self.params.base_log_dir
+            if self.params.base_log_dir
+            else os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts/log")
+        )
         if self.params.tag:
             folder_name = f"{self.params.tag}_EXP_{timestamp}"
         else:

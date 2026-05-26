@@ -215,6 +215,13 @@ def _run_trial(
         "target_value": None,
         "error": "",
     }
+    # Every trial gets its own log directory under <artifact_dir>/logs/ so
+    # the host-side Buildkite watcher can ship the full bundle (vllm server
+    # log, env dump, benchmark stdout, etc.) as artifacts.
+    logs_root = os.path.join(artifact_dir, "logs")
+    os.makedirs(logs_root, exist_ok=True)
+    trial_exp_dir = None
+
     try:
         param = _build_test_param(
             model=model,
@@ -222,7 +229,9 @@ def _run_trial(
             base_param_overrides=base_param_overrides,
             tag=f"autotune_{trial.trial_id}",
         )
+        param.base_log_dir = logs_root
         fw = VLLMTestFramework(params=param, dry_run=dry_run)
+        trial_exp_dir = fw.exp_dir
         results = fw.execute_task([VLLMTestTask.RUN_BENCHMARK_SERVING])
         result = results[0] if results else None
         if result is not None:
@@ -248,6 +257,30 @@ def _run_trial(
         json.dump(record, f, indent=2)
     summary_fp.write(json.dumps(record) + "\n")
     summary_fp.flush()
+
+    # Drop a descriptive _tag.txt + .done marker next to the trial log dir
+    # so the watcher can: (a) show a human-readable summary in BK and
+    # (b) upload the complete dir as a unit only after it's been fully
+    # written.
+    if trial_exp_dir and os.path.exists(trial_exp_dir):
+        try:
+            with open(os.path.join(trial_exp_dir, "_tag.txt"), "w") as f:
+                f.write(
+                    f"trial_id        : {trial.trial_id}\n"
+                    f"kind            : {trial.kind}\n"
+                    f"flag            : {trial.flag or '(baseline, no extra flag)'}\n"
+                    f"model           : {model}\n"
+                    f"target_metric   : {target_metric}\n"
+                    f"target_value    : {record['target_value']}\n"
+                    f"success         : {record['success']}\n"
+                    f"duration_sec    : {record['duration_sec']}\n"
+                    f"started_utc     : {record['started_utc']}\n"
+                    f"finished_utc    : {record['finished_utc']}\n"
+                    f"error           : {record['error'].splitlines()[0] if record['error'] else ''}\n"
+                )
+            open(trial_exp_dir + ".done", "w").close()
+        except Exception:  # noqa: BLE001
+            pass
     print(
         f"[autotune] {trial.trial_id} kind={trial.kind} "
         f"success={record['success']} {target_metric}={record['target_value']} "
