@@ -76,8 +76,12 @@ steps:
   # For the staged flags.txt (10 flags) with matrix=4:
   #   shard 1 → flags 1-3, shard 2 → flags 4-6, shard 3 → flags 7-9,
   #   shard 4 → flag 10.  Every shard additionally runs 3 baselines.
-  - label: "tpu7x [xla-autotune-smoke] shard 1/1"
-    key: tpu7x_xla_autotune_smoke
+  # Final 2-shard × (2 baseline + 2 candidate) validation. Real benchmark
+  # config (640 prompts at concurrency 512, 8K/1K input/output) so each
+  # candidate's throughput delta vs baseline is statistically meaningful.
+  # 4 candidate flags split 2-per-shard via the matrix.
+  - label: "tpu7x [xla-autotune-final] shard {{matrix}}/2"
+    key: tpu7x_xla_autotune_final
     depends_on: tpu7x_build_docker
     env:
       USE_PREBUILT_IMAGE: "1"
@@ -86,16 +90,11 @@ steps:
       NEW_MODEL_DESIGN: "1"
       AUTOTUNE_MODEL: "Qwen/Qwen3.5-397B-A17B-FP8"
       AUTOTUNE_TARGET_METRIC: "total_token_throughput"
-      # 2 baselines (identical flags) so we can compare init-2 vs init-1
-      # and detect whether the persistent JAX cache is even working.
       AUTOTUNE_BASELINE_RUNS: "2"
-      # Smoke mode: point the autotuner at the smoke flag list + minimal
-      # benchmark config. Each trial then completes in ~10-15 min instead
-      # of ~110 min, so we can validate the cache-hit fix BEFORE committing
-      # to the full multi-hour sweep.
-      AUTOTUNE_FLAGS: ".buildkite/xla_autotune/flags.smoke.txt"
-      AUTOTUNE_CONFIG: ".buildkite/xla_autotune/config.smoke.json"
+      AUTOTUNE_FLAGS: ".buildkite/xla_autotune/flags.final.txt"
+      AUTOTUNE_CONFIG: ".buildkite/xla_autotune/config.json"
+    matrix: ["1", "2"]
     agents:
       queue: tpu_v7x_8_queue
     commands:
-      - .buildkite/scripts/run_xla_autotune_shard.sh 1 1
+      - .buildkite/scripts/run_xla_autotune_shard.sh {{matrix}} 2

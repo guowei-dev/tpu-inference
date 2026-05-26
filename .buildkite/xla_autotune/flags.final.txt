@@ -1,0 +1,8 @@
+# Final validation flag set: 4 candidates, sliced 2-per-shard across 2 shards.
+# Picked from the top of tpu_comp_env_tuning.json, skipping the one known to
+# trigger a JAX compile error
+# (--xla_tpu_communication_computation_optimization=true).
+--xla_tpu_enable_flash_attention=false
+--xla_tpu_prefuse_self_attention=true
+--xla_tpu_enable_pincer_short_fusion_emitter=true
+--xla_tpu_enable_multi_level_nested_loop_fusion=true
