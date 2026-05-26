@@ -1,6 +1,8 @@
 {
   "_comment": "VLLMTestParam overrides for the Qwen3.5-397B-A17B-FP8 OFAT autotune run. Mirrors the user-supplied reference test record (8K/1K, concurrency 512, ATTN_DP, EP8). All vllm serve args, env vars, and benchmark args are aligned with that record.",
 
+  "benchmark_script_path": "/workspace/tpu_inference/.buildkite/xla_autotune/bench_serving/benchmark_serving.py",
+
   "model_configs": {
     "Qwen/Qwen3.5-397B-A17B-FP8": [
       "--max-model-len=9216",
