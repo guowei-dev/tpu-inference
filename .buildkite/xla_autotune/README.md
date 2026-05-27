@@ -1,62 +1,40 @@
 # XLA autotune
 
 One-factor-at-a-time (OFAT) sweep over XLA / libtpu flags, driven from
-Buildkite.  Spins up `vllm serve` on a TPU pod, runs `benchmark_serving`
-against it, and records the target metric (default `total_token_throughput`)
-per candidate flag.
+Buildkite.  For each candidate flag, stand up `vllm serve` on a TPU pod,
+benchmark it with `benchmark_serving`, record the target metric (default
+`total_token_throughput`).
 
 ## Layout
 
 ```
 .buildkite/xla_autotune/
-├── autotuner.py             OFAT driver (CLI: --flag-list-file, --slice-{index,count}, ...)
-├── vllm_test_framework.py   vllm serve + benchmark_serving driver, production defaults
+├── autotuner.py             OFAT driver
+├── vllm_test_framework.py   vllm serve + benchmark_serving runner + MODELS registry
 ├── flags.txt                Candidate flags, one per line
 ├── pipeline.yml             Buildkite pipeline definition (4-shard matrix)
 └── README.md
 ```
 
-The host-side wrapper that runs inside each Buildkite step lives at
-`.buildkite/scripts/run_xla_autotune_shard.sh`.  It is responsible for
-launching `autotuner.py` inside the docker container and incrementally
-uploading per-trial JSON + log bundles to Buildkite artifacts as soon as
-they land.  It also `git clone`s
-[`kimbochen/bench_serving`](https://github.com/kimbochen/bench_serving)
-into the docker workdir, matching the convention used by
-`tests/e2e/benchmarking/bm_qwen3_coder.sh` so every serving benchmark in
-the repo shares one harness.
+The host wrapper `.buildkite/scripts/run_xla_autotune_shard.sh` runs one
+shard: starts the watcher that ships results to Buildkite as they land,
+`git clone`s [`kimbochen/bench_serving`][bs] inside docker (same harness as
+`tests/e2e/benchmarking/bm_qwen3_coder.sh`), then invokes `autotuner.py`.
 
-## How it works
+[bs]: https://github.com/kimbochen/bench_serving
 
-For a flag list of length `F` and a matrix of `N` shards:
+## Sharding
 
-* Shard `k` (1-based) gets `flags[(k-1)*ceil(F/N) : k*ceil(F/N)]` as its
-  candidate flags.
-* Each shard runs `AUTOTUNE_BASELINE_RUNS` baseline trials (no extra
-  LIBTPU args) followed by one trial per candidate flag.
-* Every trial runs `warmup_runs` warmup benchmark passes (results
-  discarded) plus one measured pass per `(input_len, output_len)` shape.
-  The warmup pass exists because the first benchmark after engine init
-  reflects compile + cache-warm transients, not steady-state throughput.
+For a flag list of length `F` over `N` shards:
 
-Trial outputs:
+* Shard `k` (1-based) processes `flags[(k-1) * ceil(F/N) : k * ceil(F/N)]`.
+* Every shard also runs `AUTOTUNE_BASELINE_RUNS` baselines (no extra
+  `LIBTPU_INIT_ARGS`) so the per-VM noise floor can be re-estimated.
+* Per `(input_len, output_len)` shape, every trial runs `warmup_runs`
+  warmup passes (discarded) plus one measured pass — the first-batch
+  latency reflects compile / cache transients, not steady-state.
 
-* `<artifact-dir>/<trial_id>.json` — per-trial record (success, target
-  metric, full benchmark metrics dict, duration, error).
-* `<artifact-dir>/summary.jsonl` — same records, one per line, appended
-  as trials finish.
-* `<artifact-dir>/logs/<trial_id>_EXP_<ts>/` — full log bundle (vllm
-  server log, env dump, benchmark stdout, the constructed commands).
-
-All of the above ship to Buildkite as artifacts under
-`shard_<k>_of_<N>/...`.
-
-## Triggering a run
-
-The pipeline file is `.buildkite/xla_autotune/pipeline.yml`.  Either
-configure a Buildkite pipeline whose upload step is
-`buildkite-agent pipeline upload .buildkite/xla_autotune/pipeline.yml`,
-or trigger via the REST API:
+## Trigger
 
 ```
 curl -s -X POST -H "Authorization: Bearer $BUILDKITE_API_TOKEN" \
@@ -70,46 +48,62 @@ curl -s -X POST -H "Authorization: Bearer $BUILDKITE_API_TOKEN" \
   }'
 ```
 
-To trigger from a fork, set `branch` to the namespaced form
-`<fork-owner>:<branch>`.
+From a fork, set `branch` to the namespaced form `<fork-owner>:<branch>`.
+The Buildkite pipeline must be configured to upload
+`.buildkite/xla_autotune/pipeline.yml`.
 
 ## Knobs
 
-Pipeline `env:` block (with defaults):
-
-| Var                       | Default                              | Notes                                                            |
-|---------------------------|--------------------------------------|------------------------------------------------------------------|
-| `AUTOTUNE_MODEL`          | `Qwen/Qwen3.5-397B-A17B-FP8`         | Must be a key in `DEFAULT_MODEL_CONFIGS`.                        |
-| `AUTOTUNE_TARGET_METRIC`  | `total_token_throughput`             | Any key inside the benchmark_serving result JSON.                |
-| `AUTOTUNE_BASELINE_RUNS`  | `2`                                  | ≥2 recommended so per-shard noise floor can be estimated.        |
-| `AUTOTUNE_FLAGS`          | `.buildkite/xla_autotune/flags.txt`  | One `--flag=value` per line; `#` comments ignored.               |
-| `AUTOTUNE_CONFIG`         | _(unset)_                            | Optional JSON of `VLLMTestParam` field overrides.                |
+| Env var                  | Default                              | Notes                                                            |
+|--------------------------|--------------------------------------|------------------------------------------------------------------|
+| `AUTOTUNE_MODEL`         | `Qwen/Qwen3.5-397B-A17B-FP8`         | Must be a key in `MODELS` (`vllm_test_framework.py`).            |
+| `AUTOTUNE_TARGET_METRIC` | `total_token_throughput`             | Any key inside the benchmark_serving result JSON.                |
+| `AUTOTUNE_BASELINE_RUNS` | `2`                                  | ≥2 lets you estimate per-shard noise floor.                      |
+| `AUTOTUNE_FLAGS`         | `.buildkite/xla_autotune/flags.txt`  | One `--flag=value` per line; `#` comments allowed.               |
+| `AUTOTUNE_CONFIG`        | _(unset)_                            | Optional JSON of `VLLMTestParam` field overrides.                |
+| `AUTOTUNE_DRY_RUN`       | _(unset)_                            | If set, passes `--dry-run` (no `vllm serve` or benchmark).       |
 
 ## Onboarding a new model
 
-1. Add the model's `vllm serve` args and env vars to
-   `DEFAULT_MODEL_CONFIGS` / `DEFAULT_MODEL_ENV_CONFIGS` /
-   `DEFAULT_MODEL_BENCHMARK_CONFIGS` in `vllm_test_framework.py`.
-2. Set `AUTOTUNE_MODEL` in `pipeline.yml`.
-3. Confirm the model's persistent JAX cache namespace (in
-   `run_in_docker.sh`) is appropriate.
+Add a `ModelSpec` entry to the `MODELS` dict in `vllm_test_framework.py`
+(`serve_args`, `server_env`, `benchmark_shapes`) and set `AUTOTUNE_MODEL`
+in `pipeline.yml`.
 
-## Cache notes
+## JAX compile cache
 
-Engine startup is dominated by HLO compile.  Cold-cache init for the 397B
-model is ~90 min; warm-cache init drops to ~10 min.  The TPU runner
-pulls/pushes a persistent JAX cache from GCS in `run_in_docker.sh`, so
-once a candidate flag's HLO modules have been compiled once on any VM
-they are reused on subsequent runs.
+`run_in_docker.sh` mounts and synchronises a GCS-backed JAX compile cache
+keyed on `jax<VERSION>_tpu<TPU>`:
 
-JAX keys each compiled HLO module on the `(flag-set × shape)` tuple, so a
-new candidate flag typically only invalidates the small subset of modules
-it actually affects — observed +2–4 % init overhead vs baseline on the
-397B model, not +90 min.
+* Before docker starts: `gsutil -m rsync` pulls
+  `gs://ullm-ci-cache/jax_cache/<key>/` → `/mnt/disks/persist/tpu_jax_cache/<key>/`.
+* The persist-disk path is exposed to the container as `VLLM_XLA_CACHE_PATH`
+  and `JAX_COMPILATION_CACHE_DIR`.
+* After docker exits: `gsutil -m rsync` pushes back.  Cache entries are
+  content-addressed, so concurrent CI builds pushing in parallel is safe.
+
+JAX keys each compiled HLO module on `(LIBTPU_INIT_ARGS bytes × shape)`,
+so a new candidate flag invalidates only the small subset of modules it
+actually affects — observed +2–4 % init overhead on the 397B model vs
+warm baseline (~10 min), not the +90 min of a cold compile.
+
+## Result handoff
+
+While a shard runs, `autotuner.py` writes each trial's record to
+`<artifact-dir>/<trial_id>.json` and appends to `summary.jsonl` the moment
+the trial finishes; the per-trial log bundle gets a sibling `<bundle>.done`
+marker once the autotuner is done writing it.  In parallel, the host
+wrapper's watcher loop (every 20 s):
+
+* Re-uploads top-level JSON / `summary.jsonl` whose mtime advanced.
+* Uploads each completed log bundle exactly once (driven by `.done`).
+
+A final sweep after the autotuner exits picks up anything written between
+the watcher's last tick and the docker exit.  All artifacts land in
+Buildkite under `shard_<k>_of_<N>/...`, mirroring the on-disk layout.
 
 ## Interpreting results
 
-Always look at the baselines first.  If the baseline runs have a wide
-spread (>10 %) the candidate signal is most likely noise.  For tighter
-attribution: bump `AUTOTUNE_BASELINE_RUNS` and add candidate replicates
-by appending the same flag multiple times in `flags.txt`.
+Always inspect the baselines first.  If their spread is >10 % (per-VM
+noise on the same flag set), the candidate signal will be drowned out —
+bump `AUTOTUNE_BASELINE_RUNS`, or repeat a flag multiple times in
+`flags.txt` to get candidate replicates.

@@ -13,75 +13,53 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Host-side driver for one shard of the XLA autotune sweep.
+# Run one shard of the XLA autotune sweep.
 #
-# Usage: run_xla_autotune_shard.sh <slice_index> <slice_count>
-#
-# Env (optional, set in the pipeline step):
-#   AUTOTUNE_MODEL          default: Qwen/Qwen3.5-397B-A17B-FP8
-#   AUTOTUNE_TARGET_METRIC  default: total_token_throughput
-#   AUTOTUNE_BASELINE_RUNS  default: 2
-#   AUTOTUNE_FLAGS          default: .buildkite/xla_autotune/flags.txt
-#   AUTOTUNE_CONFIG         optional JSON of VLLMTestParam overrides
-#   AUTOTUNE_DRY_RUN        if non-empty, pass --dry-run to the autotuner
-#                           (skips vllm serve + benchmark; useful for
-#                           validating pipeline plumbing without TPU cost)
-#
-# A background watcher tails the artifact dir and uploads per-trial JSONs and
-# completed log bundles to Buildkite as soon as they land — progress is
-# visible without waiting for the whole shard to finish.
+# Args (positional):   <slice_index> <slice_count>     1-based
+# Env (all optional):  AUTOTUNE_{MODEL,TARGET_METRIC,BASELINE_RUNS,FLAGS,
+#                                CONFIG,DRY_RUN}      see README
 
 set -euo pipefail
 
 SLICE_INDEX="${1:?usage: $0 <slice_index> <slice_count>}"
 SLICE_COUNT="${2:?usage: $0 <slice_index> <slice_count>}"
 
-AUTOTUNE_MODEL="${AUTOTUNE_MODEL:-Qwen/Qwen3.5-397B-A17B-FP8}"
-AUTOTUNE_TARGET_METRIC="${AUTOTUNE_TARGET_METRIC:-total_token_throughput}"
-AUTOTUNE_BASELINE_RUNS="${AUTOTUNE_BASELINE_RUNS:-2}"
-AUTOTUNE_FLAGS="${AUTOTUNE_FLAGS:-.buildkite/xla_autotune/flags.txt}"
-AUTOTUNE_CONFIG="${AUTOTUNE_CONFIG:-}"
+MODEL="${AUTOTUNE_MODEL:-Qwen/Qwen3.5-397B-A17B-FP8}"
+METRIC="${AUTOTUNE_TARGET_METRIC:-total_token_throughput}"
+BASELINES="${AUTOTUNE_BASELINE_RUNS:-2}"
+FLAGS="${AUTOTUNE_FLAGS:-.buildkite/xla_autotune/flags.txt}"
+CONFIG="${AUTOTUNE_CONFIG:-}"
+DRY_RUN="${AUTOTUNE_DRY_RUN:-}"
 
-# /tmp/kernel_tuning is already bind-mounted host↔container by run_in_docker.sh,
-# so we reuse it as a shared artifact directory.
-SHARED_ROOT="/tmp/kernel_tuning/xla_autotune"
-SHARD_DIRNAME="shard_${SLICE_INDEX}_of_${SLICE_COUNT}"
-ARTIFACT_DIR="${SHARED_ROOT}/${SHARD_DIRNAME}"
-
-# Wipe leftovers from any prior build on this agent VM, otherwise the watcher
-# would re-upload stale per-trial JSONs before the new run overwrites them.
-# Done inside docker because the prior run wrote those files as root.
-.buildkite/scripts/run_in_docker.sh bash -c "rm -rf '${ARTIFACT_DIR}'"
+# /tmp/kernel_tuning is bind-mounted host↔container by run_in_docker.sh.
+# Per-build subdir keeps shards isolated from prior builds on the same agent
+# (those files are owned by root and the host buildkite-agent can't unlink).
+BUILD_ROOT="/tmp/kernel_tuning/xla_autotune/build_${BUILDKITE_BUILD_NUMBER:-local}"
+SHARD_DIR="shard_${SLICE_INDEX}_of_${SLICE_COUNT}"
+ARTIFACT_DIR="${BUILD_ROOT}/${SHARD_DIR}"
 mkdir -p "${ARTIFACT_DIR}"
 
 echo "[xla-autotune] shard ${SLICE_INDEX}/${SLICE_COUNT} → ${ARTIFACT_DIR}"
 
-# Watcher: ship per-trial JSONs as their mtime advances, and ship each log
-# bundle exactly once when its sibling `<bundle>.done` marker appears.
+# Background watcher: ship per-trial JSON & summary.jsonl on mtime change;
+# ship each log bundle once its sibling `<bundle>.done` marker appears.
 (
-  cd "${SHARED_ROOT}"
-  declare -A LAST_MTIME=()
-  declare -A UPLOADED_BUNDLE=()
+  cd "${BUILD_ROOT}"
+  declare -A LAST=() SENT=()
   while true; do
     shopt -s nullglob
-    for f in "${SHARD_DIRNAME}"/*.json "${SHARD_DIRNAME}/summary.jsonl"; do
+    for f in "${SHARD_DIR}"/*.json "${SHARD_DIR}/summary.jsonl"; do
       [[ -f "$f" ]] || continue
-      cur_mtime=$(stat -c %Y "$f" 2>/dev/null || echo 0)
-      if [[ "${LAST_MTIME[$f]:-0}" != "$cur_mtime" ]]; then
-        if buildkite-agent artifact upload "$f"; then
-          LAST_MTIME["$f"]=$cur_mtime
-        fi
+      m=$(stat -c %Y "$f" 2>/dev/null || echo 0)
+      if [[ "${LAST[$f]:-0}" != "$m" ]]; then
+        buildkite-agent artifact upload "$f" && LAST["$f"]=$m
       fi
     done
-    for marker in "${SHARD_DIRNAME}"/logs/*.done; do
+    for marker in "${SHARD_DIR}"/logs/*.done; do
       [[ -f "$marker" ]] || continue
-      bundle_dir="${marker%.done}"
-      [[ -d "$bundle_dir" ]] || continue
-      if [[ -z "${UPLOADED_BUNDLE[$bundle_dir]:-}" ]]; then
-        if buildkite-agent artifact upload "${bundle_dir}/**/*"; then
-          UPLOADED_BUNDLE["$bundle_dir"]=1
-        fi
-      fi
+      d="${marker%.done}"
+      [[ -d "$d" && -z "${SENT[$d]:-}" ]] || continue
+      buildkite-agent artifact upload "${d}/**/*" && SENT["$d"]=1
     done
     sleep 20
   done
@@ -89,41 +67,34 @@ echo "[xla-autotune] shard ${SLICE_INDEX}/${SLICE_COUNT} → ${ARTIFACT_DIR}"
 WATCH_PID=$!
 trap 'kill ${WATCH_PID} 2>/dev/null || true' EXIT INT TERM
 
-EXTRA_ARGS=""
-if [[ -n "${AUTOTUNE_CONFIG}" ]]; then
-  EXTRA_ARGS+=" --benchmark-args-json '${AUTOTUNE_CONFIG}'"
-fi
-if [[ -n "${AUTOTUNE_DRY_RUN:-}" ]]; then
-  EXTRA_ARGS+=" --dry-run"
-fi
+EXTRA=()
+[[ -n "${CONFIG}"  ]] && EXTRA+=(--benchmark-args-json "${CONFIG}")
+[[ -n "${DRY_RUN}" ]] && EXTRA+=(--dry-run)
 
 set +e
 .buildkite/scripts/run_in_docker.sh bash -c "
   set -euo pipefail
   cd /workspace/tpu_inference
-  # Pull the shared benchmark_serving harness (matches the convention used
-  # in tests/e2e/benchmarking/bm_qwen3_coder.sh).
+  # Shared benchmark_serving harness — same source as tests/e2e/benchmarking.
   if [ ! -e bench_serving ]; then
     git clone https://github.com/kimbochen/bench_serving.git
   fi
   echo \"bench_serving commit: \$(git -C bench_serving rev-parse HEAD)\"
   python3 .buildkite/xla_autotune/autotuner.py \
-    --flag-list-file '${AUTOTUNE_FLAGS}' \
-    --model '${AUTOTUNE_MODEL}' \
-    --target-metric '${AUTOTUNE_TARGET_METRIC}' \
+    --flag-list-file '${FLAGS}' \
+    --model '${MODEL}' \
+    --target-metric '${METRIC}' \
     --slice-index ${SLICE_INDEX} --slice-count ${SLICE_COUNT} \
-    --baseline-runs ${AUTOTUNE_BASELINE_RUNS} \
+    --baseline-runs ${BASELINES} \
     --artifact-dir '${ARTIFACT_DIR}' \
-    ${EXTRA_ARGS}
+    ${EXTRA[*]}
 "
 RC=$?
 set -e
 
+# Stop the watcher and sweep up anything written after its last tick.
 kill "${WATCH_PID}" 2>/dev/null || true
 wait "${WATCH_PID}" 2>/dev/null || true
-
-# Final sweep: pick up anything written between the watcher's last tick and
-# the docker exit.
-( cd "${SHARED_ROOT}" && buildkite-agent artifact upload "${SHARD_DIRNAME}/**/*" || true )
+( cd "${BUILD_ROOT}" && buildkite-agent artifact upload "${SHARD_DIR}/**/*" || true )
 
 exit "${RC}"
