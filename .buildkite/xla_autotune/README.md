@@ -13,7 +13,6 @@ per candidate flag.
 ├── vllm_test_framework.py   vllm serve + benchmark_serving driver, production defaults
 ├── flags.txt                Candidate flags, one per line
 ├── pipeline.yml             Buildkite pipeline definition (4-shard matrix)
-├── bench_serving/           Pinned snapshot of vLLM's benchmark_serving.py + deps
 └── README.md
 ```
 
@@ -21,7 +20,11 @@ The host-side wrapper that runs inside each Buildkite step lives at
 `.buildkite/scripts/run_xla_autotune_shard.sh`.  It is responsible for
 launching `autotuner.py` inside the docker container and incrementally
 uploading per-trial JSON + log bundles to Buildkite artifacts as soon as
-they land.
+they land.  It also `git clone`s
+[`kimbochen/bench_serving`](https://github.com/kimbochen/bench_serving)
+into the docker workdir, matching the convention used by
+`tests/e2e/benchmarking/bm_qwen3_coder.sh` so every serving benchmark in
+the repo shares one harness.
 
 ## How it works
 

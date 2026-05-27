@@ -41,10 +41,11 @@ from enum import Enum
 from typing import Any, Dict, List, Optional
 
 
-_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_BENCHMARK_SCRIPT_PATH: str = os.path.join(
-    _THIS_DIR, "bench_serving", "benchmark_serving.py"
-)
+# bench_serving is cloned at runtime into the docker workdir; see
+# run_xla_autotune_shard.sh.  Same source/path as tests/e2e/benchmarking
+# scripts (e.g. bm_qwen3_coder.sh) so all serving benchmarks share one
+# pinned harness.
+DEFAULT_BENCHMARK_SCRIPT_PATH: str = "bench_serving/benchmark_serving.py"
 DEFAULT_MODEL: str = "Qwen/Qwen3.5-397B-A17B-FP8"
 DEFAULT_HOST: str = "0.0.0.0"
 DEFAULT_PORT: int = 8000

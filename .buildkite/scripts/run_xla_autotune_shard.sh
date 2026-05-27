@@ -100,6 +100,12 @@ set +e
 .buildkite/scripts/run_in_docker.sh bash -c "
   set -euo pipefail
   cd /workspace/tpu_inference
+  # Pull the shared benchmark_serving harness (matches the convention used
+  # in tests/e2e/benchmarking/bm_qwen3_coder.sh).
+  if [ ! -e bench_serving ]; then
+    git clone https://github.com/kimbochen/bench_serving.git
+  fi
+  echo \"bench_serving commit: \$(git -C bench_serving rev-parse HEAD)\"
   python3 .buildkite/xla_autotune/autotuner.py \
     --flag-list-file '${AUTOTUNE_FLAGS}' \
     --model '${AUTOTUNE_MODEL}' \
