@@ -1,3 +1,0 @@
-# SMOKE TEST: a single candidate flag that's known to be cheap to recompile.
-# Goal: validate cache-hit behaviour, not measure throughput change.
---xla_tpu_enable_flash_attention=false

@@ -1,29 +1,31 @@
 #!/usr/bin/env python3
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """XLA flag auto-tuner.
 
-Drives `vllm_test_framework.VLLMTestFramework` to evaluate a list of
-candidate XLA / libtpu flags against a baseline.
+Drives ``VLLMTestFramework`` to benchmark a list of candidate XLA / libtpu
+flags against a baseline using one-factor-at-a-time (OFAT).
 
-The CLI is sharded — each invocation handles `--slice-index` of
-`--slice-count` (1-based), so it can be fanned out across N Buildkite VMs
-on a single matrix step.  Every shard *also* runs `--baseline-runs`
-baseline trials (default 3) so the noise floor can be re-estimated per
-machine.
+The CLI is sharded — each invocation handles ``--slice-index`` of
+``--slice-count`` (1-based), so it fans out cleanly across a Buildkite
+matrix step.  Every shard also runs ``--baseline-runs`` baseline trials so
+the noise floor can be re-estimated per machine.
 
-Schedulers
-----------
-
-* ``ofat``        — one-flag-at-a-time.  Implemented.
-* ``orthogonal``  — placeholder.  Raises NotImplementedError.
-* ``optuna``      — placeholder.  Raises NotImplementedError.
-
-Output
-------
-
-For every trial the autotuner writes ``<trial-id>.json`` into
-``--artifact-dir`` *immediately* after the trial finishes, so partial
-progress survives a crash.  The file is also appended to a per-shard
-``summary.jsonl``.
+Each trial's record is written to ``<artifact-dir>/<trial_id>.json`` and
+appended to ``summary.jsonl`` as soon as it finishes, so partial progress
+survives a crash and the host-side watcher can ship results incrementally.
 """
 
 from __future__ import annotations
@@ -35,20 +37,11 @@ import os
 import sys
 import time
 import traceback
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-# Make the sibling vllm_test_framework importable.  The framework module
-# lives in the same directory as this script when shipped inside the
-# tpu-inference repo (.buildkite/xla_autotune/), and at the repo root when
-# run from the autotuner dev tree (/workspace/).  Try both.
-_SELF_DIR = os.path.dirname(os.path.abspath(__file__))
-_REPO_ROOT = os.path.dirname(os.path.dirname(_SELF_DIR))
-for _p in (_SELF_DIR, _REPO_ROOT):
-    if _p and _p not in sys.path:
-        sys.path.insert(0, _p)
-
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from vllm_test_framework import (  # noqa: E402
     VLLMTestFramework,
     VLLMTestParam,
@@ -56,13 +49,8 @@ from vllm_test_framework import (  # noqa: E402
 )
 
 
-# ---------------------------------------------------------------------------
-# Trial planning
-# ---------------------------------------------------------------------------
-
 @dataclass
 class Trial:
-    """One unit of work: launch vllm with `extra_flags` and benchmark it."""
     trial_id: str
     kind: str            # "baseline" | "candidate"
     flag: Optional[str]  # None for baseline; one extra flag for candidate
@@ -70,11 +58,7 @@ class Trial:
 
 
 def slice_flags(flags: List[str], slice_index: int, slice_count: int) -> List[str]:
-    """Split `flags` into `slice_count` contiguous chunks and return chunk `slice_index` (1-based).
-
-    100 flags / 4 shards → shard 1 gets flags[0:25], shard 2 flags[25:50], etc.
-    Trailing remainder is appended to the last shard.
-    """
+    """Contiguous-chunk shard: shard ``slice_index`` of ``slice_count``."""
     if slice_index < 1 or slice_index > slice_count:
         raise ValueError(f"slice_index {slice_index} out of [1, {slice_count}]")
     chunk = math.ceil(len(flags) / slice_count)
@@ -83,77 +67,38 @@ def slice_flags(flags: List[str], slice_index: int, slice_count: int) -> List[st
     return flags[start:end]
 
 
-class Scheduler:
-    """Base scheduler: turns a sliced flag list into a sequence of Trials."""
+def plan_ofat(
+    sliced_flags: List[str],
+    baseline_flags: List[str],
+    baseline_runs: int,
+) -> List[Trial]:
+    """Plan: ``baseline_runs`` baselines, then each candidate flag once."""
+    trials: List[Trial] = []
+    for i in range(baseline_runs):
+        trials.append(Trial(
+            trial_id=f"baseline_{i+1:02d}",
+            kind="baseline",
+            flag=None,
+            extra_flags=list(baseline_flags),
+        ))
+    for idx, flag in enumerate(sliced_flags):
+        trials.append(Trial(
+            trial_id=f"cand_{idx+1:03d}",
+            kind="candidate",
+            flag=flag,
+            extra_flags=list(baseline_flags) + [flag],
+        ))
+    return trials
 
-    def __init__(self, baseline_flags: List[str], baseline_runs: int):
-        self.baseline_flags = list(baseline_flags)
-        self.baseline_runs = baseline_runs
-
-    def plan(self, sliced_flags: List[str]) -> List[Trial]:
-        raise NotImplementedError
-
-
-class OFATScheduler(Scheduler):
-    """One-factor-at-a-time: baseline ×N then each candidate flag once."""
-
-    def plan(self, sliced_flags: List[str]) -> List[Trial]:
-        trials: List[Trial] = []
-        for i in range(self.baseline_runs):
-            trials.append(Trial(
-                trial_id=f"baseline_{i+1:02d}",
-                kind="baseline",
-                flag=None,
-                extra_flags=list(self.baseline_flags),
-            ))
-        for idx, flag in enumerate(sliced_flags):
-            trials.append(Trial(
-                trial_id=f"cand_{idx+1:03d}",
-                kind="candidate",
-                flag=flag,
-                extra_flags=list(self.baseline_flags) + [flag],
-            ))
-        return trials
-
-
-class OrthogonalScheduler(Scheduler):
-    """Placeholder — orthogonal-array experiment design."""
-
-    def plan(self, sliced_flags: List[str]) -> List[Trial]:
-        raise NotImplementedError("orthogonal scheduler not implemented yet")
-
-
-class OptunaScheduler(Scheduler):
-    """Placeholder — Optuna-driven Bayesian search."""
-
-    def plan(self, sliced_flags: List[str]) -> List[Trial]:
-        raise NotImplementedError("optuna scheduler not implemented yet")
-
-
-SCHEDULERS = {
-    "ofat": OFATScheduler,
-    "orthogonal": OrthogonalScheduler,
-    "optuna": OptunaScheduler,
-}
-
-
-# ---------------------------------------------------------------------------
-# Trial execution
-# ---------------------------------------------------------------------------
 
 def _load_lines(path: str) -> List[str]:
-    """Read a file as a list of non-empty, non-comment lines."""
     with open(path) as f:
-        return [
-            ln.strip()
-            for ln in f
-            if ln.strip() and not ln.strip().startswith("#")
-        ]
+        return [ln.strip() for ln in f if ln.strip() and not ln.strip().startswith("#")]
 
 
-def _load_json(path: Optional[str]) -> Optional[Dict[str, Any]]:
+def _load_json(path: Optional[str]) -> Dict[str, Any]:
     if not path:
-        return None
+        return {}
     with open(path) as f:
         return json.load(f)
 
@@ -161,20 +106,18 @@ def _load_json(path: Optional[str]) -> Optional[Dict[str, Any]]:
 def _build_test_param(
     model: str,
     extra_flags: List[str],
-    base_param_overrides: Dict[str, Any],
+    overrides: Dict[str, Any],
     tag: str,
 ) -> VLLMTestParam:
     p = VLLMTestParam()
     p.model_name = model
     p.tag = tag
-    # Append candidate / baseline flags AFTER the framework's default
-    # production-tuned LIBTPU set.  Overwriting would mint a fresh
-    # LIBTPU_INIT_ARGS string that the GCS JAX compile cache has no
-    # entries for → ~90 min cold compile per trial.
+    # Append; do not overwrite.  The framework's default LIBTPU set is what
+    # the GCS-backed JAX compile cache is keyed on — replacing it would
+    # invalidate every cache entry and force a ~90 min cold compile.
     p.extra_libtpu_init_args = list(p.extra_libtpu_init_args) + list(extra_flags)
-    for k, v in (base_param_overrides or {}).items():
-        # Allow `_`-prefixed keys (e.g. `_comment`) as JSON-comment metadata.
-        if k.startswith("_"):
+    for k, v in overrides.items():
+        if k.startswith("_"):  # allow `_comment` style JSON metadata
             continue
         if not hasattr(p, k):
             raise ValueError(f"unknown VLLMTestParam field: {k}")
@@ -185,13 +128,13 @@ def _build_test_param(
 def _run_trial(
     trial: Trial,
     model: str,
-    base_param_overrides: Dict[str, Any],
+    overrides: Dict[str, Any],
     artifact_dir: str,
     target_metric: str,
     dry_run: bool,
     summary_fp,
 ) -> Dict[str, Any]:
-    """Execute one trial and persist its artifact.  Never raises."""
+    """Run one trial, persist its artifact, never raise."""
     started = datetime.utcnow().isoformat()
     t0 = time.time()
     record: Dict[str, Any] = {
@@ -207,18 +150,15 @@ def _run_trial(
         "target_value": None,
         "error": "",
     }
-    # Every trial gets its own log directory under <artifact_dir>/logs/ so
-    # the host-side Buildkite watcher can ship the full bundle (vllm server
-    # log, env dump, benchmark stdout, etc.) as artifacts.
     logs_root = os.path.join(artifact_dir, "logs")
     os.makedirs(logs_root, exist_ok=True)
-    trial_exp_dir = None
+    trial_exp_dir: Optional[str] = None
 
     try:
         param = _build_test_param(
             model=model,
             extra_flags=trial.extra_flags,
-            base_param_overrides=base_param_overrides,
+            overrides=overrides,
             tag=f"autotune_{trial.trial_id}",
         )
         param.base_log_dir = logs_root
@@ -230,10 +170,7 @@ def _run_trial(
             record["success"] = bool(result.success)
             record["metrics"] = dict(result.metrics)
             record["error"] = result.error_message or ""
-            # Resolve the target value: the framework's metrics dict is keyed
-            # by per-benchmark task name (e.g. "benchmark_1024_1024"); pick
-            # the *first* sub-result's `target_metric` for the summary.
-            for _sub, sub_metrics in result.metrics.items():
+            for sub_metrics in result.metrics.values():
                 if isinstance(sub_metrics, dict) and target_metric in sub_metrics:
                     record["target_value"] = sub_metrics[target_metric]
                     break
@@ -243,24 +180,21 @@ def _run_trial(
     record["duration_sec"] = round(time.time() - t0, 2)
     record["finished_utc"] = datetime.utcnow().isoformat()
 
-    # Write per-trial artifact + append to summary.jsonl right away.
     out_path = os.path.join(artifact_dir, f"{trial.trial_id}.json")
     with open(out_path, "w") as f:
         json.dump(record, f, indent=2)
     summary_fp.write(json.dumps(record) + "\n")
     summary_fp.flush()
 
-    # Drop a descriptive _tag.txt + .done marker next to the trial log dir
-    # so the watcher can: (a) show a human-readable summary in BK and
-    # (b) upload the complete dir as a unit only after it's been fully
-    # written.
+    # Drop a human-readable _tag.txt + a .done marker the watcher uses to
+    # detect that the log bundle is complete and safe to upload.
     if trial_exp_dir and os.path.exists(trial_exp_dir):
         try:
             with open(os.path.join(trial_exp_dir, "_tag.txt"), "w") as f:
                 f.write(
                     f"trial_id        : {trial.trial_id}\n"
                     f"kind            : {trial.kind}\n"
-                    f"flag            : {trial.flag or '(baseline, no extra flag)'}\n"
+                    f"flag            : {trial.flag or '(baseline)'}\n"
                     f"model           : {model}\n"
                     f"target_metric   : {target_metric}\n"
                     f"target_value    : {record['target_value']}\n"
@@ -273,6 +207,7 @@ def _run_trial(
             open(trial_exp_dir + ".done", "w").close()
         except Exception:  # noqa: BLE001
             pass
+
     print(
         f"[autotune] {trial.trial_id} kind={trial.kind} "
         f"success={record['success']} {target_metric}={record['target_value']} "
@@ -282,28 +217,21 @@ def _run_trial(
     return record
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--flag-list-file", required=True,
-                    help="One XLA flag per line, e.g. --xla_tpu_foo=true")
+                    help="One XLA flag per line (e.g. --xla_tpu_foo=true).")
     ap.add_argument("--baseline-flags-file", default=None,
                     help="Flags applied to every trial (incl. baselines). "
                          "Defaults to none — pure stock baseline.")
     ap.add_argument("--model", required=True,
-                    help="Model name, must be a key in MODEL_CONFIGS.")
+                    help="Model name; must appear in VLLMTestParam.model_configs.")
     ap.add_argument("--benchmark-args-json", default=None,
-                    help="Optional JSON file overriding VLLMTestParam fields "
-                         "(benchmark_args, model_benchmark_configs, …).")
-    ap.add_argument("--target-metric", default="output_throughput",
-                    help="Metric key inside each per-benchmark result dict.")
-    ap.add_argument("--scheduler", choices=list(SCHEDULERS), default="ofat")
+                    help="JSON file of VLLMTestParam field overrides.")
+    ap.add_argument("--target-metric", default="total_token_throughput")
     ap.add_argument("--slice-index", type=int, default=1)
     ap.add_argument("--slice-count", type=int, default=1)
-    ap.add_argument("--baseline-runs", type=int, default=3)
+    ap.add_argument("--baseline-runs", type=int, default=2)
     ap.add_argument("--artifact-dir", required=True)
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
@@ -312,19 +240,15 @@ def main() -> int:
     baseline_flags = (
         _load_lines(args.baseline_flags_file) if args.baseline_flags_file else []
     )
-    base_param_overrides = _load_json(args.benchmark_args_json) or {}
+    overrides = _load_json(args.benchmark_args_json)
 
     sliced = slice_flags(flags, args.slice_index, args.slice_count)
-    scheduler = SCHEDULERS[args.scheduler](
-        baseline_flags=baseline_flags,
-        baseline_runs=args.baseline_runs,
-    )
-    trials = scheduler.plan(sliced)
+    trials = plan_ofat(sliced, baseline_flags, args.baseline_runs)
 
     os.makedirs(args.artifact_dir, exist_ok=True)
     manifest = {
         "model": args.model,
-        "scheduler": args.scheduler,
+        "scheduler": "ofat",
         "slice_index": args.slice_index,
         "slice_count": args.slice_count,
         "total_flags": len(flags),
@@ -351,7 +275,7 @@ def main() -> int:
             rec = _run_trial(
                 trial=trial,
                 model=args.model,
-                base_param_overrides=base_param_overrides,
+                overrides=overrides,
                 artifact_dir=args.artifact_dir,
                 target_metric=args.target_metric,
                 dry_run=args.dry_run,
