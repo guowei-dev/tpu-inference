@@ -50,7 +50,8 @@ ARTIFACT_DIR="${SHARED_ROOT}/${SHARD_DIRNAME}"
 
 # Wipe leftovers from any prior build on this agent VM, otherwise the watcher
 # would re-upload stale per-trial JSONs before the new run overwrites them.
-rm -rf "${ARTIFACT_DIR}"
+# Done inside docker because the prior run wrote those files as root.
+.buildkite/scripts/run_in_docker.sh bash -c "rm -rf '${ARTIFACT_DIR}'"
 mkdir -p "${ARTIFACT_DIR}"
 
 echo "[xla-autotune] shard ${SLICE_INDEX}/${SLICE_COUNT} → ${ARTIFACT_DIR}"
