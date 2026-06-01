@@ -24,6 +24,25 @@ from vllm import LLM, SamplingParams
 from vllm.v1.metrics.reader import Counter
 
 
+def _disable_shardy_for_qwen35_4b(mp: pytest.MonkeyPatch) -> None:
+    """Route JIT lowering through the legacy GSPMD partitioner for the next
+    ``LLM(...)`` call in this monkeypatch scope.
+
+    libtpu 0.0.41 crashes inside ``mlir::sdy::InsertExplicitReshardsPass`` ->
+    ``redistributeAxes`` while compiling ``embed_multimodal`` for Qwen3.5-4B's
+    vision-tower JIT region. Forcing Shardy off (both the JAX-level flag the
+    engine subprocess reads on import and the libtpu-level
+    ``--xla_use_shardy=false``) side-steps the crash. The setting only lives
+    for the monkeypatch's scope, so other tests keep the new partitioner.
+
+    TODO: remove once the libtpu Shardy InsertExplicitReshardsPass fix lands.
+    """
+    mp.setenv("JAX_USE_SHARDY_PARTITIONER", "false")
+    libtpu_args = os.environ.get("LIBTPU_INIT_ARGS", "")
+    if "--xla_use_shardy" not in libtpu_args:
+        mp.setenv("LIBTPU_INIT_ARGS", "--xla_use_shardy=false " + libtpu_args)
+
+
 # TODO (Qiliang Cui): remove this when XLA fixes the recursive jit call issue.
 def _is_v7x():
     # jax.devices() will hang so use TPU_VERSION to indicate the version.
@@ -522,6 +541,7 @@ def mtp_baseline():
     }
     test_prompts = get_eagle3_test_prompts()
     with pytest.MonkeyPatch.context() as mp:
+        _disable_shardy_for_qwen35_4b(mp)
         ref_outputs = _get_baseline_results(
             mp,
             sampling_config,
@@ -547,6 +567,7 @@ def test_mtp_correctness(
     model_name = "Qwen/Qwen3.5-4B"
     monkeypatch.setenv("MODEL_IMPL_TYPE", "vllm")
     monkeypatch.setenv("DRAFT_MODEL_IMPL_TYPE", "vllm")
+    _disable_shardy_for_qwen35_4b(monkeypatch)
 
     speculative_config = {
         "method": "mtp",
@@ -587,6 +608,7 @@ def test_mtp_performance(
     model_name = "Qwen/Qwen3.5-4B"
     monkeypatch.setenv("MODEL_IMPL_TYPE", "vllm")
     monkeypatch.setenv("DRAFT_MODEL_IMPL_TYPE", "vllm")
+    _disable_shardy_for_qwen35_4b(monkeypatch)
 
     extra_kwargs = {
         "seed": 42,
