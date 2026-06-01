@@ -79,6 +79,38 @@ steps:
   # Shows how to start a server and run a benchmark against it.
   # Uses --dataset-name random so no dataset file is needed.
   # -----------------------------------------------------------------
+  # -----------------------------------------------------------------
+  # PR #2711 validation: run the JAX unit-tests "part2" surface that
+  # failed in tpu-inference-ci build 19002 to confirm the test_qwen3
+  # tight-threshold-guard fix passes under jax 0.10.1 / libtpu 0.0.41.
+  # Branch-only step; do not merge.
+  # -----------------------------------------------------------------
+  - label: "tpu7x [PR2711] JAX unit tests part2"
+    key: tpu7x_pr2711_jax_part2
+    depends_on: tpu7x_build_docker
+    env:
+      USE_PREBUILT_IMAGE: "1"
+      TPU_VERSION: "tpu7x"
+    agents:
+      queue: tpu_v7x_2_queue
+    commands:
+      - |
+        .buildkite/scripts/run_in_docker.sh bash -c "python3 -m pytest -s -v -x /workspace/tpu_inference/tests/ \
+          --ignore=/workspace/tpu_inference/tests/layers/vllm/backends/test_flash_attn.py \
+          --ignore=/workspace/tpu_inference/tests/layers/vllm/test_awq.py \
+          --ignore=/workspace/tpu_inference/tests/layers/vllm/test_compressed_tensors_moe.py \
+          --ignore=/workspace/tpu_inference/tests/layers/vllm/test_compressed_tensors_w8a8_fp8.py \
+          --ignore=/workspace/tpu_inference/tests/layers/vllm/test_compressed_tensors_w8a8_int8.py \
+          --ignore=/workspace/tpu_inference/tests/kernels \
+          --ignore=/workspace/tpu_inference/tests/lora \
+          --ignore=/workspace/tpu_inference/tests/e2e \
+          --ignore=/workspace/tpu_inference/tpu_inference/mock \
+          --ignore=/workspace/tpu_inference/tests/models/jax/test_deepseek_v3.py \
+          --ignore=/workspace/tpu_inference/tests/offload/tpu_offload_multi_request_accuracy_test.py \
+          --ignore=/workspace/tpu_inference/tests/offload/tpu_offload_accuracy_test.py \
+          --ignore=/workspace/tpu_inference/tests/offload/tpu_offload_performance_test.py \
+          --ignore=/workspace/tpu_inference/tests/core/test_dp_group_sampling_prefix_cache.py"
+
   - label: "tpu7x [demo] vllm serve + vllm bench serve"
     key: tpu7x_demo_serve_bench
     depends_on: tpu7x_build_docker
