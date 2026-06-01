@@ -242,6 +242,7 @@ class TestQwen3ForCausalLM:
             model = Qwen3ForCausalLM(config, rng, mesh)
             loader = get_model_loader(config.load_config)
 
+            sentinel = None
             with pytest.raises(AssertionError, match="exceeded threshold"):
                 with assert_weight_loading_memory_bounded(
                         model,
@@ -249,7 +250,18 @@ class TestQwen3ForCausalLM:
                         threshold_multiplier=0.001,
                         min_threshold_bytes=1,
                 ), set_current_vllm_config(config):
+                    # load_weights overwrites pre-allocated buffers
+                    # in-place, so on its own peak_delta is zero (and
+                    # bytes_after even drops slightly below bytes_before).
+                    # Hold a sentinel HBM allocation that survives past
+                    # the guard's bytes_after snapshot so the tight
+                    # threshold is actually exceeded; size it well above
+                    # the few MB freed by load_weights so it dominates
+                    # the net delta.
+                    sentinel = jax.block_until_ready(
+                        jnp.ones((1 << 24, ), dtype=jnp.bfloat16))
                     loader.load_weights(model, config.model_config)
+            del sentinel
 
     @pytest.mark.parametrize("model_name",
                              ["Qwen/Qwen3-0.6B", "Qwen/Qwen3-0.6B-FP8"])
