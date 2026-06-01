@@ -611,7 +611,24 @@ def test_mtp_correctness(
     "max_num_seqs,async_scheduling",
     [
         (1, False),
-        (20, False),
+        # Under libtpu 0.0.41, Qwen3.5-4B mtp forces the GSPMD partitioner
+        # fallback (see _disable_shardy_for_qwen35_4b for the libtpu
+        # InsertExplicitReshardsPass segfault). GSPMD selects a layout for
+        # _select_from_array_fn's gather that needs 37.92 MiB scoped vmem
+        # vs the 32 MiB libtpu limit at max_num_seqs=20; Shardy fits within
+        # the limit but crashes the partitioner itself. Mark xfail until
+        # the libtpu fix lets us turn Shardy back on.
+        pytest.param(
+            20,
+            False,
+            marks=pytest.mark.xfail(
+                reason=("Qwen3.5-4B mtp[20] hits CompileTimeScopedVmemOom on "
+                        "GSPMD fallback while libtpu 0.0.41 Shardy "
+                        "InsertExplicitReshardsPass is broken; revisit "
+                        "after libtpu fix lands."),
+                strict=False,
+            ),
+        ),
         # (20, True),
     ],
 )
