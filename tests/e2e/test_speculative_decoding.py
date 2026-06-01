@@ -18,22 +18,36 @@ import os
 import random
 import string
 import time
+from contextlib import contextmanager
 
+import jax
 import pytest
 from vllm import LLM, SamplingParams
 from vllm.v1.metrics.reader import Counter
 
 
-def _disable_shardy_for_qwen35_4b(mp: pytest.MonkeyPatch) -> None:
-    """Route JIT lowering through the legacy GSPMD partitioner for the next
-    ``LLM(...)`` call in this monkeypatch scope.
+@contextmanager
+def _disable_shardy_for_qwen35_4b(mp: pytest.MonkeyPatch):
+    """Route JIT lowering through the legacy GSPMD partitioner for the
+    ``LLM(...)`` call(s) inside this ``with`` block.
 
     libtpu 0.0.41 crashes inside ``mlir::sdy::InsertExplicitReshardsPass`` ->
     ``redistributeAxes`` while compiling ``embed_multimodal`` for Qwen3.5-4B's
-    vision-tower JIT region. Forcing Shardy off (both the JAX-level flag the
-    engine subprocess reads on import and the libtpu-level
-    ``--xla_use_shardy=false``) side-steps the crash. The setting only lives
-    for the monkeypatch's scope, so other tests keep the new partitioner.
+    vision-tower JIT region. Three layers are needed to fully suppress Shardy
+    for one LLM creation:
+
+    1. ``JAX_USE_SHARDY_PARTITIONER=false`` env — covers a freshly-spawned
+       subprocess that re-imports jax (``VLLM_WORKER_MULTIPROC_METHOD=spawn``).
+    2. ``--xla_use_shardy=false`` appended to ``LIBTPU_INIT_ARGS`` — covers
+       libtpu's own compile pipeline regardless of JAX's choice.
+    3. ``jax.config.update(jax_use_shardy_partitioner=False)`` — covers
+       fork-mode subprocesses (vLLM's default): the child inherits the
+       parent's already-initialised in-memory ``jax.config`` state, and env
+       vars set *after* jax was imported are ignored by the child. The
+       in-memory flip is what actually unblocks fork.
+
+    Restores the previous ``jax.config`` value on exit so other tests in
+    the same module keep the new partitioner.
 
     TODO: remove once the libtpu Shardy InsertExplicitReshardsPass fix lands.
     """
@@ -41,6 +55,12 @@ def _disable_shardy_for_qwen35_4b(mp: pytest.MonkeyPatch) -> None:
     libtpu_args = os.environ.get("LIBTPU_INIT_ARGS", "")
     if "--xla_use_shardy" not in libtpu_args:
         mp.setenv("LIBTPU_INIT_ARGS", "--xla_use_shardy=false " + libtpu_args)
+    prev_shardy = jax.config.jax_use_shardy_partitioner
+    jax.config.update("jax_use_shardy_partitioner", False)
+    try:
+        yield
+    finally:
+        jax.config.update("jax_use_shardy_partitioner", prev_shardy)
 
 
 # TODO (Qiliang Cui): remove this when XLA fixes the recursive jit call issue.
@@ -540,8 +560,7 @@ def mtp_baseline():
         "gpu_memory_utilization": 0.90,
     }
     test_prompts = get_eagle3_test_prompts()
-    with pytest.MonkeyPatch.context() as mp:
-        _disable_shardy_for_qwen35_4b(mp)
+    with pytest.MonkeyPatch.context() as mp, _disable_shardy_for_qwen35_4b(mp):
         ref_outputs = _get_baseline_results(
             mp,
             sampling_config,
@@ -567,7 +586,6 @@ def test_mtp_correctness(
     model_name = "Qwen/Qwen3.5-4B"
     monkeypatch.setenv("MODEL_IMPL_TYPE", "vllm")
     monkeypatch.setenv("DRAFT_MODEL_IMPL_TYPE", "vllm")
-    _disable_shardy_for_qwen35_4b(monkeypatch)
 
     speculative_config = {
         "method": "mtp",
@@ -575,17 +593,18 @@ def test_mtp_correctness(
     }
     test_prompts, ref_outputs, extra_kwargs = mtp_baseline
 
-    _test_correctness_helper(
-        monkeypatch,
-        sampling_config,
-        model_name,
-        speculative_config=speculative_config,
-        test_prompts=test_prompts,
-        ref_outputs=ref_outputs,
-        max_num_seqs=10,
-        async_scheduling=async_scheduling,
-        extra_kwargs=extra_kwargs,
-    )
+    with _disable_shardy_for_qwen35_4b(monkeypatch):
+        _test_correctness_helper(
+            monkeypatch,
+            sampling_config,
+            model_name,
+            speculative_config=speculative_config,
+            test_prompts=test_prompts,
+            ref_outputs=ref_outputs,
+            max_num_seqs=10,
+            async_scheduling=async_scheduling,
+            extra_kwargs=extra_kwargs,
+        )
 
 
 @pytest.mark.parametrize(
@@ -608,7 +627,6 @@ def test_mtp_performance(
     model_name = "Qwen/Qwen3.5-4B"
     monkeypatch.setenv("MODEL_IMPL_TYPE", "vllm")
     monkeypatch.setenv("DRAFT_MODEL_IMPL_TYPE", "vllm")
-    _disable_shardy_for_qwen35_4b(monkeypatch)
 
     extra_kwargs = {
         "seed": 42,
@@ -619,16 +637,17 @@ def test_mtp_performance(
         "gpu_memory_utilization": 0.90,
     }
 
-    _test_performance_helper(
-        monkeypatch,
-        sampling_config,
-        speculative_config={
-            "method": "mtp",
-            "num_speculative_tokens": 3,
-        },
-        min_acceptance_rate=0.99,
-        max_num_seqs=max_num_seqs,
-        async_scheduling=async_scheduling,
-        model_name=model_name,
-        extra_kwargs=extra_kwargs,
-    )
+    with _disable_shardy_for_qwen35_4b(monkeypatch):
+        _test_performance_helper(
+            monkeypatch,
+            sampling_config,
+            speculative_config={
+                "method": "mtp",
+                "num_speculative_tokens": 3,
+            },
+            min_acceptance_rate=0.99,
+            max_num_seqs=max_num_seqs,
+            async_scheduling=async_scheduling,
+            model_name=model_name,
+            extra_kwargs=extra_kwargs,
+        )
