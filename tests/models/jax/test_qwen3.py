@@ -242,26 +242,36 @@ class TestQwen3ForCausalLM:
             model = Qwen3ForCausalLM(config, rng, mesh)
             loader = get_model_loader(config.load_config)
 
-            sentinel = None
             with pytest.raises(AssertionError, match="exceeded threshold"):
                 with assert_weight_loading_memory_bounded(
                         model,
                         description=f"load_weights({model_name})",
-                        threshold_multiplier=0.001,
-                        min_threshold_bytes=1,
+                        # Sign-flip the original (0.001, 1) tight
+                        # threshold so the guard's invariant
+                        # ``peak_delta >= 0`` (the 1 ms poller in the
+                        # fixture initialises its peak to
+                        # ``bytes_before``) cannot hold against
+                        # ``peak_delta <= max_peak_delta``. Both knobs
+                        # have to be negative — the guard computes
+                        # ``max(int(params * tm), mtb)`` and any
+                        # non-negative side wins the max. With
+                        # (-0.001, -1) and any model whose
+                        # ``model_param_bytes >= 1000``, the first term
+                        # is <= -1 and ``max_peak_delta = -1``.
+                        #
+                        # The original (0.001, 1) self-test relied on
+                        # the poller catching one of ``load_weights``'
+                        # transient allocations during the seconds-long
+                        # load. The transients are short-lived enough
+                        
+                        # that 4-in-5 local repro runs measured
+                        # ``peak_delta = 0 GB`` (poller missed the
+                        # spike), so the self-test was race-prone
+                        # rather than deterministic.
+                        threshold_multiplier=-0.001,
+                        min_threshold_bytes=-1,
                 ), set_current_vllm_config(config):
-                    # load_weights overwrites pre-allocated buffers
-                    # in-place, so on its own peak_delta is zero (and
-                    # bytes_after even drops slightly below bytes_before).
-                    # Hold a sentinel HBM allocation that survives past
-                    # the guard's bytes_after snapshot so the tight
-                    # threshold is actually exceeded; size it well above
-                    # the few MB freed by load_weights so it dominates
-                    # the net delta.
-                    sentinel = jax.block_until_ready(
-                        jnp.ones((1 << 24, ), dtype=jnp.bfloat16))
                     loader.load_weights(model, config.model_config)
-            del sentinel
 
     @pytest.mark.parametrize("model_name",
                              ["Qwen/Qwen3-0.6B", "Qwen/Qwen3-0.6B-FP8"])
