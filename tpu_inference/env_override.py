@@ -22,6 +22,14 @@ os.environ[
     "LIBTPU_INIT_ARGS"] = "--xla_tpu_use_dynamic_smem_negotiation=true " + os.environ.get(
         "LIBTPU_INIT_ARGS", "")
 
+# TODO: Remove this when the Shardy partitioner segfault in libtpu 0.0.41 is
+# fixed upstream. libtpu's InsertExplicitReshardsPass crashes inside
+# mlir::sdy::redistributeAxes when lowering certain vision-tower JIT regions
+# (observed on Qwen3.5-4B during test_speculative_decoding::test_mtp_correctness).
+# Falling back to the legacy GSPMD partitioner avoids the crash. Honour any
+# value the caller has already set so opt-in Shardy testing still works.
+os.environ.setdefault("JAX_USE_SHARDY_PARTITIONER", "false")
+
 # Monkeypatch vLLM to avoid ImportError: cannot import name 'SamplingParams' from 'vllm'
 # in vllm/v1/... submodules due to circular imports or lazy loading failures.
 try:
