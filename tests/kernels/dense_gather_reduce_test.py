@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
 import itertools
 
 import jax
@@ -222,6 +223,49 @@ class DenseGatherReduceTest(jtu.JaxTestCase):
             print("DEBUG ACTUAL (first 32 rows):\n", actual[:32, :])
             print("DEBUG DESIRED (first 32 rows):\n", desired[:32, :])
             raise e
+
+    def test_sc_kernel_keeps_output_operand_aliasing(self):
+        """Guards the jax 0.10.1 mpmd_map regression fix.
+
+        The SparseCore ``tpu_custom_call`` must carry destination-passing
+        ``output_to_operand_aliasing``; without it XLA drops the AllocateBuffer
+        double-buffer and the SC kernels stop overlapping with TensorCore ops
+        (~+15% device on the MoE serving path). This kernel must therefore be
+        constructed via ``core_map_helper.kernel`` (not raw ``pl.kernel``, which
+        lowers via ``mpmd_map`` and loses the alias). A revert to ``pl.kernel``
+        regresses this test.
+        """
+        out_size, hidden_size, reduce_group_size = 16384, 512, 8
+        key = jax.random.key(0)
+        x = jax.random.normal(key, (out_size, hidden_size),
+                              jnp.bfloat16)
+        indices = jax.random.permutation(key, out_size).astype(jnp.int32)
+        topk_weights = jax.random.normal(
+            key, (out_size // reduce_group_size, reduce_group_size),
+            jnp.bfloat16)
+
+        compiled = jax.jit(
+            functools.partial(dense_gather_reduce,
+                              reduce_group_size=reduce_group_size)).lower(
+                                  x, indices, topk_weights).compile()
+        hlo = compiled.as_text()
+
+        # The kernel must actually run on SparseCore (not the jax fallback)...
+        self.assertIn("sc_dense_gather_reduce", hlo)
+        self.assertIn('custom_call_target="tpu_custom_call"', hlo)
+        # ...and the SC custom-call must keep destination-passing aliasing.
+        kernel_lines = [
+            line for line in hlo.splitlines()
+            if "sc_dense_gather_reduce" in line
+            and 'custom_call_target="tpu_custom_call"' in line
+        ]
+        self.assertTrue(kernel_lines, "SC custom-call not found in HLO")
+        self.assertTrue(
+            any("output_to_operand_aliasing" in line
+                for line in kernel_lines),
+            "SparseCore dense_gather_reduce lost output_to_operand_aliasing "
+            "(mpmd_map regression) — it must be built via core_map_helper, "
+            "not pl.kernel.")
 
 
 if __name__ == "__main__":

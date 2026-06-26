@@ -27,6 +27,8 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
 
+from tpu_inference.kernels.sparse_core import core_map_helper
+
 
 def is_compatible(
     op: jax.Array,
@@ -111,19 +113,6 @@ def _sc_gather_reduce(
     if topk_weights is not None:
         topk_weights = topk_weights.flatten()
 
-    @jax.jit
-    @pl.kernel(
-        out_type=jax.ShapeDtypeStruct((M_out, K), op.dtype),
-        mesh=plsc.VectorSubcoreMesh(
-            core_axis_name="core",
-            subcore_axis_name="subcore",
-            num_cores=1 if single_sc else sc_info.num_cores,
-        ),
-        compiler_params=pltpu.CompilerParams(
-            use_tc_tiling_on_sc=True,
-            needs_layout_passes=True,
-        ),
-    )
     def kernel(in_hbm_ref, idx_hbm_ref, weights_hbm_ref, out_hbm_ref):
         row_wave_size = row_chunk_size * lax.axis_size(("core", "subcore"))
         if M % row_wave_size:
@@ -232,7 +221,31 @@ def _sc_gather_reduce(
             idx_hbm_ref,
             *([weights_hbm_ref] if weights_hbm_ref is not None else []))
 
-    return kernel(op, idx, topk_weights)  # pylint: disable=no-value-for-parameter
+    # Route through core_map_helper instead of pl.kernel. Since jax 0.10.1
+    # pl.kernel lowers via mpmd_map allocating a FRESH output buffer per call, so
+    # the SC custom-call loses output_to_operand_aliasing -> XLA drops the
+    # AllocateBuffer double-buffer -> SC/TC overlap regresses (~+15% device on the
+    # MoE serving path). core_map_helper allocates the output ref outside
+    # (lax.empty) and closes over it, restoring the destination-passing alias.
+    # lowering="mpmd" stays on jax's current mpmd_map lowering (rather than
+    # core_map) and recovers the alias via that closed-over output ref -- the
+    # future-proof path that does not depend on core_map remaining available.
+    # (#2887 fixed the other single-mesh SC kernels the same way, via core_map.)
+    return core_map_helper.kernel(
+        kernel,
+        out_type=jax.ShapeDtypeStruct((M_out, K), op.dtype),
+        mesh=plsc.VectorSubcoreMesh(
+            core_axis_name="core",
+            subcore_axis_name="subcore",
+            num_cores=1 if single_sc else sc_info.num_cores,
+        ),
+        compiler_params=pltpu.CompilerParams(
+            use_tc_tiling_on_sc=True,
+            needs_layout_passes=True,
+        ),
+        name="sc_dense_gather_reduce",
+        lowering="mpmd",
+    )(op, idx, topk_weights)
 
 
 def _jax_fallback(x,
