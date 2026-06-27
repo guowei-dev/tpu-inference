@@ -159,6 +159,30 @@ class ScatterTest(jtu.JaxTestCase):
             except Exception as e:  # pylint: disable=broad-except
                 print(f"Skipping {name} correctness check due to error: {e}")
 
+    def test_sc_ragged_gather_reduce_v2_no_spmem_overflow(self):
+        """Regression: large input_size must not overflow SparseCore SPMEM.
+
+        v2 (#2836) staged the *entire* row-partition sort permutation into one
+        resident SPMEM scratch (`sorted_by_validity_vmem`), which scales linearly
+        with input_size and overflows the per-subcore tile_spmem budget. On v7,
+        input_size=1,835,008 (hidden=1024) overflows the unfixed kernel with
+        `E3000 CompileTimeSparseCoreAllocationFailure`. The windowed fix bounds
+        the scratch to a fixed window so it compiles for any input_size.
+
+        Compile-only (ShapeDtypeStruct) — no large allocation; hidden kept small
+        so x stays under the 16 GiB SparseCore per-tensor limit.
+        """
+        n, h, rgs = 1_835_008, 1024, 8
+        specs = (
+            jax.ShapeDtypeStruct((n, h), jnp.bfloat16),
+            jax.ShapeDtypeStruct((n, ), jnp.int32),
+            jax.ShapeDtypeStruct((n, ), jnp.bfloat16),
+            jax.ShapeDtypeStruct((n, ), jnp.bool_),
+        )
+        # Must compile without raising E3000 (do NOT swallow — this is the gate).
+        ragged_gather_reduce_v2.lower(*specs,
+                                      reduce_group_size=rgs).compile()
+
     # The first perf test case approximates the DeepSeekV3, 2k-batch-size, EP=16.
     # The second case approximates the Qwen3-Coder-480B, 2k-batch-size, EP=8.
     _perf_test_cases = [
