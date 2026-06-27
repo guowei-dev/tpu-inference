@@ -110,7 +110,7 @@ class CoreMapHelperTest(jtu.JaxTestCase):
         if sc_info is None:
             self.skipTest("SparseCore is not available")
 
-    @parameterized.parameters("core_map", "mpmd")
+    @parameterized.parameters("core_map", "mpmd", "mpmd_out", "mpmd_fix")
     def test_correct_and_aliased(self, lowering):
         rows, hidden = 512, 512
         gather = _make_gather(rows, hidden, lowering)

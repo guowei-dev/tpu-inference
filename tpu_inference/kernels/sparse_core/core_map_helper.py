@@ -74,7 +74,7 @@ def kernel(body,
            debug=False,
            name=None,
            metadata=None,
-           lowering="core_map"):
+           lowering="mpmd_fix"):
     """Drop-in replacement for ``pl.kernel`` with destination-passing output.
 
     Args:
@@ -85,9 +85,18 @@ def kernel(body,
         (~-20% on 397B 8K/1K); see the module docstring. Same kernel-level
         custom-call either way.
     """
-    if lowering not in ("core_map", "mpmd"):
+    if lowering not in ("core_map", "mpmd", "mpmd_out", "mpmd_fix"):
         raise ValueError(
-            f"lowering must be 'core_map' or 'mpmd', got {lowering!r}")
+            "lowering must be 'core_map', 'mpmd', 'mpmd_out', or 'mpmd_fix', "
+            f"got {lowering!r}")
+    if lowering == "mpmd_fix":
+        # Process-wide: re-register mpmd_map's state-discharge to alias only
+        # WRITTEN refs (like core_map), so closed-over read-only input refs are
+        # not donated -> no preservation copies of the live MoE tensor. The
+        # thorough fix for the mpmd serving-prefill regression; see the module
+        # docstring + dev_nexus solve/mpmd-noregress.
+        from . import mpmd_discharge_patch
+        mpmd_discharge_patch.apply()
     single_output = not isinstance(out_type, (tuple, list))
     out_types = (out_type, ) if single_output else out_type
 
@@ -113,10 +122,18 @@ def kernel(body,
             def _(*scratch_refs, **scratch_kwrefs):
                 return body(*arg_refs, *out_refs, *scratch_refs,
                             **scratch_kwrefs)
-        else:  # lowering == "mpmd"
+        elif lowering in ("mpmd", "mpmd_fix"):
             # out_types=() so mpmd_map allocates nothing; the closed-over
-            # out_refs (written then read after) become the destination buffers
-            # and pick up the input_output_alias on discharge.
+            # arg_refs + out_refs (written then read after) become the
+            # destination buffers and pick up the input_output_alias on
+            # discharge. NOTE: stock mpmd_map discharge aliases + force-keeps ALL
+            # closed-over ref invars (the inputs too) -> XLA inserts a
+            # preservation copy of each live input (the gmm output) -> +118 GB/
+            # step on 397B 8K prefill -> ~-20%. "mpmd" leaves that bug in place;
+            # "mpmd_fix" applies mpmd_discharge_patch (alias written-only) above
+            # -> no copies, while keeping this serve-compatible closed-over form
+            # (unlike "mpmd_out", which passes operands and breaks the vLLM
+            # shared-experts trace).
             def body_closed(*scratch_refs, **scratch_kwrefs):
                 return body(*arg_refs, *out_refs, *scratch_refs,
                             **scratch_kwrefs)
@@ -132,6 +149,33 @@ def kernel(body,
                 name=name,
                 metadata=metadata,
             )()
+        else:  # lowering == "mpmd_out"
+            # PASS the operands to mpmd_map (they become *value* invars, not
+            # aliased) and close over ONLY the output ref. Then discharge's
+            # io_indices = just the output ref -> output double-buffer WITHOUT
+            # mpmd_map auto-aliasing/force-keeping the input refs. Intended to
+            # match core_map's serving behavior on the mpmd_map lowering.
+            # (Operands must be non-None: mpmd_map flattens away None, so the
+            # body's positional inputs would shift — the SC kernels pass non-None.)
+            n_in = len(tree_util.tree_leaves(operands))
+
+            def body_out(*in_and_scratch, **scratch_kwrefs):
+                in_refs = in_and_scratch[:n_in]
+                scratch_refs = in_and_scratch[n_in:]
+                return body(*in_refs, *out_refs, *scratch_refs,
+                            **scratch_kwrefs)
+
+            pl_mpmd.mpmd_map(
+                [(mesh, body_out)],
+                out_types=(),
+                scratch_types=scratch_types,
+                compiler_params=compiler_params,
+                interpret=interpret,
+                cost_estimate=cost_estimate,
+                debug=debug,
+                name=name,
+                metadata=metadata,
+            )(*operands)
 
         outs = tree_util.tree_map(lambda ref: ref[...], out_refs)
         return outs[0] if single_output else outs
