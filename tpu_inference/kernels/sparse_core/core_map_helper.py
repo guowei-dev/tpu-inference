@@ -26,20 +26,26 @@ path).
 ``kernel`` here is a drop-in replacement for ``pl.kernel`` that restores the
 output alias by allocating the output ref *outside* the kernel (``jax_core.new_ref``
 over ``lax.empty``) and closing over it in the kernel body -- the destination-passing
-pattern. Two equivalent lowerings produce the identical aliased custom-call:
+pattern. Two lowerings carry that output alias:
 
-* ``lowering="mpmd"`` (default): stay on ``mpmd_map`` (jax's current ``pl.kernel``
-  direction) but pass ``out_types=()`` and let the closed-over output ref carry the
-  destination-passing alias. This recovers the same ``output_to_operand_aliasing`` +
-  ``AllocateBuffer`` **without depending on ``core_map`` remaining available** -- the
-  future-proof path now that jax routes ``pl.kernel`` through ``mpmd_map``.
-* ``lowering="core_map"``: construct the kernel via ``pl_core.core_map`` directly,
-  matching the pre-0.10.1 ``pl.kernel`` lowering. Kept as a fallback.
+* ``lowering="core_map"`` (default): construct the kernel via ``pl_core.core_map``
+  directly, matching the pre-0.10.1 ``pl.kernel`` lowering. ``core_map`` aliases only
+  the *written* output ref, so it gets the double-buffer with no extra ordering edges.
+* ``lowering="mpmd"``: stay on ``mpmd_map`` (jax's current ``pl.kernel`` direction)
+  with ``out_types=()`` and let the closed-over output ref carry the alias.
 
-Both paths emit a byte-identical aliased custom-call (verified at the
-after-optimizations HLO level): identical SC ``tpu_custom_call`` with the
-destination operand + ``AllocateBuffer`` double-buffer. ``mpmd`` is the default so the
-fix does not depend on ``core_map`` surviving the ``pl.kernel`` -> ``mpmd_map`` move.
+Both emit the same aliased SC ``tpu_custom_call`` (destination operand +
+``AllocateBuffer`` double-buffer) at the *kernel* level, BUT they are **not**
+equivalent in the full serving graph. ``mpmd_map`` auto-aliases **all** closed-over
+input refs (not just the written output), which adds ref-ordering edges that
+serialize the serving MoE prefill. Measured on Qwen3.5-397B (TP=8 EP serve, jax
+0.10.2): vs ``core_map``, ``mpmd`` is ~flat on decode (1K/8K) but **~-20% total
+throughput / +38% TTFT on prefill (8K/1K)** -- the handoff "read-ref auto-aliasing"
+axis, distinct from (and opposite-signed to) the output double-buffer it recovers.
+**So ``core_map`` is the default** (output double-buffer WITHOUT the read-ref
+serialization). ``mpmd`` is kept for the upstream discussion (it proves the alias is
+recoverable under ``mpmd_map``); the real jax fix is for ``mpmd_map`` to alias only
+written refs, like ``core_map``.
 """
 
 from jax._src import api
@@ -68,15 +74,16 @@ def kernel(body,
            debug=False,
            name=None,
            metadata=None,
-           lowering="mpmd"):
+           lowering="core_map"):
     """Drop-in replacement for ``pl.kernel`` with destination-passing output.
 
     Args:
-      lowering: ``"mpmd"`` (default) stays on ``mpmd_map`` (jax's current
-        ``pl.kernel`` direction) and recovers the output aliasing via the
-        closed-over output ref; ``"core_map"`` constructs the kernel via
-        ``pl_core.core_map`` (the pre-0.10.1 lowering, kept as a fallback).
-        Both yield an identical aliased custom-call.
+      lowering: ``"core_map"`` (default) constructs the kernel via
+        ``pl_core.core_map`` -- aliases only the written output ref, the best
+        serving choice. ``"mpmd"`` stays on ``mpmd_map`` and recovers the output
+        alias too, but its read-ref auto-aliasing regresses serving prefill
+        (~-20% on 397B 8K/1K); see the module docstring. Same kernel-level
+        custom-call either way.
     """
     if lowering not in ("core_map", "mpmd"):
         raise ValueError(

@@ -226,11 +226,11 @@ def _sc_gather_reduce(
     # the SC custom-call loses output_to_operand_aliasing -> XLA drops the
     # AllocateBuffer double-buffer -> SC/TC overlap regresses (~+15% device on the
     # MoE serving path). core_map_helper allocates the output ref outside
-    # (lax.empty) and closes over it, restoring the destination-passing alias.
-    # lowering="mpmd" stays on jax's current mpmd_map lowering (rather than
-    # core_map) and recovers the alias via that closed-over output ref -- the
-    # future-proof path that does not depend on core_map remaining available.
-    # (#2887 fixed the other single-mesh SC kernels the same way, via core_map.)
+    # (lax.empty) and closes over it, restoring the destination-passing alias via
+    # the default core_map lowering -- aliasing only the written output ref.
+    # (#2887 fixed the other single-mesh SC kernels the same way. The helper's
+    # "mpmd" lowering recovers the same alias but regresses serving prefill ~20%
+    # via mpmd_map's read-ref auto-aliasing -- see core_map_helper docstring.)
     return core_map_helper.kernel(
         kernel,
         out_type=jax.ShapeDtypeStruct((M_out, K), op.dtype),
@@ -244,7 +244,6 @@ def _sc_gather_reduce(
             needs_layout_passes=True,
         ),
         name="sc_dense_gather_reduce",
-        lowering="mpmd",
     )(op, idx, topk_weights)
 
 
