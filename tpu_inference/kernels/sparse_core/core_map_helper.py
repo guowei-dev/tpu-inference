@@ -28,17 +28,18 @@ output alias by allocating the output ref *outside* the kernel (``jax_core.new_r
 over ``lax.empty``) and closing over it in the kernel body -- the destination-passing
 pattern. Two equivalent lowerings produce the identical aliased custom-call:
 
-* ``lowering="core_map"`` (default): construct the kernel via ``pl_core.core_map``
-  directly, matching the pre-0.10.1 ``pl.kernel`` lowering.
-* ``lowering="mpmd"``: stay on ``mpmd_map`` (jax's current ``pl.kernel`` direction)
-  but pass ``out_types=()`` and let the closed-over output ref carry the
-  destination-passing alias. This recovers the same
-  ``output_to_operand_aliasing`` + ``AllocateBuffer`` without depending on
-  ``core_map`` remaining available.
+* ``lowering="mpmd"`` (default): stay on ``mpmd_map`` (jax's current ``pl.kernel``
+  direction) but pass ``out_types=()`` and let the closed-over output ref carry the
+  destination-passing alias. This recovers the same ``output_to_operand_aliasing`` +
+  ``AllocateBuffer`` **without depending on ``core_map`` remaining available** -- the
+  future-proof path now that jax routes ``pl.kernel`` through ``mpmd_map``.
+* ``lowering="core_map"``: construct the kernel via ``pl_core.core_map`` directly,
+  matching the pre-0.10.1 ``pl.kernel`` lowering. Kept as a fallback.
 
 Both paths emit a byte-identical aliased custom-call (verified at the
-after-optimizations HLO level); pick ``mpmd`` if/when ``core_map`` is retired
-upstream.
+after-optimizations HLO level): identical SC ``tpu_custom_call`` with the
+destination operand + ``AllocateBuffer`` double-buffer. ``mpmd`` is the default so the
+fix does not depend on ``core_map`` surviving the ``pl.kernel`` -> ``mpmd_map`` move.
 """
 
 from jax._src import api
@@ -67,14 +68,15 @@ def kernel(body,
            debug=False,
            name=None,
            metadata=None,
-           lowering="core_map"):
+           lowering="mpmd"):
     """Drop-in replacement for ``pl.kernel`` with destination-passing output.
 
     Args:
-      lowering: ``"core_map"`` (default) constructs the kernel via
-        ``pl_core.core_map``; ``"mpmd"`` stays on ``mpmd_map`` and recovers the
-        same output aliasing via the closed-over output ref. Both yield an
-        identical aliased custom-call.
+      lowering: ``"mpmd"`` (default) stays on ``mpmd_map`` (jax's current
+        ``pl.kernel`` direction) and recovers the output aliasing via the
+        closed-over output ref; ``"core_map"`` constructs the kernel via
+        ``pl_core.core_map`` (the pre-0.10.1 lowering, kept as a fallback).
+        Both yield an identical aliased custom-call.
     """
     if lowering not in ("core_map", "mpmd"):
         raise ValueError(
