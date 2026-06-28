@@ -406,9 +406,224 @@ def main_kernel(
     # exactly like an interior block boundary.
     scratch.prev_dst_row_smem[0] = -1
 
+    # The per-window pipeline: gather, weight, segment-reduce, scatter one
+    # window's row-blocks. Kept a sibling of `window_loop` (not nested inside it)
+    # to bound the function nesting depth -- `window_loop` binds the window via
+    # `functools.partial`, the same flat style as ragged_gather_v2.
+    def row_pipeline(window_block_base, *args):
+        src_indices_refs = args[:num_row_subchunks]
+        topk_weights_refs = args[num_row_subchunks:2 * num_row_subchunks]
+        (
+            src_indices_vmem_sc,
+            dst_indices_vmem_sc,
+            tw_f32_vmem_sc,
+            dma_src_row_vmem_sc,
+            dma_dst_row_vmem_sc,
+            prev_dst_val_vmem_sc,
+            out_vmem_sc,
+            sem_sc,
+        ) = args[-8:]
+
+        row_block_id = pl.program_id(0)
+        # Absolute row-block index within the partition (for the validity
+        # mask); the resident sort window is indexed window-relative.
+        global_block_id = window_block_base + row_block_id
+
+        # Destination output row of each source row in this block.
+        dst_indices_list = [
+            scratch.sorted_by_validity_vmem[pl.ds(
+                row_block_id * row_chunk_size + s * num_simd_lanes,
+                num_simd_lanes,
+            )] // cfg.reduce_group_size for s in range(num_row_subchunks)
+        ]
+
+        # Stage the gathered indices/weights and the destinations in VMEM.
+        for s in range(num_row_subchunks):
+            sub = pl.ds(s * num_simd_lanes, num_simd_lanes)
+            src_indices_vmem_sc[sub] = src_indices_refs[s][...]
+            dst_indices_vmem_sc[sub] = dst_indices_list[s]
+
+            tw = topk_weights_refs[s][...]
+            if cfg.topk_dtype == jnp.bfloat16:
+                tw_f32 = plsc.bitcast(jnp.bitwise_left_shift(tw, 16),
+                                      jnp.float32)
+            else:
+                tw_f32 = plsc.bitcast(tw, jnp.float32)
+            tw_f32_vmem_sc[sub] = tw_f32
+
+        # For each sub-chunk, the destination of the row just before it -- the
+        # seed for the segmented reduction's "same group as previous row" test.
+        for s in range(num_row_subchunks):
+            if s == 0:
+                prev_dst = scratch.prev_dst_row_smem[0]
+            else:
+                prev_dst = dst_indices_list[s - 1][num_simd_lanes - 1]
+            prev_dst_val_vmem_sc[pl.ds(s * num_simd_lanes,
+                                       num_simd_lanes)] = (jnp.broadcast_to(
+                                           prev_dst, (num_simd_lanes, )))
+
+        def get_dst_idx(global_idx):
+            return dst_indices_list[global_idx //
+                                    num_simd_lanes][global_idx %
+                                                    num_simd_lanes]
+
+        # For each source row, find the VMEM row that will hold its group's fully
+        # reduced value -- the last row of the group within this block. Scanning
+        # backwards, a row inherits its successor's merge target when they share
+        # a destination, otherwise it is its own target.
+        src_row_idx_in_vmem = []
+        row_valid_vec = []
+        for row_vmem_idx in reversed(range(row_chunk_size)):
+            global_row_idx = global_block_id * row_chunk_size + row_vmem_idx
+            row_valid_vec.append(
+                global_row_idx < num_rows_current_row_partition)
+            if row_vmem_idx == row_chunk_size - 1:
+                src_row_idx_in_vmem.append(row_vmem_idx)
+            else:
+                same_group_as_next = jnp.logical_and(
+                    row_valid_vec[-2],
+                    get_dst_idx(row_vmem_idx) == get_dst_idx(row_vmem_idx + 1),
+                ).astype(jnp.int32)
+                src_row_idx_in_vmem.append(
+                    same_group_as_next * src_row_idx_in_vmem[-1] +
+                    (1 - same_group_as_next) * row_vmem_idx)
+        src_row_idx_in_vmem.reverse()
+        row_valid_vec.reverse()
+
+        # Per source row, the (VMEM source row, HBM destination row) of its
+        # scatter. Rows whose group is not yet fully reduced in this sub-chunk,
+        # and padding rows, are routed to a throwaway row.
+        garbage_dst = out_hbm_ref.shape[0] - 1
+        dma_src_rows = []
+        dma_dst_rows = []
+        for s in range(num_row_subchunks):
+            sub_src = []
+            sub_dst = []
+            for i in range(num_simd_lanes):
+                global_idx = s * num_simd_lanes + i
+                merge_target = src_row_idx_in_vmem[global_idx]
+                is_final_write = jnp.logical_and(
+                    row_valid_vec[global_idx],
+                    merge_target < (s + 1) * num_simd_lanes,
+                )
+                sub_src.append(
+                    jnp.where(is_final_write, merge_target % num_simd_lanes, 0))
+                sub_dst.append(
+                    jnp.where(is_final_write, dst_indices_list[s][i],
+                              garbage_dst))
+            dma_src_rows.append(sub_src)
+            dma_dst_rows.append(sub_dst)
+
+        for s in range(num_row_subchunks):
+            sub = pl.ds(s * num_simd_lanes, num_simd_lanes)
+            dma_src_row_vmem_sc[sub] = _pack_scalars_to_vector(
+                dma_src_rows[s], num_simd_lanes)
+            dma_dst_row_vmem_sc[sub] = _pack_scalars_to_vector(
+                dma_dst_rows[s], num_simd_lanes)
+
+        @functools.partial(
+            pltpu.emit_pipeline,
+            grid=(num_row_subchunks, num_col_chunks),
+            in_specs=pl.BlockSpec(
+                (pl.Indirect(num_simd_lanes), col_chunk_size),
+                lambda s, c: (
+                    jnp.bitwise_right_shift(
+                        src_indices_vmem_sc[pl.ds(s * num_simd_lanes,
+                                                  num_simd_lanes)],
+                        cfg.row_shift,
+                    ),
+                    col_start // col_chunk_size + c,
+                ),
+            ),
+            out_specs=(),
+        )
+        def col_pipeline(gather_ref, sem_inner):
+            s = pl.program_id(0)
+            c = pl.program_id(1)
+            col_hbm_start = col_start + c * col_chunk_size
+            send_sem = sem_inner.at[1]
+
+            row_slice = pl.ds(s * num_simd_lanes, num_simd_lanes)
+            tw_slice = tw_f32_vmem_sc[row_slice]
+            dst_slice = dst_indices_vmem_sc[row_slice]
+            src_idx_slice = src_indices_vmem_sc[row_slice]
+            prev_dst_vals_vec = prev_dst_val_vmem_sc[row_slice]
+
+            def col_loop(col_compute_offset):
+                col_slice = pl.ds(col_compute_offset, num_simd_lanes)
+                # Running sum, seeded by the carry from the previous sub-chunk.
+                previous_accumulated_data = scratch.prev_iter_last_row_vmem[
+                    c, col_slice]
+
+                for row_src in range(num_simd_lanes):
+                    val_u32 = gather_ref[row_src, col_slice]
+                    if cfg.in_dtype == jnp.bfloat16:
+                        # The two bfloat16 rows packed in one uint32 word sit in the low
+                        # (even row) or high (odd row) 16 bits. Shift the wanted half
+                        # into the float32 sign/exponent position and clear the rest.
+                        shift = jnp.where(
+                            jnp.bitwise_and(src_idx_slice[row_src], 1) == 0,
+                            16, 0)
+                        shifted = jnp.bitwise_and(
+                            jnp.left_shift(val_u32, shift),
+                            jnp.uint32(0xFFFF0000))
+                        data_f32 = plsc.bitcast(shifted, jnp.float32)
+                    else:
+                        data_f32 = plsc.bitcast(val_u32, jnp.float32)
+                    data_f32 *= tw_slice[row_src]
+
+                    # Reduction: accumulate while the destination group is unchanged,
+                    # restart otherwise. Sorting guarantees rows of one group are
+                    # contiguous.
+                    dst_row_hbm = dst_slice[row_src]
+                    if row_src == 0:
+                        prev_dst = prev_dst_vals_vec[0]
+                    else:
+                        prev_dst = dst_slice[row_src - 1]
+                    accumulated_data = jnp.where(
+                        dst_row_hbm == prev_dst,
+                        previous_accumulated_data + data_f32,
+                        data_f32,
+                    )
+                    previous_accumulated_data = accumulated_data
+
+                    # The output buffer stays float32: a bfloat16 output would be
+                    # (16, 128)-tiled and the per-row scatter below writes a single
+                    # row at an arbitrary, non-tile-aligned destination, which is only
+                    # legal for 32-bit elements. The cast happens in the wrapper.
+                    out_vmem_sc[row_src, col_slice] = accumulated_data
+                    if row_src == num_simd_lanes - 1:
+                        scratch.prev_iter_last_row_vmem[
+                            c, col_slice] = accumulated_data
+
+            plsc.parallel_loop(0, col_chunk_size,
+                               step=num_simd_lanes)(col_loop)
+
+            # Scatter every source row's reduced value to its output row. Rows
+            # that share a group write the same value (idempotent); rows routed to
+            # the garbage destination are harmless.
+            dma_src_row_slice = dma_src_row_vmem_sc[row_slice]
+            dma_dst_row_slice = dma_dst_row_vmem_sc[row_slice]
+            copies = []
+            for i in range(num_simd_lanes):
+                copy = pltpu.make_async_copy(
+                    out_vmem_sc.at[dma_src_row_slice[i],
+                                   pl.ds(0, col_chunk_size)],
+                    out_hbm_ref.at[dma_dst_row_slice[i],
+                                   pl.ds(col_hbm_start, col_chunk_size)],
+                    send_sem,
+                )
+                copy.start()
+                copies.append(copy)
+            for copy in copies:
+                copy.wait()
+
+        col_pipeline(in_32b_hbm_ref, scratches=(sem_sc, ))
+        scratch.prev_dst_row_smem[0] = dst_indices_list[-1][num_simd_lanes - 1]
+
     # Stream the sort permutation one fixed-size window of row-blocks at a time.
-    # The whole window is staged resident before its row_pipeline runs, so the
-    # pl.Indirect index source below is always available (no prefetch hazard).
+    # The whole window is staged resident before the pipeline runs, so the
+    # pl.Indirect index source is always available (no prefetch hazard).
     @pl.loop(0, num_windows)
     def window_loop(window_id):
         window_block_base = window_id * max_window
@@ -434,227 +649,12 @@ def main_kernel(
                 row_chunk_size=row_chunk_size,
             ) for sub in range(num_row_subchunks)) * 2)
 
-        @functools.partial(
-            pltpu.emit_pipeline,
+        pltpu.emit_pipeline(
+            functools.partial(row_pipeline, window_block_base),
             grid=(blocks_in_window, ),
             in_specs=row_pipeline_in_specs,
             out_specs=(),
-        )
-        def row_pipeline(*args):
-            src_indices_refs = args[:num_row_subchunks]
-            topk_weights_refs = args[num_row_subchunks:2 * num_row_subchunks]
-            (
-                src_indices_vmem_sc,
-                dst_indices_vmem_sc,
-                tw_f32_vmem_sc,
-                dma_src_row_vmem_sc,
-                dma_dst_row_vmem_sc,
-                prev_dst_val_vmem_sc,
-                out_vmem_sc,
-                sem_sc,
-            ) = args[-8:]
-
-            row_block_id = pl.program_id(0)
-            # Absolute row-block index within the partition (for the validity
-            # mask); the resident sort window is indexed window-relative.
-            global_block_id = window_block_base + row_block_id
-
-            # Destination output row of each source row in this block.
-            dst_indices_list = [
-                scratch.sorted_by_validity_vmem[pl.ds(
-                    row_block_id * row_chunk_size + s * num_simd_lanes,
-                    num_simd_lanes,
-                )] // cfg.reduce_group_size for s in range(num_row_subchunks)
-            ]
-
-            # Stage the gathered indices/weights and the destinations in VMEM.
-            for s in range(num_row_subchunks):
-                sub = pl.ds(s * num_simd_lanes, num_simd_lanes)
-                src_indices_vmem_sc[sub] = src_indices_refs[s][...]
-                dst_indices_vmem_sc[sub] = dst_indices_list[s]
-
-                tw = topk_weights_refs[s][...]
-                if cfg.topk_dtype == jnp.bfloat16:
-                    tw_f32 = plsc.bitcast(jnp.bitwise_left_shift(tw, 16),
-                                          jnp.float32)
-                else:
-                    tw_f32 = plsc.bitcast(tw, jnp.float32)
-                tw_f32_vmem_sc[sub] = tw_f32
-
-            # For each sub-chunk, the destination of the row just before it -- the
-            # seed for the segmented reduction's "same group as previous row" test.
-            for s in range(num_row_subchunks):
-                if s == 0:
-                    prev_dst = scratch.prev_dst_row_smem[0]
-                else:
-                    prev_dst = dst_indices_list[s - 1][num_simd_lanes - 1]
-                prev_dst_val_vmem_sc[pl.ds(s * num_simd_lanes,
-                                           num_simd_lanes)] = (jnp.broadcast_to(
-                                               prev_dst, (num_simd_lanes, )))
-
-            def get_dst_idx(global_idx):
-                return dst_indices_list[global_idx //
-                                        num_simd_lanes][global_idx %
-                                                        num_simd_lanes]
-
-            # For each source row, find the VMEM row that will hold its group's fully
-            # reduced value -- the last row of the group within this block. Scanning
-            # backwards, a row inherits its successor's merge target when they share
-            # a destination, otherwise it is its own target.
-            src_row_idx_in_vmem = []
-            row_valid_vec = []
-            for row_vmem_idx in reversed(range(row_chunk_size)):
-                global_row_idx = global_block_id * row_chunk_size + row_vmem_idx
-                row_valid_vec.append(
-                    global_row_idx < num_rows_current_row_partition)
-                if row_vmem_idx == row_chunk_size - 1:
-                    src_row_idx_in_vmem.append(row_vmem_idx)
-                else:
-                    same_group_as_next = jnp.logical_and(
-                        row_valid_vec[-2],
-                        get_dst_idx(row_vmem_idx) == get_dst_idx(row_vmem_idx +
-                                                                 1),
-                    ).astype(jnp.int32)
-                    src_row_idx_in_vmem.append(
-                        same_group_as_next * src_row_idx_in_vmem[-1] +
-                        (1 - same_group_as_next) * row_vmem_idx)
-            src_row_idx_in_vmem.reverse()
-            row_valid_vec.reverse()
-
-            # Per source row, the (VMEM source row, HBM destination row) of its
-            # scatter. Rows whose group is not yet fully reduced in this sub-chunk,
-            # and padding rows, are routed to a throwaway row.
-            garbage_dst = out_hbm_ref.shape[0] - 1
-            dma_src_rows = []
-            dma_dst_rows = []
-            for s in range(num_row_subchunks):
-                sub_src = []
-                sub_dst = []
-                for i in range(num_simd_lanes):
-                    global_idx = s * num_simd_lanes + i
-                    merge_target = src_row_idx_in_vmem[global_idx]
-                    is_final_write = jnp.logical_and(
-                        row_valid_vec[global_idx],
-                        merge_target < (s + 1) * num_simd_lanes,
-                    )
-                    sub_src.append(
-                        jnp.where(is_final_write,
-                                  merge_target % num_simd_lanes, 0))
-                    sub_dst.append(
-                        jnp.where(is_final_write, dst_indices_list[s][i],
-                                  garbage_dst))
-                dma_src_rows.append(sub_src)
-                dma_dst_rows.append(sub_dst)
-
-            for s in range(num_row_subchunks):
-                sub = pl.ds(s * num_simd_lanes, num_simd_lanes)
-                dma_src_row_vmem_sc[sub] = _pack_scalars_to_vector(
-                    dma_src_rows[s], num_simd_lanes)
-                dma_dst_row_vmem_sc[sub] = _pack_scalars_to_vector(
-                    dma_dst_rows[s], num_simd_lanes)
-
-            @functools.partial(
-                pltpu.emit_pipeline,
-                grid=(num_row_subchunks, num_col_chunks),
-                in_specs=pl.BlockSpec(
-                    (pl.Indirect(num_simd_lanes), col_chunk_size),
-                    lambda s, c: (
-                        jnp.bitwise_right_shift(
-                            src_indices_vmem_sc[pl.ds(s * num_simd_lanes,
-                                                      num_simd_lanes)],
-                            cfg.row_shift,
-                        ),
-                        col_start // col_chunk_size + c,
-                    ),
-                ),
-                out_specs=(),
-            )
-            def col_pipeline(gather_ref, sem_inner):
-                s = pl.program_id(0)
-                c = pl.program_id(1)
-                col_hbm_start = col_start + c * col_chunk_size
-                send_sem = sem_inner.at[1]
-
-                row_slice = pl.ds(s * num_simd_lanes, num_simd_lanes)
-                tw_slice = tw_f32_vmem_sc[row_slice]
-                dst_slice = dst_indices_vmem_sc[row_slice]
-                src_idx_slice = src_indices_vmem_sc[row_slice]
-                prev_dst_vals_vec = prev_dst_val_vmem_sc[row_slice]
-
-                def col_loop(col_compute_offset):
-                    col_slice = pl.ds(col_compute_offset, num_simd_lanes)
-                    # Running sum, seeded by the carry from the previous sub-chunk.
-                    previous_accumulated_data = scratch.prev_iter_last_row_vmem[
-                        c, col_slice]
-
-                    for row_src in range(num_simd_lanes):
-                        val_u32 = gather_ref[row_src, col_slice]
-                        if cfg.in_dtype == jnp.bfloat16:
-                            # The two bfloat16 rows packed in one uint32 word sit in the low
-                            # (even row) or high (odd row) 16 bits. Shift the wanted half
-                            # into the float32 sign/exponent position and clear the rest.
-                            shift = jnp.where(
-                                jnp.bitwise_and(src_idx_slice[row_src], 1) == 0,
-                                16, 0)
-                            shifted = jnp.bitwise_and(
-                                jnp.left_shift(val_u32, shift),
-                                jnp.uint32(0xFFFF0000))
-                            data_f32 = plsc.bitcast(shifted, jnp.float32)
-                        else:
-                            data_f32 = plsc.bitcast(val_u32, jnp.float32)
-                        data_f32 *= tw_slice[row_src]
-
-                        # Reduction: accumulate while the destination group is unchanged,
-                        # restart otherwise. Sorting guarantees rows of one group are
-                        # contiguous.
-                        dst_row_hbm = dst_slice[row_src]
-                        if row_src == 0:
-                            prev_dst = prev_dst_vals_vec[0]
-                        else:
-                            prev_dst = dst_slice[row_src - 1]
-                        accumulated_data = jnp.where(
-                            dst_row_hbm == prev_dst,
-                            previous_accumulated_data + data_f32,
-                            data_f32,
-                        )
-                        previous_accumulated_data = accumulated_data
-
-                        # The output buffer stays float32: a bfloat16 output would be
-                        # (16, 128)-tiled and the per-row scatter below writes a single
-                        # row at an arbitrary, non-tile-aligned destination, which is only
-                        # legal for 32-bit elements. The cast happens in the wrapper.
-                        out_vmem_sc[row_src, col_slice] = accumulated_data
-                        if row_src == num_simd_lanes - 1:
-                            scratch.prev_iter_last_row_vmem[
-                                c, col_slice] = accumulated_data
-
-                plsc.parallel_loop(0, col_chunk_size,
-                                   step=num_simd_lanes)(col_loop)
-
-                # Scatter every source row's reduced value to its output row. Rows
-                # that share a group write the same value (idempotent); rows routed to
-                # the garbage destination are harmless.
-                dma_src_row_slice = dma_src_row_vmem_sc[row_slice]
-                dma_dst_row_slice = dma_dst_row_vmem_sc[row_slice]
-                copies = []
-                for i in range(num_simd_lanes):
-                    copy = pltpu.make_async_copy(
-                        out_vmem_sc.at[dma_src_row_slice[i],
-                                       pl.ds(0, col_chunk_size)],
-                        out_hbm_ref.at[dma_dst_row_slice[i],
-                                       pl.ds(col_hbm_start, col_chunk_size)],
-                        send_sem,
-                    )
-                    copy.start()
-                    copies.append(copy)
-                for copy in copies:
-                    copy.wait()
-
-            col_pipeline(in_32b_hbm_ref, scratches=(sem_sc, ))
-            scratch.prev_dst_row_smem[0] = dst_indices_list[-1][num_simd_lanes -
-                                                                1]
-
-        row_pipeline(
+        )(
             *([inputs.indices] * num_row_subchunks),
             *([inputs.topk_weights] * num_row_subchunks),
             scratches=(
