@@ -33,6 +33,7 @@ class _Config:
     col_size: int
     col_chunk_size: int
     num_row_subchunks: int
+    max_window: int
     num_simd_lanes: int
     topk_dtype: Any
     in_dtype: Any
@@ -43,6 +44,11 @@ class _Config:
     def row_chunk_size(self) -> int:
         """Number of rows handled per row-pipeline block."""
         return self.num_simd_lanes * self.num_row_subchunks
+
+    @property
+    def window_size(self) -> int:
+        """Number of rows whose sort permutation is resident per window."""
+        return self.max_window * self.row_chunk_size
 
     @property
     def row_shift(self) -> int:
@@ -202,18 +208,45 @@ def _calculate_col_chunk_size(col_size: int, num_simd_lanes: int) -> int:
     return 128
 
 
+def _max_row_window(
+    row_chunk_size: int,
+    col_size: int,
+    col_chunk_size: int,
+    num_simd_lanes: int,
+    max_blocks_per_partition: int,
+) -> int:
+    """Largest window of row-blocks whose resident sort permutation fits SPMEM.
+
+  Streaming a fixed window instead of the whole partition makes SPMEM use
+  independent of input_size; the clamp keeps small inputs single-window.
+  """
+    # Per-subcore tile_spmem budget in 32-bit words, kept 10% under to leave
+    # headroom for TC-tiling padding.
+    sc = pltpu.get_tpu_info().sparse_core
+    words_per_subcore = sc.vmem_capacity_bytes // 4
+    # Input-size-independent resident scratch (32-bit words): prev-row carry
+    # (col_size), out_vmem + column gather double-buffer (3*lanes*col_chunk),
+    # the num_rows vector (lanes), and 6 row index/dma buffers + the row gather
+    # pipeline double-buffers (10*row_chunk).
+    fixed = (col_size + 3 * num_simd_lanes * col_chunk_size + num_simd_lanes +
+             10 * row_chunk_size)
+    window = (int(words_per_subcore * 0.9) - fixed) // row_chunk_size
+    return max(1, min(window, max(1, max_blocks_per_partition)))
+
+
 def _preprocess(
     valid_rows_mask: jax.Array,
     reduce_group_size: int,
     num_row_partitions: int,
     num_simd_lanes: int,
-    row_chunk_size: int,
+    window_size: int,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Sorts valid source rows to the front of each row partition.
 
   Returns:
     sorted_by_validity: original row index of each slot after the stable
-      sort, flattened across partitions and padded to ``row_chunk_size``.
+      sort, flattened across partitions and padded to a whole number of
+      windows (``window_size``).
     num_src_rows_per_row_partition: valid row count per partition, padded to
       ``num_simd_lanes`` so the kernel can load it as a single vector.
     mask: per output group, whether the group has any valid source row.
@@ -230,7 +263,8 @@ def _preprocess(
     sorted_by_validity += (jnp.arange(num_row_partitions)[:, None] *
                            row_partition_size)
 
-    pad_to = _align_to(row_partition_size, row_chunk_size)
+    # Pad each partition to a whole number of windows (fixed per-window DMA size).
+    pad_to = _align_to(row_partition_size, window_size)
     if pad_to > row_partition_size:
         sorted_by_validity = jnp.pad(
             sorted_by_validity,
@@ -292,6 +326,8 @@ def main_kernel(
     col_chunk_size = cfg.col_chunk_size
     num_row_subchunks = cfg.num_row_subchunks
     row_chunk_size = cfg.row_chunk_size
+    max_window = cfg.max_window
+    window_words = cfg.window_size
 
     num_col_chunks = cfg.col_size // col_chunk_size
 
@@ -304,23 +340,16 @@ def main_kernel(
     row_start_padded = row_partition_id * row_partition_size_padded
     col_start = col_partition_id * cfg.col_size
 
-    # Step 2: Stage this partition's row count and sort permutation into VMEM.
+    # Step 2: Stage this partition's row count (the sort permutation is streamed
+    # one window at a time in the loop below, bounding the resident scratch).
     recv_sem = scratch.sem.at[0]
     num_rows_dma = pltpu.make_async_copy(
         inputs.num_src_rows_per_row_partition.at[pl.ds(0, num_simd_lanes)],
         scratch.num_rows_per_row_partition_vmem,
         recv_sem,
     )
-    sorted_dma = pltpu.make_async_copy(
-        inputs.sorted_by_validity.at[pl.ds(row_start_padded,
-                                           row_partition_size_padded)],
-        scratch.sorted_by_validity_vmem,
-        recv_sem,
-    )
     num_rows_dma.start()
-    sorted_dma.start()
     num_rows_dma.wait()
-    sorted_dma.wait()
 
     num_rows_per_row_partition = scratch.num_rows_per_row_partition_vmem[...]
     num_rows_current_row_partition = jnp.array(0, jnp.int32)
@@ -331,6 +360,7 @@ def main_kernel(
             num_rows_current_row_partition,
         )
     num_row_blocks = pl.cdiv(num_rows_current_row_partition, row_chunk_size)
+    num_windows = pl.cdiv(num_row_blocks, max_window)
 
     # Step 3: Run the gather / weighted segmented-reduce / scatter pipeline.
 
@@ -339,26 +369,13 @@ def main_kernel(
     # uint32 row (row index >> 1); float32 is 1:1 (row index unchanged).
     in_32b_hbm_ref = inputs.x.bitcast(jnp.uint32)
 
-    # Sentinel for the cross-block reduction carry (no previous group).
+    # Sentinel for the cross-block reduction carry (no previous group). The carry
+    # is kernel scratch, so it also persists across window boundaries.
     scratch.prev_dst_row_smem[0] = -1
 
-    # One gather per sub-chunk for ``indices``, then the same for
-    # ``topk_weights``.
-    row_pipeline_in_specs = (tuple(
-        _row_gather_spec(
-            scratch.sorted_by_validity_vmem,
-            sub,
-            num_simd_lanes=num_simd_lanes,
-            row_chunk_size=row_chunk_size,
-        ) for sub in range(num_row_subchunks)) * 2)
-
-    @functools.partial(
-        pltpu.emit_pipeline,
-        grid=(num_row_blocks, ),
-        in_specs=row_pipeline_in_specs,
-        out_specs=(),
-    )
-    def row_pipeline(*args):
+    # The per-window pipeline: gather, weight, segment-reduce, scatter one
+    # window's row-blocks. window_block_base is bound per window at the call site.
+    def row_pipeline(window_block_base, *args):
         src_indices_refs = args[:num_row_subchunks]
         topk_weights_refs = args[num_row_subchunks:2 * num_row_subchunks]
         (
@@ -373,6 +390,9 @@ def main_kernel(
         ) = args[-8:]
 
         row_block_id = pl.program_id(0)
+        # Absolute row-block index within the partition (for the validity
+        # mask); the resident sort window is indexed window-relative.
+        global_block_id = window_block_base + row_block_id
 
         # Destination output row of each source row in this block.
         dst_indices_list = [
@@ -419,7 +439,7 @@ def main_kernel(
         src_row_idx_in_vmem = []
         row_valid_vec = []
         for row_vmem_idx in reversed(range(row_chunk_size)):
-            global_row_idx = row_block_id * row_chunk_size + row_vmem_idx
+            global_row_idx = global_block_id * row_chunk_size + row_vmem_idx
             row_valid_vec.append(
                 global_row_idx < num_rows_current_row_partition)
             if row_vmem_idx == row_chunk_size - 1:
@@ -567,20 +587,52 @@ def main_kernel(
         col_pipeline(in_32b_hbm_ref, scratches=(sem_sc, ))
         scratch.prev_dst_row_smem[0] = dst_indices_list[-1][num_simd_lanes - 1]
 
-    row_pipeline(
-        *([inputs.indices] * num_row_subchunks),
-        *([inputs.topk_weights] * num_row_subchunks),
-        scratches=(
-            scratch.src_indices_vmem,
-            scratch.dst_indices_vmem,
-            scratch.tw_f32_vmem,
-            scratch.dma_src_row_vmem,
-            scratch.dma_dst_row_vmem,
-            scratch.prev_dst_val_vmem,
-            scratch.out_vmem,
-            scratch.sem,
-        ),
-    )
+    # One gather per sub-chunk for ``indices``, then the same for ``topk_weights``.
+    # Loop-invariant: each window is re-DMA'd into the same resident buffer.
+    row_pipeline_in_specs = (tuple(
+        _row_gather_spec(
+            scratch.sorted_by_validity_vmem,
+            sub,
+            num_simd_lanes=num_simd_lanes,
+            row_chunk_size=row_chunk_size,
+        ) for sub in range(num_row_subchunks)) * 2)
+
+    # Stream one window of the sort permutation at a time. The whole window is
+    # staged resident before the pipeline, so the pl.Indirect source has no hazard.
+    @pl.loop(0, num_windows)
+    def window_loop(window_id):
+        window_block_base = window_id * max_window
+        sorted_dma = pltpu.make_async_copy(
+            inputs.sorted_by_validity.at[pl.ds(
+                row_start_padded + window_id * window_words, window_words)],
+            scratch.sorted_by_validity_vmem,
+            recv_sem,
+        )
+        sorted_dma.start()
+        sorted_dma.wait()
+
+        blocks_in_window = jnp.minimum(max_window,
+                                       num_row_blocks - window_block_base)
+
+        pltpu.emit_pipeline(
+            functools.partial(row_pipeline, window_block_base),
+            grid=(blocks_in_window, ),
+            in_specs=row_pipeline_in_specs,
+            out_specs=(),
+        )(
+            *([inputs.indices] * num_row_subchunks),
+            *([inputs.topk_weights] * num_row_subchunks),
+            scratches=(
+                scratch.src_indices_vmem,
+                scratch.dst_indices_vmem,
+                scratch.tw_f32_vmem,
+                scratch.dma_src_row_vmem,
+                scratch.dma_dst_row_vmem,
+                scratch.prev_dst_val_vmem,
+                scratch.out_vmem,
+                scratch.sem,
+            ),
+        )
 
 
 @functools.partial(jax.jit, static_argnames=("reduce_group_size", ))
@@ -637,6 +689,15 @@ def ragged_gather_reduce(
     col_size = aligned_hidden_size // num_column_partitions
     col_chunk_size = _calculate_col_chunk_size(col_size, num_simd_lanes)
 
+    # Size the sort-permutation window (see _max_row_window).
+    padded_input_size = _align_to(input_size,
+                                  num_row_partitions * reduce_group_size)
+    row_partition_size = padded_input_size // num_row_partitions
+    max_blocks_per_partition = pl.cdiv(row_partition_size, row_chunk_size)
+    max_window = _max_row_window(row_chunk_size, col_size, col_chunk_size,
+                                 num_simd_lanes, max_blocks_per_partition)
+    window_size = max_window * row_chunk_size
+
     # Step 3: Pre-process inputs (weights, padding, sort by validity).
     # The kernel gathers x through a uint32 reinterpretation; carry the weights
     # the same way so they can be bitcast back to float32 on SparseCore.
@@ -649,8 +710,6 @@ def ragged_gather_reduce(
 
     # Pad the input so each row partition holds a whole number of reduce
     # groups; no group is then split across two physical cores.
-    padded_input_size = _align_to(input_size,
-                                  num_row_partitions * reduce_group_size)
     valid_rows_mask = jnp.pad(
         valid_rows_mask,
         (0, padded_input_size - input_size),
@@ -662,7 +721,7 @@ def ragged_gather_reduce(
         reduce_group_size,
         num_row_partitions,
         num_simd_lanes,
-        row_chunk_size,
+        window_size,
     )
 
     # Step 4: Launch the SparseCore kernel.
@@ -680,6 +739,7 @@ def ragged_gather_reduce(
         col_size=col_size,
         col_chunk_size=col_chunk_size,
         num_row_subchunks=num_row_subchunks,
+        max_window=max_window,
         num_simd_lanes=num_simd_lanes,
         topk_dtype=topk_weights.dtype,
         in_dtype=x.dtype,
@@ -705,8 +765,7 @@ def ragged_gather_reduce(
             prev_iter_last_row_vmem=pltpu.VMEM(
                 (col_size // col_chunk_size, col_chunk_size), jnp.float32),
             prev_dst_row_smem=pltpu.SMEM((1, ), jnp.int32),
-            sorted_by_validity_vmem=pltpu.VMEM(
-                (sorted_by_validity.size // num_row_partitions, ), jnp.int32),
+            sorted_by_validity_vmem=pltpu.VMEM((window_size, ), jnp.int32),
             src_indices_vmem=pltpu.VMEM((row_chunk_size, ), jnp.int32),
             dst_indices_vmem=pltpu.VMEM((row_chunk_size, ), jnp.int32),
             tw_f32_vmem=pltpu.VMEM((row_chunk_size, ), jnp.float32),
