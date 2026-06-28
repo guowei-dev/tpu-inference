@@ -251,7 +251,8 @@ def _max_row_window(
         + num_simd_lanes * col_chunk_size  # out_vmem (f32)
         + 2 * num_simd_lanes * col_chunk_size  # col-pipeline gather double-buffer (u32)
         + num_simd_lanes  # num_rows_per_row_partition_vmem
-        + 6 * row_chunk_size)  # src/dst/tw/dma_src/dma_dst/prev_dst_val
+        + 6 * row_chunk_size  # src/dst/tw/dma_src/dma_dst/prev_dst_val
+        + 4 * row_chunk_size)  # row-pipeline gather double-buffers (indices+topk, x2)
 
     budget = int(words_per_subcore * (1.0 - _SPMEM_HEADROOM))
     window = (budget - fixed) // row_chunk_size
