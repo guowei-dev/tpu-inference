@@ -84,6 +84,7 @@ class _Inputs:
 @dataclasses.dataclass(frozen=True)
 class _Scratch:
     num_rows_per_row_partition_vmem: Any
+    next_row_peek_vmem: Any
     prev_iter_last_row_vmem: Any
     prev_dst_row_smem: Any
     sorted_by_validity_vmem: Any
@@ -410,7 +411,7 @@ def main_kernel(
     # window's row-blocks. Kept a sibling of `window_loop` (not nested inside it)
     # to bound the function nesting depth -- `window_loop` binds the window via
     # `functools.partial`, the same flat style as ragged_gather_v2.
-    def row_pipeline(window_block_base, *args):
+    def row_pipeline(window_block_base, blocks_in_window, *args):
         src_indices_refs = args[:num_row_subchunks]
         topk_weights_refs = args[num_row_subchunks:2 * num_row_subchunks]
         (
@@ -490,6 +491,30 @@ def main_kernel(
         src_row_idx_in_vmem.reverse()
         row_valid_vec.reverse()
 
+        # A reduce group whose last in-block row is the block's final row may
+        # continue into the next block, which writes the group's full reduced
+        # value. Suppress this block's partial write for such a group so each
+        # output row has a single writer -- neither the pipelined row-block
+        # emit_pipeline nor the outer window loop orders the two scatters, so a
+        # double write races on the output row. The next block's first source
+        # row is resident within a window; at a window boundary it is the next
+        # window's first row, prefetched once per window into next_row_peek_vmem.
+        is_last_block_in_window = (row_block_id + 1) == blocks_in_window
+        next_block_first_row = (global_block_id + 1) * row_chunk_size
+        resident_peek = jnp.minimum((row_block_id + 1) * row_chunk_size,
+                                    window_words - num_simd_lanes)
+        next_block_first_idx = jnp.where(
+            is_last_block_in_window,
+            scratch.next_row_peek_vmem[pl.ds(0, num_simd_lanes)][0],
+            scratch.sorted_by_validity_vmem[pl.ds(resident_peek,
+                                                  num_simd_lanes)][0],
+        )
+        group_continues = jnp.logical_and(
+            next_block_first_row < num_rows_current_row_partition,
+            (next_block_first_idx // cfg.reduce_group_size)
+            == dst_indices_list[-1][num_simd_lanes - 1],
+        )
+
         # Per source row, the (VMEM source row, HBM destination row) of its
         # scatter. Rows whose group is not yet fully reduced in this sub-chunk,
         # and padding rows, are routed to a throwaway row.
@@ -506,6 +531,15 @@ def main_kernel(
                     row_valid_vec[global_idx],
                     merge_target < (s + 1) * num_simd_lanes,
                 )
+                # Only the last sub-chunk's group can reach the block's final
+                # row; earlier sub-chunks already route such a group to garbage.
+                if s == num_row_subchunks - 1:
+                    is_final_write = jnp.logical_and(
+                        is_final_write,
+                        jnp.logical_not(
+                            jnp.logical_and(merge_target == row_chunk_size - 1,
+                                            group_continues)),
+                    )
                 sub_src.append(
                     jnp.where(is_final_write, merge_target % num_simd_lanes, 0))
                 sub_dst.append(
@@ -636,6 +670,20 @@ def main_kernel(
         sorted_dma.start()
         sorted_dma.wait()
 
+        # Prefetch the next window's first source row so the last block of this
+        # window can detect a group continuing across the window boundary (the
+        # last window fetches a harmless clamped past-the-end row).
+        peek_dma = pltpu.make_async_copy(
+            inputs.sorted_by_validity.at[pl.ds(
+                jnp.minimum(row_start_padded + (window_id + 1) * window_words,
+                            inputs.sorted_by_validity.shape[0] - num_simd_lanes),
+                num_simd_lanes)],
+            scratch.next_row_peek_vmem,
+            recv_sem,
+        )
+        peek_dma.start()
+        peek_dma.wait()
+
         blocks_in_window = jnp.minimum(max_window,
                                        num_row_blocks - window_block_base)
 
@@ -650,7 +698,8 @@ def main_kernel(
             ) for sub in range(num_row_subchunks)) * 2)
 
         pltpu.emit_pipeline(
-            functools.partial(row_pipeline, window_block_base),
+            functools.partial(row_pipeline, window_block_base,
+                              blocks_in_window),
             grid=(blocks_in_window, ),
             in_specs=row_pipeline_in_specs,
             out_specs=(),
@@ -798,6 +847,7 @@ def ragged_gather_reduce(
         scratch_types=(_Scratch(
             num_rows_per_row_partition_vmem=pltpu.VMEM((num_simd_lanes, ),
                                                        jnp.int32),
+            next_row_peek_vmem=pltpu.VMEM((num_simd_lanes, ), jnp.int32),
             prev_iter_last_row_vmem=pltpu.VMEM(
                 (col_size // col_chunk_size, col_chunk_size), jnp.float32),
             prev_dst_row_smem=pltpu.SMEM((1, ), jnp.int32),
