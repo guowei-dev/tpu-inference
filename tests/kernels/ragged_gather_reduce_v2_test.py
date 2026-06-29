@@ -160,30 +160,6 @@ class ScatterTest(jtu.JaxTestCase):
             except Exception as e:  # pylint: disable=broad-except
                 print(f"Skipping {name} correctness check due to error: {e}")
 
-    def test_sc_ragged_gather_reduce_v2_no_spmem_overflow(self):
-        """Regression: large input_size must not overflow SparseCore SPMEM.
-
-        v2 (#2836) staged the *entire* row-partition sort permutation into one
-        resident SPMEM scratch (`sorted_by_validity_vmem`), which scales linearly
-        with input_size and overflows the per-subcore tile_spmem budget. On v7,
-        input_size=1,835,008 (hidden=1024) overflows the unfixed kernel with
-        `E3000 CompileTimeSparseCoreAllocationFailure`. The windowed fix bounds
-        the scratch to a fixed window so it compiles for any input_size.
-
-        Compile-only (ShapeDtypeStruct) — no large allocation; hidden kept small
-        so x stays under the 16 GiB SparseCore per-tensor limit.
-        """
-        n, h, rgs = 1_835_008, 1024, 8
-        specs = (
-            jax.ShapeDtypeStruct((n, h), jnp.bfloat16),
-            jax.ShapeDtypeStruct((n, ), jnp.int32),
-            jax.ShapeDtypeStruct((n, ), jnp.bfloat16),
-            jax.ShapeDtypeStruct((n, ), jnp.bool_),
-        )
-        # Must compile without raising E3000 (do NOT swallow — this is the gate).
-        ragged_gather_reduce_v2.lower(*specs,
-                                      reduce_group_size=rgs).compile()
-
     # Forced-small-window cases that exercise the multi-window streaming path on
     # SC-reaching shapes (out_size large enough to skip the TensorCore fallback).
     # max_window=1 puts every row-block in its own window, so the cross-window
@@ -265,6 +241,11 @@ class ScatterTest(jtu.JaxTestCase):
 
     # The first perf test case approximates the DeepSeekV3, 2k-batch-size, EP=16.
     # The second case approximates the Qwen3-Coder-480B, 2k-batch-size, EP=8.
+    # The last case is a large input_size that overflowed v2's resident sort
+    # permutation (#2836) before the windowed-streaming fix; it spans multiple
+    # permutation windows, so it runs only with the fix (compile raises E3000
+    # otherwise). hidden is kept small so x stays runnable and under the 16 GiB
+    # SparseCore per-tensor limit.
     _perf_test_cases = [
         dict(
             out_size=o,
@@ -297,6 +278,14 @@ class ScatterTest(jtu.JaxTestCase):
                 [jnp.bfloat16],
                 [8],
                 [2048],
+            ),
+            itertools.product(
+                [1_835_008],
+                [(0, 1_835_008)],
+                [1024],
+                [jnp.bfloat16],
+                [8],
+                [512],
             ),
         )
     ]
@@ -331,11 +320,13 @@ class ScatterTest(jtu.JaxTestCase):
         print(f"\n=== Running shape: out={out_size},"
               f" hidden={hidden_size}, start={start}, end={end} ===")
 
-        def run_and_time(name, fn, *args):
+        def run_and_time(name, fn, *args, must_succeed=False):
             try:
                 t_val = _time_function(fn, *args)
                 print(f"{name}: {t_val*1000:.3f} ms")
             except Exception as e:  # pylint: disable=broad-except
+                if must_succeed:
+                    raise  # v2 is the kernel under test -- a failure is a regression
                 print(f"{name} failed: {e}")
 
         run_and_time(
@@ -368,6 +359,7 @@ class ScatterTest(jtu.JaxTestCase):
             topk_weights,
             valid_rows_mask,
             reduce_group_size,
+            must_succeed=True,
         )
 
 
