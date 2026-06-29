@@ -215,6 +215,34 @@ class ScatterTest(jtu.JaxTestCase):
             v2_mod._MAX_WINDOW_OVERRIDE = prev
             jax.clear_caches()
 
+    # Partial validity is the realistic MoE regime: an expert receives a
+    # variable, often large fraction of the tokens. The cases above sample only
+    # ~6% validity, where every reduce group fits inside one row-block; at
+    # 50-94% validity many groups straddle a row-block boundary and exercise the
+    # cross-block reduction carry and scatter.
+    _partial_validity_cases = [
+        dict(out_size=16384, hidden_size=1024, valid_frac=f, dtype=jnp.bfloat16,
+             reduce_group_size=8) for f in (0.5, 0.75, 0.9375)
+    ]
+
+    @parameterized.parameters(*_partial_validity_cases)
+    def test_sc_ragged_gather_reduce_v2_partial_validity(self, out_size,
+                                                         hidden_size, valid_frac,
+                                                         dtype,
+                                                         reduce_group_size):
+        key = jax.random.key(0)
+        x = jax.random.normal(key, (out_size, hidden_size), jnp.float32)
+        x = x.astype(dtype)
+        indices = jax.random.permutation(key, out_size)
+        topk_weights = jax.random.normal(key, (out_size, ), jnp.bfloat16)
+        valid_rows_mask = indices < int(out_size * valid_frac)
+        desired = reference_ragged_gather_reduce(x, indices, topk_weights,
+                                                 valid_rows_mask,
+                                                 reduce_group_size)
+        actual = ragged_gather_reduce_v2(x, indices, topk_weights,
+                                         valid_rows_mask, reduce_group_size)
+        np.testing.assert_allclose(actual, desired, atol=1e-2, rtol=1e-2)
+
     def test_max_row_window_bounds_spmem(self):
         """`_max_row_window` keeps the per-subcore SPMEM use under budget."""
         from jax.experimental.pallas import tpu as pltpu
