@@ -21,6 +21,7 @@ import jax.numpy as jnp
 import numpy as np
 from absl.testing import absltest, parameterized
 from jax._src import test_util as jtu
+from jax.experimental.pallas import tpu as pltpu
 
 from tpu_inference.kernels.sparse_core.ragged_gather_reduce import \
     ragged_gather_reduce as ragged_gather_reduce_v1
@@ -158,6 +159,43 @@ class ScatterTest(jtu.JaxTestCase):
                 raise
             except Exception as e:  # pylint: disable=broad-except
                 print(f"Skipping {name} correctness check due to error: {e}")
+
+    # Partial validity is the realistic MoE regime: an expert receives a
+    # variable, often large fraction of the tokens. The correctness cases above
+    # only reach the SparseCore path at ~6-13% validity, where each reduce group
+    # fits inside one row-block; at 50-94% validity many groups straddle a
+    # row-block boundary and exercise the cross-block reduction carry + scatter.
+    _partial_validity_cases = [
+        dict(out_size=16384,
+             hidden_size=1024,
+             valid_frac=f,
+             dtype=jnp.bfloat16,
+             reduce_group_size=8) for f in (0.5, 0.75, 0.9375)
+    ]
+
+    @parameterized.parameters(*_partial_validity_cases)
+    def test_sc_ragged_gather_reduce_v2_partial_validity(
+            self, out_size, hidden_size, valid_frac, dtype, reduce_group_size):
+        # The shape must reach the SparseCore kernel; with enough VMEM to hold
+        # the input the wrapper routes to the (always-correct) TensorCore
+        # fallback, which would mask the bug. Skip rather than pass vacuously
+        # there (mirrors the wrapper's fallback gate).
+        dtype_bytes = jax.dtypes.itemsize_bits(dtype) // 8
+        if (out_size * hidden_size * dtype_bytes * 2
+                < pltpu.get_tpu_info().vmem_capacity_bytes * 0.6):
+            self.skipTest("input fits TC VMEM; routes to the fallback, not SC")
+        key = jax.random.key(0)
+        x = jax.random.normal(key, (out_size, hidden_size), jnp.float32)
+        x = x.astype(dtype)
+        indices = jax.random.permutation(key, out_size)
+        topk_weights = jax.random.normal(key, (out_size, ), jnp.bfloat16)
+        valid_rows_mask = indices < int(out_size * valid_frac)
+        desired = reference_ragged_gather_reduce(x, indices, topk_weights,
+                                                 valid_rows_mask,
+                                                 reduce_group_size)
+        actual = ragged_gather_reduce_v2(x, indices, topk_weights,
+                                         valid_rows_mask, reduce_group_size)
+        np.testing.assert_allclose(actual, desired, atol=1e-2, rtol=1e-2)
 
     # The first perf test case approximates the DeepSeekV3, 2k-batch-size, EP=16.
     # The second case approximates the Qwen3-Coder-480B, 2k-batch-size, EP=8.

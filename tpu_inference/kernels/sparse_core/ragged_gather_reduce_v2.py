@@ -435,6 +435,22 @@ def main_kernel(
         src_row_idx_in_vmem.reverse()
         row_valid_vec.reverse()
 
+        # Single-writer rule: a group reaching the block's final row may continue
+        # into the next block (which writes its full reduced value), so suppress
+        # this block's partial write -- the pipelined row-blocks don't order the
+        # two scatters and would race on the output row. The whole permutation is
+        # resident, so the next block's first source row is read directly.
+        next_block_first_row = (row_block_id + 1) * row_chunk_size
+        peek = jnp.minimum(
+            next_block_first_row,
+            scratch.sorted_by_validity_vmem.shape[0] - num_simd_lanes)
+        group_continues = jnp.logical_and(
+            next_block_first_row < num_rows_current_row_partition,
+            (scratch.sorted_by_validity_vmem[pl.ds(peek, num_simd_lanes)][0] //
+             cfg.reduce_group_size) == dst_indices_list[-1][num_simd_lanes -
+                                                            1],
+        )
+
         # Per source row, the (VMEM source row, HBM destination row) of its
         # scatter. Rows whose group is not yet fully reduced in this sub-chunk,
         # and padding rows, are routed to a throwaway row.
@@ -451,6 +467,15 @@ def main_kernel(
                     row_valid_vec[global_idx],
                     merge_target < (s + 1) * num_simd_lanes,
                 )
+                # Only the last sub-chunk's group can reach the block's final
+                # row; earlier sub-chunks already route such a group to garbage.
+                if s == num_row_subchunks - 1:
+                    is_final_write = jnp.logical_and(
+                        is_final_write,
+                        jnp.logical_not(
+                            jnp.logical_and(merge_target == row_chunk_size - 1,
+                                            group_continues)),
+                    )
                 sub_src.append(
                     jnp.where(is_final_write, merge_target % num_simd_lanes,
                               0))
