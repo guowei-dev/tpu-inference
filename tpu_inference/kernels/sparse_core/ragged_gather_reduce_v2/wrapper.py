@@ -17,6 +17,7 @@ import functools
 
 import jax
 import jax.numpy as jnp
+from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
 
@@ -45,13 +46,14 @@ def _preprocess(
     reduce_group_size: int,
     num_row_partitions: int,
     num_simd_lanes: int,
-    row_chunk_size: int,
+    window_size: int,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Sorts valid source rows to the front of each row partition.
 
     Returns:
       sorted_by_validity: original row index of each slot after the stable
-        sort, flattened across partitions and padded to ``row_chunk_size``.
+        sort, flattened across partitions and padded to a whole number of
+        windows (``window_size``, the fixed per-window DMA size).
       num_src_rows_per_row_partition: valid row count per partition, padded to
         ``num_simd_lanes`` so the kernel can load it as a single vector.
       mask: per output group, whether the group has any valid source row.
@@ -68,7 +70,7 @@ def _preprocess(
     sorted_by_validity += (jnp.arange(num_row_partitions)[:, None] *
                            row_partition_size)
 
-    pad_to = config._align_to(row_partition_size, row_chunk_size)
+    pad_to = config._align_to(row_partition_size, window_size)
     if pad_to > row_partition_size:
         sorted_by_validity = jnp.pad(
             sorted_by_validity,
@@ -144,6 +146,18 @@ def ragged_gather_reduce(
     col_size = aligned_hidden_size // num_column_partitions
     col_chunk_size = config._calculate_col_chunk_size(col_size, num_simd_lanes)
 
+    # Size the sort-permutation window (see config._max_row_window). Pad the
+    # input first so each row partition holds a whole number of reduce groups;
+    # no group is then split across two physical cores.
+    padded_input_size = config._align_to(input_size,
+                                         num_row_partitions * reduce_group_size)
+    row_partition_size = padded_input_size // num_row_partitions
+    max_blocks_per_partition = pl.cdiv(row_partition_size, row_chunk_size)
+    max_window = config._max_row_window(row_chunk_size, col_size,
+                                        col_chunk_size, num_simd_lanes,
+                                        max_blocks_per_partition)
+    window_size = max_window * row_chunk_size
+
     # Step 3: Pre-process inputs (weights, padding, sort by validity).
     # The kernel gathers x through a uint32 reinterpretation; carry the weights
     # the same way so they can be bitcast back to float32 on SparseCore.
@@ -154,10 +168,6 @@ def ragged_gather_reduce(
         topk_weights_u32 = jax.lax.bitcast_convert_type(
             topk_weights, jnp.uint32)
 
-    # Pad the input so each row partition holds a whole number of reduce
-    # groups; no group is then split across two physical cores.
-    padded_input_size = config._align_to(input_size,
-                                         num_row_partitions * reduce_group_size)
     valid_rows_mask = jnp.pad(
         valid_rows_mask,
         (0, padded_input_size - input_size),
@@ -169,7 +179,7 @@ def ragged_gather_reduce(
         reduce_group_size,
         num_row_partitions,
         num_simd_lanes,
-        row_chunk_size,
+        window_size,
     )
 
     # Step 4: Launch the SparseCore kernel.
@@ -187,14 +197,13 @@ def ragged_gather_reduce(
         col_size=col_size,
         col_chunk_size=col_chunk_size,
         num_row_subchunks=num_row_subchunks,
+        max_window=max_window,
         num_simd_lanes=num_simd_lanes,
         topk_dtype=topk_weights.dtype,
         in_dtype=x.dtype,
         core_axis_name=vector_mesh.core_axis_name,
         subcore_axis_name=vector_mesh.subcore_axis_name,
     )
-
-    row_partition_size_padded = sorted_by_validity.size // num_row_partitions
 
     # The output gets one extra row: the kernel's garbage scatter destination.
     out = core_map_helper.kernel(
@@ -208,8 +217,7 @@ def ragged_gather_reduce(
             disable_bounds_checks=True,
             needs_layout_passes=False,
         ),
-        scratch_types=(memory_ref._Scratch.create(cfg,
-                                                  row_partition_size_padded), ),
+        scratch_types=(memory_ref._Scratch.create(cfg), ),
         mesh=vector_mesh,
         name="sc_ragged_gather_reduce_v2",
     )(memory_ref._Inputs(

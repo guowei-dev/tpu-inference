@@ -37,6 +37,7 @@ class _Inputs:
 @dataclasses.dataclass(frozen=True)
 class _Scratch:
     num_rows_per_row_partition_vmem: Any
+    next_row_peek_vmem: Any
     prev_iter_last_row_vmem: Any
     prev_dst_row_smem: Any
     sorted_by_validity_vmem: Any
@@ -50,19 +51,24 @@ class _Scratch:
     sem: Any
 
     @classmethod
-    def create(cls, cfg: config._Config,
-               row_partition_size_padded: int) -> "_Scratch":
-        """Allocates one core's VMEM/SMEM scratch from the resolved config."""
+    def create(cls, cfg: config._Config) -> "_Scratch":
+        """Allocates one core's VMEM/SMEM scratch from the resolved config.
+
+        ``sorted_by_validity_vmem`` holds one resident window of the sort
+        permutation (``window_size`` rows), so SPMEM use is independent of
+        input_size; ``next_row_peek_vmem`` prefetches the next window's first
+        row for the cross-window single-writer check.
+        """
         row_chunk_size = cfg.row_chunk_size
         return cls(
             num_rows_per_row_partition_vmem=pltpu.VMEM((cfg.num_simd_lanes, ),
                                                        jnp.int32),
+            next_row_peek_vmem=pltpu.VMEM((cfg.num_simd_lanes, ), jnp.int32),
             prev_iter_last_row_vmem=pltpu.VMEM(
                 (cfg.col_size // cfg.col_chunk_size, cfg.col_chunk_size),
                 jnp.float32),
             prev_dst_row_smem=pltpu.SMEM((1, ), jnp.int32),
-            sorted_by_validity_vmem=pltpu.VMEM((row_partition_size_padded, ),
-                                               jnp.int32),
+            sorted_by_validity_vmem=pltpu.VMEM((cfg.window_size, ), jnp.int32),
             src_indices_vmem=pltpu.VMEM((row_chunk_size, ), jnp.int32),
             dst_indices_vmem=pltpu.VMEM((row_chunk_size, ), jnp.int32),
             tw_f32_vmem=pltpu.VMEM((row_chunk_size, ), jnp.float32),

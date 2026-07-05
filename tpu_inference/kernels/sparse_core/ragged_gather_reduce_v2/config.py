@@ -29,6 +29,7 @@ class _Config:
     col_size: int
     col_chunk_size: int
     num_row_subchunks: int
+    max_window: int
     num_simd_lanes: int
     topk_dtype: Any
     in_dtype: Any
@@ -39,6 +40,11 @@ class _Config:
     def row_chunk_size(self) -> int:
         """Number of rows handled per row-pipeline block."""
         return self.num_simd_lanes * self.num_row_subchunks
+
+    @property
+    def window_size(self) -> int:
+        """Number of rows whose sort permutation is resident per window."""
+        return self.max_window * self.row_chunk_size
 
     @property
     def num_col_chunks(self) -> int:
@@ -153,3 +159,29 @@ def _calculate_col_chunk_size(col_size: int, num_simd_lanes: int) -> int:
         if col_size % chunk == 0:
             return chunk
     return 128
+
+
+def _max_row_window(
+    row_chunk_size: int,
+    col_size: int,
+    col_chunk_size: int,
+    num_simd_lanes: int,
+    max_blocks_per_partition: int,
+) -> int:
+    """Largest window of row-blocks whose resident sort permutation fits SPMEM.
+
+    Streaming a fixed window instead of the whole partition makes SPMEM use
+    independent of input_size; the clamp keeps small inputs single-window.
+    """
+    # Per-subcore tile_spmem budget in 32-bit words, kept 10% under to leave
+    # headroom for TC-tiling padding.
+    sc = pltpu.get_tpu_info().sparse_core
+    words_per_subcore = sc.vmem_capacity_bytes // 4
+    # Input-size-independent resident scratch (32-bit words): prev-row carry
+    # (col_size), out_vmem + column gather double-buffer (3*lanes*col_chunk),
+    # the num_rows + next-block-peek vectors (2*lanes), and 6 row index/dma
+    # buffers + the row gather pipeline double-buffers (10*row_chunk).
+    fixed = (col_size + 3 * num_simd_lanes * col_chunk_size +
+             2 * num_simd_lanes + 10 * row_chunk_size)
+    window = (int(words_per_subcore * 0.9) - fixed) // row_chunk_size
+    return max(1, min(window, max(1, max_blocks_per_partition)))

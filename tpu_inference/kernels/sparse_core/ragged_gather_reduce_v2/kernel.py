@@ -91,8 +91,11 @@ def main_kernel(
     *,
     cfg: config._Config,
 ):
-    """Stages this core's partition into VMEM, then runs the row pipeline."""
+    """Stages this core's partition, then streams the sort permutation window by
+    window through the row pipeline."""
     num_simd_lanes = cfg.num_simd_lanes
+    max_window = cfg.max_window
+    window_words = cfg.window_size
 
     # Step 1: Resolve this core's row/column partition and its column slice.
     core_id = jax.lax.axis_index((cfg.core_axis_name, cfg.subcore_axis_name))
@@ -104,23 +107,16 @@ def main_kernel(
     row_start_padded = row_partition_id * row_partition_size_padded
     col_start = col_partition_id * cfg.col_size
 
-    # Step 2: Stage this partition's row count and sort permutation into VMEM.
+    # Step 2: Stage this partition's row count (the sort permutation is streamed
+    # one window at a time in the loop below, bounding the resident scratch).
     recv_sem = scratch.sem.at[0]
     num_rows_dma = pltpu.make_async_copy(
         inputs.num_src_rows_per_row_partition.at[pl.ds(0, num_simd_lanes)],
         scratch.num_rows_per_row_partition_vmem,
         recv_sem,
     )
-    sorted_dma = pltpu.make_async_copy(
-        inputs.sorted_by_validity.at[pl.ds(row_start_padded,
-                                           row_partition_size_padded)],
-        scratch.sorted_by_validity_vmem,
-        recv_sem,
-    )
     num_rows_dma.start()
-    sorted_dma.start()
     num_rows_dma.wait()
-    sorted_dma.wait()
 
     num_rows_per_row_partition = scratch.num_rows_per_row_partition_vmem[...]
     num_rows_current_row_partition = jnp.array(0, jnp.int32)
@@ -131,13 +127,17 @@ def main_kernel(
             num_rows_current_row_partition,
         )
     num_row_blocks = pl.cdiv(num_rows_current_row_partition, cfg.row_chunk_size)
+    num_windows = pl.cdiv(num_row_blocks, max_window)
 
-    # Step 3: Run the gather / weighted segmented-reduce / scatter pipeline.
-    # Sentinel for the cross-block reduction carry (no previous group).
+    # Step 3: Stream one window of the sort permutation at a time; each window's
+    # row-blocks run the gather / weighted segmented-reduce / scatter pipeline.
+    # Sentinel for the cross-block reduction carry (no previous group). The carry
+    # is kernel scratch, so it also persists across window boundaries.
     scratch.prev_dst_row_smem[0] = -1
 
     # One gather per sub-chunk for ``indices``, then the same for
-    # ``topk_weights``.
+    # ``topk_weights``. Loop-invariant: each window is re-DMA'd into the same
+    # resident buffer.
     row_gather_in_specs = tuple(
         _row_gather_spec(
             scratch.sorted_by_validity_vmem,
@@ -146,24 +146,57 @@ def main_kernel(
             row_chunk_size=cfg.row_chunk_size,
         ) for sub in range(cfg.num_row_subchunks))
 
-    row_pipeline = pltpu.emit_pipeline(
-        functools.partial(
-            _row_kernel,
-            cfg=cfg,
-            scratch=scratch,
-            in_hbm_ref=inputs.x,
-            out_hbm_ref=out_hbm_ref,
-            num_rows_current_row_partition=num_rows_current_row_partition,
-            col_start=col_start,
-        ),
-        grid=(num_row_blocks, ),
-        in_specs=(row_gather_in_specs, row_gather_in_specs),
-        out_specs=(),
-    )
-    row_pipeline(
-        (inputs.indices, ) * cfg.num_row_subchunks,
-        (inputs.topk_weights, ) * cfg.num_row_subchunks,
-    )
+    @pl.loop(0, num_windows)
+    def window_loop(window_id):
+        window_block_base = window_id * max_window
+        # Stage this window's slice of the sort permutation resident, then
+        # prefetch the next window's first source row -- the last block of this
+        # window uses it to detect a group continuing across the window boundary
+        # (the final window fetches a harmless clamped past-the-end row).
+        sorted_dma = pltpu.make_async_copy(
+            inputs.sorted_by_validity.at[pl.ds(
+                row_start_padded + window_id * window_words, window_words)],
+            scratch.sorted_by_validity_vmem,
+            recv_sem,
+        )
+        sorted_dma.start()
+        sorted_dma.wait()
+
+        peek_dma = pltpu.make_async_copy(
+            inputs.sorted_by_validity.at[pl.ds(
+                jnp.minimum(
+                    row_start_padded + (window_id + 1) * window_words,
+                    inputs.sorted_by_validity.shape[0] - num_simd_lanes),
+                num_simd_lanes)],
+            scratch.next_row_peek_vmem,
+            recv_sem,
+        )
+        peek_dma.start()
+        peek_dma.wait()
+
+        blocks_in_window = jnp.minimum(max_window,
+                                       num_row_blocks - window_block_base)
+
+        row_pipeline = pltpu.emit_pipeline(
+            functools.partial(
+                _row_kernel,
+                cfg=cfg,
+                scratch=scratch,
+                in_hbm_ref=inputs.x,
+                out_hbm_ref=out_hbm_ref,
+                num_rows_current_row_partition=num_rows_current_row_partition,
+                col_start=col_start,
+                window_block_base=window_block_base,
+                blocks_in_window=blocks_in_window,
+            ),
+            grid=(blocks_in_window, ),
+            in_specs=(row_gather_in_specs, row_gather_in_specs),
+            out_specs=(),
+        )
+        row_pipeline(
+            (inputs.indices, ) * cfg.num_row_subchunks,
+            (inputs.topk_weights, ) * cfg.num_row_subchunks,
+        )
 
 
 def _row_kernel(
@@ -176,11 +209,14 @@ def _row_kernel(
     out_hbm_ref: jax.Array,
     num_rows_current_row_partition: jax.Array,
     col_start: jax.Array,
+    window_block_base: jax.Array,
+    blocks_in_window: jax.Array,
 ):
     """One row-block: stage indices/weights, resolve scatters, run col pipeline."""
     num_simd_lanes = cfg.num_simd_lanes
     row_chunk_size = cfg.row_chunk_size
     num_row_subchunks = cfg.num_row_subchunks
+    window_words = cfg.window_size
 
     # The SparseCore indirect DMA requires 32-bit elements, so x is gathered
     # through a uint32 reinterpretation. bfloat16 packs two source rows per
@@ -188,6 +224,9 @@ def _row_kernel(
     in_32b_hbm_ref = in_hbm_ref.bitcast(jnp.uint32)
 
     row_block_id = pl.program_id(0)
+    # Absolute row-block index within the partition (for the validity mask); the
+    # resident sort window is indexed window-relative.
+    global_block_id = window_block_base + row_block_id
 
     # Destination output row of each source row in this block.
     dst_indices_list = [
@@ -232,7 +271,7 @@ def _row_kernel(
     src_row_idx_in_vmem = []
     row_valid_vec = []
     for row_vmem_idx in reversed(range(row_chunk_size)):
-        global_row_idx = row_block_id * row_chunk_size + row_vmem_idx
+        global_row_idx = global_block_id * row_chunk_size + row_vmem_idx
         row_valid_vec.append(global_row_idx < num_rows_current_row_partition)
         if row_vmem_idx == row_chunk_size - 1:
             src_row_idx_in_vmem.append(row_vmem_idx)
@@ -246,6 +285,30 @@ def _row_kernel(
                 (1 - same_group_as_next) * row_vmem_idx)
     src_row_idx_in_vmem.reverse()
     row_valid_vec.reverse()
+
+    # A reduce group whose last in-block row is the block's final row may
+    # continue into the next block, which writes the group's full reduced value.
+    # Suppress this block's partial write for such a group so each output row has
+    # a single writer -- neither the pipelined row-block emit_pipeline nor the
+    # outer window loop orders the two scatters, so a double write races on the
+    # output row. The next block's first source row is resident within a window;
+    # at a window boundary it is the next window's first row, prefetched once per
+    # window into next_row_peek_vmem.
+    is_last_block_in_window = (row_block_id + 1) == blocks_in_window
+    next_block_first_row = (global_block_id + 1) * row_chunk_size
+    resident_peek = jnp.minimum((row_block_id + 1) * row_chunk_size,
+                                window_words - num_simd_lanes)
+    next_block_first_idx = jnp.where(
+        is_last_block_in_window,
+        scratch.next_row_peek_vmem[pl.ds(0, num_simd_lanes)][0],
+        scratch.sorted_by_validity_vmem[pl.ds(resident_peek,
+                                              num_simd_lanes)][0],
+    )
+    group_continues = jnp.logical_and(
+        next_block_first_row < num_rows_current_row_partition,
+        (next_block_first_idx //
+         cfg.reduce_group_size) == dst_indices_list[-1][num_simd_lanes - 1],
+    )
 
     # Per source row, the (VMEM source row, HBM destination row) of its
     # scatter. Rows whose group is not yet fully reduced in this sub-chunk,
@@ -263,6 +326,15 @@ def _row_kernel(
                 row_valid_vec[global_idx],
                 merge_target < (s + 1) * num_simd_lanes,
             )
+            # Only the last sub-chunk's group can reach the block's final row;
+            # earlier sub-chunks already route such a group to garbage.
+            if s == num_row_subchunks - 1:
+                is_final_write = jnp.logical_and(
+                    is_final_write,
+                    jnp.logical_not(
+                        jnp.logical_and(merge_target == row_chunk_size - 1,
+                                        group_continues)),
+                )
             sub_src.append(
                 jnp.where(is_final_write, merge_target % num_simd_lanes, 0))
             sub_dst.append(
