@@ -34,6 +34,7 @@ class IndexRef:
 @dataclasses.dataclass(frozen=True)
 class ScratchRef:
   num_rows_per_row_partition_vmem: Any
+  next_row_peek_vmem: Any
   prev_iter_last_row_vmem: Any
   prev_dst_row_smem: Any
   sorted_by_validity_vmem: Any
@@ -54,6 +55,7 @@ class ScratchRef:
         num_rows_per_row_partition_vmem=pltpu.VMEM(
             (num_simd_lanes,), jnp.int32
         ),
+        next_row_peek_vmem=pltpu.VMEM((num_simd_lanes,), jnp.int32),
         prev_iter_last_row_vmem=pltpu.VMEM(
             (cfg.col_size // cfg.col_chunk_size, cfg.col_chunk_size),
             jnp.float32,

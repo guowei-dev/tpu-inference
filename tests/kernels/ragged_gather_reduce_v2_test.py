@@ -161,21 +161,27 @@ class ScatterTest(jtu.JaxTestCase):
 
     def test_sc_ragged_gather_reduce_v2_multiwindow(self):
         """v2 is correct when the input spans multiple resident sort-permutation
-        windows (out_size large enough for >1 window on v7, no production seam),
-        exercising the windowed DMA + window-relative indexing end to end. hidden
-        is kept small so x stays under the 16 GiB SC per-tensor limit.
+        windows (out_size large enough for >1 window on v7, no production seam):
+        the windowed DMA + window-relative indexing, and -- at partial validity
+        -- a reduce group straddling a window boundary (the cross-window
+        single-writer path). hidden is kept small so x stays under the 16 GiB SC
+        per-tensor limit.
         """
         out_size, hidden, rgs = 1_835_008, 1024, 8
         key = jax.random.key(0)
         x = jax.random.normal(key, (out_size, hidden), jnp.bfloat16)
         indices = jax.random.permutation(key, out_size)
         topk_weights = jax.random.normal(key, (out_size, ), jnp.bfloat16)
-        valid_rows_mask = jnp.ones((out_size, ), jnp.bool_)
-        desired = reference_ragged_gather_reduce(x, indices, topk_weights,
-                                                 valid_rows_mask, rgs)
-        actual = ragged_gather_reduce_v2(x, indices, topk_weights,
-                                         valid_rows_mask, rgs)
-        np.testing.assert_allclose(actual, desired, atol=1e-2, rtol=1e-2)
+        # all-valid exercises the windowing; ~94% valid puts the per-partition
+        # valid-row count above one window so reduce groups straddle a window
+        # boundary (and many straddle row-block boundaries within a window).
+        for valid_rows_mask in (jnp.ones((out_size, ), jnp.bool_), indices
+                                < int(out_size * 0.9375)):
+            desired = reference_ragged_gather_reduce(x, indices, topk_weights,
+                                                     valid_rows_mask, rgs)
+            actual = ragged_gather_reduce_v2(x, indices, topk_weights,
+                                             valid_rows_mask, rgs)
+            np.testing.assert_allclose(actual, desired, atol=1e-2, rtol=1e-2)
 
     # The first perf test case approximates the DeepSeekV3, 2k-batch-size, EP=16.
     # The second case approximates the Qwen3-Coder-480B, 2k-batch-size, EP=8.
