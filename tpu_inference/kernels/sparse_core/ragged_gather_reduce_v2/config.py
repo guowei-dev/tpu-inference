@@ -86,7 +86,37 @@ class Config:
 
   @property
   def row_partition_size_padded(self) -> int:
-    return _align_to(self.row_partition_size, self.row_chunk_size)
+    # Pad each partition to a whole number of windows (fixed per-window DMA size).
+    return _align_to(self.row_partition_size, self.window_size)
+
+  @property
+  def max_blocks_per_partition(self) -> int:
+    return pl.cdiv(self.row_partition_size, self.row_chunk_size)
+
+  @property
+  def max_window(self) -> int:
+    """Largest window of row-blocks whose resident sort permutation fits SPMEM.
+
+    Streaming a fixed window instead of the whole partition makes SPMEM use
+    independent of input_size; the clamp keeps small inputs single-window.
+    """
+    # Per-subcore tile_spmem budget in 32-bit words, kept 10% under to leave
+    # headroom for TC-tiling padding.
+    words_per_subcore = self.sc_info.vmem_capacity_bytes // 4
+    num_simd_lanes = self.sc_info.num_lanes
+    # Input-size-independent resident scratch (32-bit words): prev-row carry
+    # (col_size), out_vmem + column gather double-buffer (3*lanes*col_chunk),
+    # the num_rows vector (lanes), and 6 row index/dma buffers + the row gather
+    # pipeline double-buffers (10*row_chunk).
+    fixed = (self.col_size + 3 * num_simd_lanes * self.col_chunk_size +
+             num_simd_lanes + 10 * self.row_chunk_size)
+    window = (int(words_per_subcore * 0.9) - fixed) // self.row_chunk_size
+    return max(1, min(window, max(1, self.max_blocks_per_partition)))
+
+  @property
+  def window_size(self) -> int:
+    """Number of rows whose sort permutation is resident per window."""
+    return self.max_window * self.row_chunk_size
 
   @property
   def row_chunk_size(self) -> int:

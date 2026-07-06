@@ -60,7 +60,7 @@ class ScratchRef:
         ),
         prev_dst_row_smem=pltpu.SMEM((1,), jnp.int32),
         sorted_by_validity_vmem=pltpu.VMEM(
-            (cfg.row_partition_size_padded,), jnp.int32
+            (cfg.window_size,), jnp.int32
         ),
         src_indices_vmem=indices_vmem,
         dst_indices_vmem=indices_vmem,

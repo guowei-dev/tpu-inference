@@ -103,27 +103,18 @@ def main_kernel(
   row_partition_id = core_id // cfg.num_column_partitions
   col_partition_id = core_id % cfg.num_column_partitions
 
-  row_start_padded = row_partition_id * cfg.row_partition_size_padded
   col_start = col_partition_id * cfg.col_size
 
-  # Step 2: Stage this partition's row count and sort permutation into VMEM.
+  # Step 2: Stage this partition's row count (the sort permutation is streamed
+  # one window at a time in call_kernel_pipeline, bounding the resident scratch).
   recv_sem = scratch_ref.sem.at[0]
   num_rows_dma = pltpu.make_async_copy(
       scalar_ref.num_src_rows_per_row_partition.at[pl.ds(0, num_simd_lanes)],
       scratch_ref.num_rows_per_row_partition_vmem,
       recv_sem,
   )
-  sorted_dma = pltpu.make_async_copy(
-      scalar_ref.sorted_by_validity.at[
-          pl.ds(row_start_padded, cfg.row_partition_size_padded)
-      ],
-      scratch_ref.sorted_by_validity_vmem,
-      recv_sem,
-  )
   num_rows_dma.start()
-  sorted_dma.start()
   num_rows_dma.wait()
-  sorted_dma.wait()
 
   kernel.call_kernel_pipeline(
       row_partition_id=row_partition_id,
