@@ -50,6 +50,11 @@ if TYPE_CHECKING:
     # overhead (avoids a small-batch decode regression).
     MOE_FUSE_BATCH_GATED: bool = False
     MOE_FUSE_PERMUTE_MIN_TOKENS: int = 768
+    # Fuse the MoE unpermute (token scatter) into GMM2's output write;
+    # independent of MOE_FUSE_PERMUTE (GMM1 gathers only, GMM2 scatters only).
+    # Gated by MOE_FUSE_BATCH_GATED at MOE_FUSE_UNPERMUTE_MIN_TOKENS.
+    MOE_FUSE_UNPERMUTE: bool = False
+    MOE_FUSE_UNPERMUTE_MIN_TOKENS: int = 768
     JITTED_MM_MODULE_KEYS: list[str] = []
     REGISTER_MM_MODULE_CUSTOM_PYTREE_CLASSES: list[str] = []
     # SparseCore MoE gather kernel version used by fused_moe_gmm.
@@ -342,6 +347,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     env_bool("MOE_FUSE_BATCH_GATED", default=False),
     "MOE_FUSE_PERMUTE_MIN_TOKENS":
     lambda: int(os.getenv("MOE_FUSE_PERMUTE_MIN_TOKENS", "768")),
+    # Fuse the MoE unpermute (token scatter) into GMM2's output write.
+    "MOE_FUSE_UNPERMUTE":
+    env_bool("MOE_FUSE_UNPERMUTE", default=False),
+    "MOE_FUSE_UNPERMUTE_MIN_TOKENS":
+    lambda: int(os.getenv("MOE_FUSE_UNPERMUTE_MIN_TOKENS", "768")),
     "JITTED_MM_MODULE_KEYS":
     env_str_list("JITTED_MM_MODULE_KEYS"),
     "REGISTER_MM_MODULE_CUSTOM_PYTREE_CLASSES":

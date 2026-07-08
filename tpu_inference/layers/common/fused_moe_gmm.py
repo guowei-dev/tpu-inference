@@ -128,7 +128,8 @@ def gmm_wrapper(lhs,
                 group_offset,
                 fuse_act=None,
                 preferred_element_type=None,
-                gather_indices=None):
+                gather_indices=None,
+                scatter_indices=None):
     gmm_res = gmm_v2(
         lhs=lhs,
         rhs=rhs,
@@ -137,6 +138,7 @@ def gmm_wrapper(lhs,
         group_sizes=group_sizes,
         group_offset=group_offset[0],
         gather_indices=gather_indices,
+        scatter_indices=scatter_indices,
         zero_initialize=False,
         fuse_act=fuse_act,
         preferred_element_type=preferred_element_type,
@@ -193,12 +195,14 @@ def moe_gmm_local(x: jax.Array,
                   topk_argsort_revert_indices: jax.Array,
                   topk_weights: jax.Array,
                   token_indices_sorted: jax.Array | None = None,
+                  topk_argsort_indices: jax.Array | None = None,
                   *,
                   activation: str,
                   topk: int,
                   parallelism: Literal["tp", "ep"],
                   enable_rs_kernel: bool = False,
                   fuse_permute: bool = False,
+                  fuse_unpermute: bool = False,
                   onehot_moe_permute_threshold: int = 0,
                   scatter_results: bool = False,
                   moe_chunk_size: int = 0,
@@ -210,6 +214,11 @@ def moe_gmm_local(x: jax.Array,
     When ``fuse_permute`` is set, ``x`` is the un-permuted source activations and
     ``token_indices_sorted`` selects each grouped LHS row -- GMM1 gathers its
     input per-row (fused permute) instead of reading a pre-grouped buffer.
+
+    When ``fuse_unpermute`` is set, GMM2 scatters its output rows straight to
+    token-major (unpermuted) order via ``topk_argsort_indices`` -- the combine
+    becomes a contiguous weighted-masked sum, with no separate unpermute op.
+    The two fusions are independent (GMM1 gathers only, GMM2 scatters only).
     """
 
     assert parallelism in ["tp", "ep"]
@@ -249,8 +258,19 @@ def moe_gmm_local(x: jax.Array,
         shard_id = jax.lax.axis_index(ShardingAxisName.MLP_TENSOR).sum()
         w2_bias = jnp.where(shard_id == 0, w2_bias, 0)
     gmm1_res = gmm1_res[:, :w2.shape[1]]  # trim to hidden size if padded
-    gmm2_res = gmm_wrapper(gmm1_res, w2, w2_scale, w2_bias, group_sizes,
-                           group_offset)
+    if fuse_unpermute:
+        # Fused unpermute: GMM2 writes row j to token-major row
+        # topk_argsort_indices[j] (== the unpermuted order), so the combine
+        # below is a contiguous slice instead of a gather. fp32 output is a
+        # kernel requirement (single-row bf16 DMAs are unsupported); rows for
+        # other shards' experts are uninitialized and masked out below.
+        gmm2_res = gmm_wrapper(gmm1_res, w2, w2_scale, w2_bias, group_sizes,
+                               group_offset,
+                               preferred_element_type=jnp.float32,
+                               scatter_indices=topk_argsort_indices)
+    else:
+        gmm2_res = gmm_wrapper(gmm1_res, w2, w2_scale, w2_bias, group_sizes,
+                               group_offset)
 
     batch_size = gmm2_res.shape[0]
     local_group_size = w1.shape[0]
@@ -284,9 +304,12 @@ def moe_gmm_local(x: jax.Array,
 
     # Chunk Size Resolution
     num_tokens = batch_size // topk
-    is_onehot = (local_group_size < group_sizes.size) and (
-        onehot_moe_permute_threshold > 0
-        and batch_size <= onehot_moe_permute_threshold)
+    # The fused-unpermute combine slices contiguously, so (unlike one-hot) it
+    # stays compatible with chunked reduce-scatter pipelining.
+    is_onehot = (not fuse_unpermute) and (
+        local_group_size < group_sizes.size) and (
+            onehot_moe_permute_threshold > 0
+            and batch_size <= onehot_moe_permute_threshold)
     if moe_chunk_size > 0 and num_tokens > moe_chunk_size * scatter_axis_size and not is_onehot:
         actual_chunk_size = moe_chunk_size * scatter_axis_size
     else:
@@ -327,7 +350,16 @@ def moe_gmm_local(x: jax.Array,
         cur_weights = topk_weights[start_tok:end_tok]
         cur_mask = mask[start_tok:end_tok]
 
-        if local_group_size < group_sizes.size:
+        if fuse_unpermute:
+            # gmm2_res is already unpermuted (row-scattered by GMM2), so the
+            # combine reduces a contiguous fp32 slice: weight, mask (kills the
+            # uninitialized non-local rows), sum each token's topk rows.
+            cur_sorted = gmm2_res[start_idx:end_idx].reshape(
+                -1, topk, gmm2_res.shape[-1])
+            cur_weighted = cur_sorted * jnp.expand_dims(cur_weights, -1)
+            chunk_hidden = jnp.where(cur_mask, cur_weighted,
+                                     0.0).sum(axis=-2).astype(x.dtype)
+        elif local_group_size < group_sizes.size:
             if onehot_moe_permute_threshold > 0 and batch_size <= onehot_moe_permute_threshold:
                 revert_indices = cur_indices.reshape(-1, topk)
                 onehot = jax.nn.one_hot(revert_indices,
@@ -405,12 +437,14 @@ def tensor_parallel_gmm(
     topk_argsort_revert_indices: jax.Array,
     topk_weights: jax.Array,
     token_indices_sorted: jax.Array,
+    topk_argsort_indices: jax.Array,
     *,
     activation: str,
     topk: int,
     mesh: Mesh,
     enable_rs_kernel: bool = False,
     fuse_permute: bool = False,
+    fuse_unpermute: bool = False,
     onehot_moe_permute_threshold: int = 0,
     scatter_results: bool = False,
     moe_chunk_size: int = 0,
@@ -446,6 +480,7 @@ def tensor_parallel_gmm(
             parallelism="tp",
             enable_rs_kernel=False,
             fuse_permute=fuse_permute,
+            fuse_unpermute=fuse_unpermute,
             onehot_moe_permute_threshold=onehot_moe_permute_threshold,
             scatter_results=scatter_results,
             moe_chunk_size=moe_chunk_size,
@@ -465,6 +500,7 @@ def tensor_parallel_gmm(
             data_p_spec,
             data_p_spec,
             data_p_spec,
+            data_p_spec,
         ),
         out_specs=(final_out_specs),
         check_vma=False,
@@ -481,6 +517,7 @@ def tensor_parallel_gmm(
         topk_argsort_revert_indices,
         topk_weights,
         token_indices_sorted,
+        topk_argsort_indices,
     )
 
 
@@ -496,12 +533,14 @@ def expert_parallel_gmm(
     topk_argsort_revert_indices: jax.Array,
     topk_weights: jax.Array,
     token_indices_sorted: jax.Array,
+    topk_argsort_indices: jax.Array,
     *,
     activation: str,
     topk: int,
     mesh: Mesh,
     enable_rs_kernel: bool = False,
     fuse_permute: bool = False,
+    fuse_unpermute: bool = False,
     onehot_moe_permute_threshold: int = 0,
     moe_chunk_size: int = 0,
     scatter_results: bool = False,
@@ -537,6 +576,7 @@ def expert_parallel_gmm(
             onehot_moe_permute_threshold=onehot_moe_permute_threshold,
             enable_rs_kernel=enable_rs_kernel,
             fuse_permute=fuse_permute,
+            fuse_unpermute=fuse_unpermute,
             scatter_results=scatter_results,
             moe_chunk_size=moe_chunk_size,
             defer_all_reduce=defer_all_reduce,
@@ -552,6 +592,7 @@ def expert_parallel_gmm(
             w2_bias_spec,
             data_p_spec,
             ep_p_spec,
+            data_p_spec,
             data_p_spec,
             data_p_spec,
             data_p_spec,
@@ -571,6 +612,7 @@ def expert_parallel_gmm(
         topk_argsort_revert_indices,
         topk_weights,
         token_indices_sorted,
+        topk_argsort_indices,
     )
 
 
@@ -669,6 +711,12 @@ def fused_moe_func(
     # unfused path.
     if envs.MOE_FUSE_BATCH_GATED and num_tokens < envs.MOE_FUSE_PERMUTE_MIN_TOKENS:
         fuse_permute = False
+
+    # Fuse the unpermute (token scatter) into GMM2's output write. Independent
+    # of fuse_permute: GMM1 only gathers, GMM2 only scatters.
+    fuse_unpermute = envs.MOE_FUSE_UNPERMUTE
+    if envs.MOE_FUSE_BATCH_GATED and num_tokens < envs.MOE_FUSE_UNPERMUTE_MIN_TOKENS:
+        fuse_unpermute = False
 
     assert (num_tokens * topk) % 16 == 0, (
         "The kernel requires num_tokens * topk to be a multiple of "
@@ -769,13 +817,13 @@ def fused_moe_func(
             x = hidden_states_local[token_indices_sorted]
 
         return (x, token_indices_sorted, group_sizes_local,
-                topk_argsort_revert_indices)
+                topk_argsort_revert_indices, topk_argsort_indices)
 
     if all_gather_fp8:
         hidden_states = _apply_all_gather_fp8(hidden_states, mesh, dtype)
 
-    (x, token_indices_sorted, group_sizes,
-     topk_argsort_revert_indices) = jax.shard_map(
+    (x, token_indices_sorted, group_sizes, topk_argsort_revert_indices,
+     topk_argsort_indices) = jax.shard_map(
          _process_tokens_locally,
          mesh=mesh,
          in_specs=(
@@ -783,6 +831,7 @@ def fused_moe_func(
              P(ShardingAxisName.MLP_DATA, None),
          ),
          out_specs=(
+             P(ShardingAxisName.MLP_DATA),
              P(ShardingAxisName.MLP_DATA),
              P(ShardingAxisName.MLP_DATA),
              P(ShardingAxisName.MLP_DATA),
@@ -811,11 +860,13 @@ def fused_moe_func(
             topk_argsort_revert_indices,
             topk_weights,
             token_indices_sorted,
+            topk_argsort_indices,
             activation=activation,
             topk=topk,
             mesh=mesh,
             enable_rs_kernel=actual_enable_rs_kernel,
             fuse_permute=fuse_permute,
+            fuse_unpermute=fuse_unpermute,
             onehot_moe_permute_threshold=onehot_moe_permute_threshold,
             scatter_results=scatter_results,
             moe_chunk_size=moe_chunk_size,
@@ -834,11 +885,13 @@ def fused_moe_func(
             topk_argsort_revert_indices,
             topk_weights,
             token_indices_sorted,
+            topk_argsort_indices,
             activation=activation,
             topk=topk,
             mesh=mesh,
             enable_rs_kernel=actual_enable_rs_kernel,
             fuse_permute=fuse_permute,
+            fuse_unpermute=fuse_unpermute,
             onehot_moe_permute_threshold=onehot_moe_permute_threshold,
             scatter_results=scatter_results,
             moe_chunk_size=moe_chunk_size,
