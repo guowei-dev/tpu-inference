@@ -670,6 +670,10 @@ def gathered_inner_kernel(
     carry_gm = gm1 == num_gm
     gm1 = jnp.where(carry_gm, 0, gm1)
 
+    # COMPACT pool [src, 1, k]: (1, 128) tiling -> per-row DMAs legal in any
+    # dtype (bf16 included). Legacy 2-D pool is fp32 (32-bit-granular rows).
+    compact = len(lhs_hbm.shape) == 3
+
     def start_gather(buf_slot, sem, gm, k):
         # Rows of this gm tile start at the sublane-aligned floor of m_start, to
         # match the contiguous LHS index map; out-of-group rows are masked out
@@ -690,20 +694,34 @@ def gathered_inner_kernel(
         for r in range(tile_m):
             pos = jnp.clip(delta + r, 0, win_len - 1)
             row = gather_idx_smem[pos]
-            pltpu.make_async_copy(
-                lhs_hbm.at[row, pl.ds(k_base, tile_k)],
-                buf_slot.at[r],
-                sem,
-            ).start()
+            if compact:
+                pltpu.make_async_copy(
+                    lhs_hbm.at[pl.ds(row, 1), :, pl.ds(k_base, tile_k)],
+                    buf_slot.at[pl.ds(r, 1)],
+                    sem,
+                ).start()
+            else:
+                pltpu.make_async_copy(
+                    lhs_hbm.at[row, pl.ds(k_base, tile_k)],
+                    buf_slot.at[r],
+                    sem,
+                ).start()
 
     def wait_gather(buf_slot, sem):
         for r in range(tile_m):
             # Only the dst shape + sem matter for the wait; addresses are ignored.
-            pltpu.make_async_copy(
-                lhs_hbm.at[0, pl.ds(0, tile_k)],
-                buf_slot.at[r],
-                sem,
-            ).wait()
+            if compact:
+                pltpu.make_async_copy(
+                    lhs_hbm.at[pl.ds(0, 1), :, pl.ds(0, tile_k)],
+                    buf_slot.at[pl.ds(r, 1)],
+                    sem,
+                ).wait()
+            else:
+                pltpu.make_async_copy(
+                    lhs_hbm.at[0, pl.ds(0, tile_k)],
+                    buf_slot.at[r],
+                    sem,
+                ).wait()
 
     @pl.when(s == 0)
     def _():
@@ -715,9 +733,12 @@ def gathered_inner_kernel(
 
     wait_gather(gather_buf.at[slot], gather_sem.at[slot])
 
-    # Hand the gathered tile to the shared compute path. gather_buf[slot] is a
-    # [tile_m, tile_k] array; inner_kernel's `reshape(-1, tile_k)` is a no-op.
+    # Hand the gathered tile to the shared compute path. A compact buffer
+    # ([tile_m, 1, tile_k]) is relayouted large via reshape (strided loads);
+    # for the legacy buffer inner_kernel's `reshape(-1, tile_k)` is a no-op.
     lhs_tile = gather_buf[slot]
+    if compact:
+        lhs_tile = lhs_tile.reshape(tile_m, tile_k)
 
     # Unquantized matmul: down-cast the gathered fp32 rows to the rhs dtype so the
     # MXU runs e.g. bf16 x bf16. Lossless when the source rows were only widened
@@ -740,13 +761,16 @@ def scattered_inner_kernel(
     # In (pipelined)
     tiled_lhs_ref: jax.Array,
     tiled_rhs_ref: RhsRef,
-    # Scratch: the standard refs, plus the per-row scatter double buffer
-    # (scatter_buf [2, tile_m // sublane, sublane, tile_n] out_dtype + sem[2]),
+    # Scratch: the standard refs, a single large-layout stand-in for the
+    # pipelined out block, the per-row scatter double buffer in COMPACT
+    # (1, 128)-tiled layout ([2, tile_m, 1, tile_n] out_dtype + sem[2] --
+    # compact rows are 32-bit-granularity-free, so bf16 output is legal),
     # a per-slot outstanding-row counter (SMEM int32[2]) and the index window
     # (scatter_idx_smem int32[win_len] in SMEM + sem).
     partial_out_ref: jax.Array,
     acc_ref: jax.Array,
     metadata_ref: MetadataRef,
+    standin_ref: jax.Array,
     scatter_buf: jax.Array,
     scatter_sem: jax.Array,
     scatter_cnt: jax.Array,
@@ -754,8 +778,8 @@ def scattered_inner_kernel(
     scatter_idx_sem: jax.Array,
     *,
     cfgs: GmmConfigs,
-    # Closed over (not pipelined): the raw output [size_m, num_n * tile_n] and
-    # the full int32[size_m] destination-row array, both in HBM.
+    # Closed over (not pipelined): the compact output [size_m, 1, num_n*tile_n]
+    # and the full int32[size_m] destination-row array, both in HBM.
     out_hbm: jax.Array,
     scatter_idx_hbm: jax.Array,
 ):
@@ -763,13 +787,15 @@ def scattered_inner_kernel(
     row by row to `out_hbm[scatter_idx[m]]` instead of being written as a
     contiguous grouped block.
 
-    The unchanged `inner_kernel` computes into a VMEM double buffer standing in
-    for the pipelined out block (its partial_out carry only ever adds zeros to
-    this tile's in-group rows, so the shared epilogue stays byte-identical);
-    per-row fp32 DMAs then route exactly the in-group rows [m_start, m_end) to
-    their destination rows, double-buffered so tile t+1's compute hides tile
-    t's writes. Every grouped row is in-group in exactly one gm tile, so each
-    destination row is written exactly once -- no carry, no zero-init.
+    The unchanged `inner_kernel` computes into a large-layout VMEM stand-in for
+    the pipelined out block (its partial_out carry only ever adds zeros to this
+    tile's in-group rows, so the shared epilogue stays byte-identical); the
+    tile is relayouted into a COMPACT (1, 128)-tiled double buffer, and per-row
+    DMAs (legal for bf16 and fp32 in compact layout) route exactly the in-group
+    rows [m_start, m_end) to their destination rows, double-buffered so tile
+    t+1's compute hides tile t's writes. Every grouped row is in-group in
+    exactly one gm tile, so each destination row is written exactly once -- no
+    carry, no zero-init.
     """
 
     tile_m = cfgs.tiles.tile_m
@@ -795,14 +821,26 @@ def scattered_inner_kernel(
         # dynamic); only dst shape + sem matter, addresses are ignored.
         def _one(_, carry):
             pltpu.make_async_copy(
-                scatter_buf.at[s, 0, pl.ds(0, 1)],
-                out_hbm.at[pl.ds(0, 1), pl.ds(0, tile_n)],
+                scatter_buf.at[s, pl.ds(0, 1)],
+                out_hbm.at[pl.ds(0, 1), :, pl.ds(0, tile_n)],
                 scatter_sem.at[s],
             ).wait()
             return carry
 
         lax.fori_loop(0, scatter_cnt[s], _one, 0)
         scatter_cnt[s] = 0
+
+    # The unchanged compute path, writing this tile into the large stand-in
+    # (single-buffered: it is consumed by the relayout within the same tile).
+    inner_kernel(
+        tiled_lhs_ref,
+        tiled_rhs_ref,
+        standin_ref,
+        partial_out_ref,
+        acc_ref,
+        metadata_ref,
+        cfgs=cfgs,
+    )
 
     @pl.when(is_last_k)
     def _():
@@ -812,23 +850,13 @@ def scattered_inner_kernel(
             scatter_cnt[0] = 0
             scatter_cnt[1] = 0
 
-        # The buffer slot is about to be overwritten by this tile's epilogue:
-        # drain the writes issued from it two output tiles ago (no-op if none).
+        # The buffer slot is about to be overwritten: drain the writes issued
+        # from it two output tiles ago (no-op if none), then relayout the tile
+        # large -> compact so single rows become DMA-legal in any dtype.
         wait_scatter(slot)
+        scatter_buf[pl.ds(slot, 1)] = standin_ref[...].reshape(
+            1, tile_m, 1, tile_n)
 
-    # The unchanged compute path, writing this tile's rows into the slot.
-    inner_kernel(
-        tiled_lhs_ref,
-        tiled_rhs_ref,
-        scatter_buf.at[slot],
-        partial_out_ref,
-        acc_ref,
-        metadata_ref,
-        cfgs=cfgs,
-    )
-
-    @pl.when(is_last_k)
-    def _():
         m_start = metadata_ref.gm_id_to_m_offset[gm_id]
         m_end = metadata_ref.gm_id_to_m_offset[gm_id + 1]
         m_offset = m_start - m_start % sublane
@@ -850,8 +878,8 @@ def scattered_inner_kernel(
             pos = jnp.clip(delta + r, 0, win_len - 1)
             dst = scatter_idx_smem[pos]
             pltpu.make_async_copy(
-                scatter_buf.at[slot, r // sublane, pl.ds(r % sublane, 1)],
-                out_hbm.at[pl.ds(dst, 1), pl.ds(n_base, tile_n)],
+                scatter_buf.at[slot, pl.ds(r, 1)],
+                out_hbm.at[pl.ds(dst, 1), :, pl.ds(n_base, tile_n)],
                 scatter_sem.at[slot],
             ).start()
             return carry
@@ -1243,12 +1271,13 @@ def kernel_main_scatter(
     scatter_idx_hbm: jax.Array,  # int32[size_m] destination rows (HBM)
     rhs_ref: WeightsRef,  # [size_group, size_k, size_n]
     # Out
-    out_ref: jax.Array,  # [size_m, num_n * tile_n] fp32, row-scattered
+    out_ref: jax.Array,  # [size_m, 1, num_n * tile_n] COMPACT, row-scattered
     # Scratch memory
     partial_out_ref: jax.Array,
     acc_ref: jax.Array,
     metadata_ref: MetadataRef,
-    scatter_buf: jax.Array,  # [2, tile_m // sublane, sublane, tile_n] fp32
+    standin_ref: jax.Array,  # [tile_m // sublane, sublane, tile_n] large
+    scatter_buf: jax.Array,  # [2, tile_m, 1, tile_n] compact
     scatter_sem: jax.Array,  # DMA sem [2]
     scatter_cnt: jax.Array,  # int32[2] SMEM outstanding-row counters
     scatter_idx_smem: jax.Array,  # int32[win_len] SMEM idx window
@@ -1261,9 +1290,11 @@ def kernel_main_scatter(
     Mirrors `kernel_main` but the output is NOT an `emit_pipeline` output:
     grouped row j is written to `out_ref[scatter_idx[j]]` by per-row DMAs in
     scattered_inner_kernel (out_ref and the index array are closed over; the
-    index array stays in HBM and is chunked into SMEM per tile). Rows of
-    out_ref that no in-group row targets are left UNINITIALIZED -- the caller
-    masks them (zero_initialize is rejected with scatter_indices).
+    index array stays in HBM and is chunked into SMEM per tile). The output is
+    COMPACT [size_m, 1, n] -- (1, 128) tiling makes single-row DMAs legal in
+    any output dtype (bf16 included). Rows that no in-group row targets are
+    left UNINITIALIZED -- the caller masks them (zero_initialize is rejected
+    with scatter_indices).
     """
 
     if cfgs.rhs_cfgs.should_bitcast:
@@ -1305,8 +1336,8 @@ def kernel_main_scatter(
 
     lhs_in = lhs_ref.reshape(-1, cfgs.dims.size_lhs_sublane, lhs_ref.shape[-1])
     scratches = [
-        partial_out_ref, acc_ref, metadata_ref, scatter_buf, scatter_sem,
-        scatter_cnt, scatter_idx_smem, scatter_idx_sem
+        partial_out_ref, acc_ref, metadata_ref, standin_ref, scatter_buf,
+        scatter_sem, scatter_cnt, scatter_idx_smem, scatter_idx_sem
     ]
     pipeline_fn(lhs_in, rhs_ref, scratches=scratches)
 
@@ -1445,15 +1476,23 @@ def validate_inputs(
         "(GMM1 fuses the permute, GMM2 fuses the unpermute).")
 
     if gather_indices is not None:
-        # Fused permute: lhs is the un-permuted source pool [size_lhs_src, size_k];
-        # the number of (grouped) output rows is len(gather_indices). Per-row gather
-        # needs individually addressable fp32 rows.
-        assert lhs.dtype == jnp.float32, (
-            f"gather_indices requires fp32 lhs, got {lhs.dtype}")
+        # Fused permute: lhs is the un-permuted source pool; the number of
+        # (grouped) output rows is len(gather_indices). Per-row gather needs
+        # individually addressable rows: either a COMPACT [size_lhs_src, 1,
+        # size_k] pool ((1, 128) tiling -> any dtype, bf16 included) or the
+        # legacy fp32 [size_lhs_src, size_k] pool (fp32 rows are 32-bit
+        # granular, hence addressable at standard tiling).
         assert gather_indices.ndim == 1
         size_m = gather_indices.shape[0]
-        assert lhs.ndim == 2 and lhs.shape[1] == size_k, (
-            f"{lhs.shape=} must be [size_lhs_src, {size_k=}]")
+        if lhs.ndim == 3:
+            assert lhs.shape[1] == 1 and lhs.shape[2] == size_k, (
+                f"{lhs.shape=} must be [size_lhs_src, 1, {size_k=}]")
+        else:
+            assert lhs.dtype == jnp.float32, (
+                f"gather_indices requires fp32 lhs for a 2-D source pool "
+                f"(or pass a compact [src, 1, k] pool), got {lhs.dtype}")
+            assert lhs.ndim == 2 and lhs.shape[1] == size_k, (
+                f"{lhs.shape=} must be [size_lhs_src, {size_k=}]")
     else:
         size_m = lhs.shape[0]
         assert lhs.shape == (size_m, size_k)
@@ -1706,10 +1745,10 @@ def gmm_v2(
             DMAs hidden behind the MXU, instead of contiguously. Equivalent to
             ``out.at[scatter_indices].set(gmm_v2(lhs, rhs, group_sizes, ...))``
             for the rows this call computes; rows no computed row targets are
-            left UNINITIALIZED (mask them in the caller). Requires a float32
-            output (``preferred_element_type=jnp.float32``; single-row bf16
-            DMAs are unsupported) and ``zero_initialize=False``. Mutually
-            exclusive with ``gather_indices``.
+            left UNINITIALIZED (mask them in the caller). Any output dtype
+            (the rows are scattered through a compact (1, 128)-tiled layout).
+            Requires ``zero_initialize=False``. Mutually exclusive with
+            ``gather_indices``.
         tile_info: The tile sizes or tile function to use.
         vmem_limit_bytes: Optional vmem limit in bytes.
         precision: Unused. Exists for compatibility reasons.
@@ -1761,7 +1800,10 @@ def gmm_v2(
     if gather_indices is not None:
         num_n_tiles = pl.cdiv(cfgs.out_size_n, tiles.tile_n)
         if num_n_tiles > 1:
-            lhs = lhs[gather_indices]
+            if lhs.ndim == 3:  # compact pool -> plain 2-D permuted lhs
+                lhs = lhs[:, 0][gather_indices]
+            else:
+                lhs = lhs[gather_indices]
             gather_indices = None
 
     # Prepare block specs.
@@ -1834,12 +1876,20 @@ def gmm_v2(
     )
 
     if gather_indices is not None:
-        # Fused permute: extra (2, tile_m, tile_k) double buffer + DMA sems for the
-        # per-row gather, plus an SMEM window for this tile's index chunk (the index
-        # array is an HBM input, not scalar-prefetched).
+        # Fused permute: extra double buffer + DMA sems for the per-row gather
+        # (COMPACT [2, tile_m, 1, tile_k] in the pool dtype for a 3-D pool;
+        # legacy [2, tile_m, tile_k] fp32 for a 2-D pool), plus an SMEM window
+        # for this tile's index chunk (the index array is an HBM input, not
+        # scalar-prefetched).
         gw_len = idx_window_len(tiles.tile_m)
+        if lhs.ndim == 3:
+            gather_buf_shape = pltpu.VMEM(
+                (2, tiles.tile_m, 1, tiles.tile_k), lhs.dtype)
+        else:
+            gather_buf_shape = pltpu.VMEM(
+                (2, tiles.tile_m, tiles.tile_k), jnp.float32)
         gather_scratch = [
-            pltpu.VMEM((2, tiles.tile_m, tiles.tile_k), jnp.float32),
+            gather_buf_shape,
             pltpu.SemaphoreType.DMA((2, )),
             pltpu.SMEM((gw_len, ), jnp.int32),
             pltpu.SemaphoreType.DMA((1, )),
@@ -1869,22 +1919,20 @@ def gmm_v2(
 
     if scatter_indices is not None:
         # Fused unpermute: the output is row-scattered by per-row DMAs from a
-        # (2, tile_m // sublane, sublane, tile_n) double buffer, with the
-        # destination-row array windowed into SMEM like the gather path.
+        # COMPACT (2, tile_m, 1, tile_n) double buffer into a compact
+        # [size_m, 1, n] output ((1, 128) tiling makes single-row DMAs legal
+        # in any dtype), with the destination-row array windowed into SMEM
+        # like the gather path.
         if zero_initialize:
             raise ValueError(
                 "zero_initialize is unsupported with scatter_indices: the "
                 "unwritten output rows are scattered, not contiguous ranges. "
                 "Mask them in the caller instead.")
-        if cfgs.out_dtype != jnp.float32:
-            raise ValueError(
-                "scatter_indices requires a float32 output "
-                "(preferred_element_type=jnp.float32); single-row bf16 "
-                f"VMEM->HBM DMAs are unsupported. Got {cfgs.out_dtype}.")
         sw_len = idx_window_len(tiles.tile_m)
         scatter_scratch = [
-            pltpu.VMEM((2, tiles.tile_m // dims.size_lhs_sublane,
+            pltpu.VMEM((tiles.tile_m // dims.size_lhs_sublane,
                         dims.size_lhs_sublane, tiles.tile_n), cfgs.out_dtype),
+            pltpu.VMEM((2, tiles.tile_m, 1, tiles.tile_n), cfgs.out_dtype),
             pltpu.SemaphoreType.DMA((2, )),
             pltpu.SMEM((2, ), jnp.int32),
             pltpu.SMEM((sw_len, ), jnp.int32),
@@ -1900,7 +1948,7 @@ def gmm_v2(
         # Full-width n tiles keep the last column DMA in bounds.
         num_n_tiles = pl.cdiv(cfgs.out_size_n, tiles.tile_n)
         out_scatter = jax.ShapeDtypeStruct(
-            (dims.size_m, num_n_tiles * tiles.tile_n), cfgs.out_dtype)
+            (dims.size_m, 1, num_n_tiles * tiles.tile_n), cfgs.out_dtype)
         return pl.pallas_call(
             functools.partial(kernel_main_scatter, cfgs=cfgs),
             out_shape=out_scatter,
@@ -1916,7 +1964,7 @@ def gmm_v2(
             ),
             **common_params,
         )(group_sizes, group_offset, lhs, scatter_idx,
-          rhs_weights)[:, :cfgs.out_size_n]
+          rhs_weights)[:, 0, :cfgs.out_size_n]
 
     scratch_shapes = base_scratch + zero_scratch
     return pl.pallas_call(

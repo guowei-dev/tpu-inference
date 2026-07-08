@@ -55,7 +55,7 @@ class GmmV2FuseUnpermuteTest(jtu.JaxTestCase):
 
     def _check(self, m, k, n, group_sizes, *, num_src_groups=None, goff=0,
                bias=False, fp8=False, fuse_act=None, vmem_limit=None,
-               seed=0):
+               out_dtype=jnp.float32, seed=0):
         """Fused scatter output must be bit-exact to scattering the unfused
         output, over the rows this call computes (the group_offset window)."""
         lhs, rhs, rhs_scale, rhs_bias, gs, idx = _inputs(
@@ -68,11 +68,11 @@ class GmmV2FuseUnpermuteTest(jtu.JaxTestCase):
 
         unfused = jax.jit(lambda l, i: gmm_v2(
             l, rhs, gs, rhs_scale, rhs_bias, goff_arr,
-            preferred_element_type=jnp.float32, zero_initialize=True,
+            preferred_element_type=out_dtype, zero_initialize=True,
             **kw))(lhs, idx)
         fused = jax.jit(lambda l, i: gmm_v2(
             l, rhs, gs, rhs_scale, rhs_bias, goff_arr, scatter_indices=i,
-            preferred_element_type=jnp.float32, zero_initialize=False,
+            preferred_element_type=out_dtype, zero_initialize=False,
             **kw))(lhs, idx)
 
         # Rows this call computes: the group_offset window.
@@ -121,13 +121,13 @@ class GmmV2FuseUnpermuteTest(jtu.JaxTestCase):
     def test_fuse_act_silu(self):
         self._check(512, 256, 512, [64] * 8, fuse_act="silu")
 
-    def test_rejects_bf16_out(self):
-        lhs, rhs, _, _, gs, idx = _inputs(512, 256, 512, [64] * 8)
-        with self.assertRaisesRegex(ValueError, "float32 output"):
-            gmm_v2(lhs, rhs, gs, None, None, jnp.array([0], jnp.int32),
-                   scatter_indices=idx,
-                   preferred_element_type=jnp.bfloat16,
-                   zero_initialize=False)
+    def test_bf16_out(self):
+        # bf16 rows are DMA-legal through the compact (1, 128)-tiled output.
+        self._check(512, 256, 512, [64] * 8, out_dtype=jnp.bfloat16)
+
+    def test_bf16_out_ep_window(self):
+        self._check(512, 256, 512, [16] * 32, num_src_groups=8, goff=8,
+                    out_dtype=jnp.bfloat16)
 
     def test_rejects_zero_initialize(self):
         lhs, rhs, _, _, gs, idx = _inputs(512, 256, 512, [64] * 8)

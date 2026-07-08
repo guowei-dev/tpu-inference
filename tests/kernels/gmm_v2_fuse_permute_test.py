@@ -151,6 +151,27 @@ class GmmV2FusePermuteTest(jtu.JaxTestCase):
         unfused = gmm_v2(lhs[idx], rhs, group_sizes, **kw)
         self.assertArraysEqual(fused, unfused)
 
+    @parameterized.named_parameters(
+        ("no_act", None),
+        ("silu", "silu"),
+    )
+    def test_compact_bf16_gather_matches_unfused(self, fuse_act):
+        # COMPACT [src, 1, k] pool: bf16 rows are DMA-legal through the
+        # (1, 128)-tiled view -- no fp32 widening of the source.
+        lhs, rhs, group_sizes, idx = _make_inputs(512, 256, 512, 4,
+                                                  num_src=512)
+        lhs = lhs.astype(jnp.bfloat16)
+        rhs = rhs.astype(jnp.bfloat16)
+        kw = dict(group_offset=jnp.array([0], jnp.int32),
+                  fuse_act=fuse_act,
+                  preferred_element_type=jnp.bfloat16,
+                  maybe_quantize_lhs=False,
+                  zero_initialize=False)
+        fused = gmm_v2(lhs.reshape(lhs.shape[0], 1, lhs.shape[1]), rhs,
+                       group_sizes, gather_indices=idx, **kw)
+        unfused = gmm_v2(lhs[idx], rhs, group_sizes, **kw)
+        self.assertArraysEqual(fused, unfused)
+
     def test_fused_permute_perf(self):
         # Benchmark the fused gather (tc_fused) against the three unfused permute
         # paths at a few representative prefill GMM1 shapes (bf16 matmul, silu):

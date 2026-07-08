@@ -225,11 +225,13 @@ def moe_gmm_local(x: jax.Array,
 
     # GMM1 computes x @ (W_up | W_gate) together and activation, output is [tokens,padded_intermediate_size]
     if fuse_permute:
-        # Fused permute: GMM1 gathers its LHS rows by index from the fp32 source
-        # activations. preferred_element_type keeps gmm1_res in the activation
+        # Fused permute: GMM1 gathers its LHS rows by index from the COMPACT
+        # [tokens, 1, hidden] view of the source activations ((1, 128) tiling
+        # keeps single rows DMA-addressable in the activation dtype -- no fp32
+        # widening). preferred_element_type keeps gmm1_res in the activation
         # dtype so the rest of the pipeline is unchanged.
         gmm1_res = gmm_wrapper(
-            x.astype(jnp.float32),
+            x.reshape(x.shape[0], 1, x.shape[1]),
             w1,
             w1_scale,
             w1_bias,
@@ -261,12 +263,11 @@ def moe_gmm_local(x: jax.Array,
     if fuse_unpermute:
         # Fused unpermute: GMM2 writes row j to token-major row
         # topk_argsort_indices[j] (== the unpermuted order), so the combine
-        # below is a contiguous slice instead of a gather. fp32 output is a
-        # kernel requirement (single-row bf16 DMAs are unsupported); rows for
-        # other shards' experts are uninitialized and masked out below.
+        # below is a contiguous slice instead of a gather. Rows for other
+        # shards' experts are uninitialized and masked out below.
         gmm2_res = gmm_wrapper(gmm1_res, w2, w2_scale, w2_bias, group_sizes,
                                group_offset,
-                               preferred_element_type=jnp.float32,
+                               preferred_element_type=gmm1_res.dtype,
                                scatter_indices=topk_argsort_indices)
     else:
         gmm2_res = gmm_wrapper(gmm1_res, w2, w2_scale, w2_bias, group_sizes,
@@ -352,11 +353,13 @@ def moe_gmm_local(x: jax.Array,
 
         if fuse_unpermute:
             # gmm2_res is already unpermuted (row-scattered by GMM2), so the
-            # combine reduces a contiguous fp32 slice: weight, mask (kills the
+            # combine reduces a contiguous slice: weight, mask (kills the
             # uninitialized non-local rows), sum each token's topk rows.
+            # fp32 accumulation fuses into the read pass (bytes stay bf16).
             cur_sorted = gmm2_res[start_idx:end_idx].reshape(
-                -1, topk, gmm2_res.shape[-1])
-            cur_weighted = cur_sorted * jnp.expand_dims(cur_weights, -1)
+                -1, topk, gmm2_res.shape[-1]).astype(jnp.float32)
+            cur_weighted = cur_sorted * jnp.expand_dims(
+                cur_weights.astype(jnp.float32), -1)
             chunk_hidden = jnp.where(cur_mask, cur_weighted,
                                      0.0).sum(axis=-2).astype(x.dtype)
         elif local_group_size < group_sizes.size:
