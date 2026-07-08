@@ -172,6 +172,21 @@ class GmmV2FusePermuteTest(jtu.JaxTestCase):
         unfused = gmm_v2(lhs[idx], rhs, group_sizes, **kw)
         self.assertArraysEqual(fused, unfused)
 
+    def test_vmem_staged_gather_matches_unfused(self):
+        # gather_vmem_stage: the whole fp32 pool is staged in VMEM once and
+        # per-row gathers are VMEM-local; results stay bit-exact.
+        lhs, rhs, group_sizes, idx = _make_inputs(512, 256, 512, 4,
+                                                  num_src=512)
+        kw = dict(group_offset=jnp.array([0], jnp.int32),
+                  fuse_act="silu",
+                  preferred_element_type=jnp.float32,
+                  maybe_quantize_lhs=False,
+                  zero_initialize=False)
+        staged = gmm_v2(lhs, rhs, group_sizes, gather_indices=idx,
+                        gather_vmem_stage=True, **kw)
+        unfused = gmm_v2(lhs[idx], rhs, group_sizes, **kw)
+        self.assertArraysEqual(staged, unfused)
+
     def test_fused_permute_perf(self):
         # Benchmark the fused gather (tc_fused) against the three unfused permute
         # paths at a few representative prefill GMM1 shapes (bf16 matmul, silu):

@@ -630,6 +630,11 @@ def gathered_inner_kernel(
     # and the full int32[size_m] index array, both in HBM.
     lhs_hbm: jax.Array,
     gather_idx_hbm: jax.Array,
+    # Optional VMEM staging of the whole source pool (gather_vmem_stage): one
+    # big HBM->VMEM DMA at the first grid step, then every per-row gather is
+    # VMEM-local (no HBM per-row DMAs). None when staging is off.
+    stage_ref: jax.Array | None = None,
+    stage_sem: jax.Array | None = None,
 ):
     """Inner kernel for the FUSED-PERMUTE path: the LHS tile is GATHERED row by
     row from `lhs_hbm` using `gather_idx_hbm`, double-buffered behind the MXU,
@@ -673,6 +678,10 @@ def gathered_inner_kernel(
     # COMPACT pool [src, 1, k]: (1, 128) tiling -> per-row DMAs legal in any
     # dtype (bf16 included). Legacy 2-D pool is fp32 (32-bit-granular rows).
     compact = len(lhs_hbm.shape) == 3
+    use_stage = stage_ref is not None
+    # Per-row reads come from the VMEM stage when enabled, else straight from
+    # the HBM pool.
+    src_pool = stage_ref if use_stage else lhs_hbm
 
     def start_gather(buf_slot, sem, gm, k):
         # Rows of this gm tile start at the sublane-aligned floor of m_start, to
@@ -696,13 +705,13 @@ def gathered_inner_kernel(
             row = gather_idx_smem[pos]
             if compact:
                 pltpu.make_async_copy(
-                    lhs_hbm.at[pl.ds(row, 1), :, pl.ds(k_base, tile_k)],
+                    src_pool.at[pl.ds(row, 1), :, pl.ds(k_base, tile_k)],
                     buf_slot.at[pl.ds(r, 1)],
                     sem,
                 ).start()
             else:
                 pltpu.make_async_copy(
-                    lhs_hbm.at[row, pl.ds(k_base, tile_k)],
+                    src_pool.at[row, pl.ds(k_base, tile_k)],
                     buf_slot.at[r],
                     sem,
                 ).start()
@@ -712,16 +721,26 @@ def gathered_inner_kernel(
             # Only the dst shape + sem matter for the wait; addresses are ignored.
             if compact:
                 pltpu.make_async_copy(
-                    lhs_hbm.at[pl.ds(0, 1), :, pl.ds(0, tile_k)],
+                    src_pool.at[pl.ds(0, 1), :, pl.ds(0, tile_k)],
                     buf_slot.at[pl.ds(r, 1)],
                     sem,
                 ).wait()
             else:
                 pltpu.make_async_copy(
-                    lhs_hbm.at[0, pl.ds(0, tile_k)],
+                    src_pool.at[0, pl.ds(0, tile_k)],
                     buf_slot.at[r],
                     sem,
                 ).wait()
+
+    if use_stage:
+
+        @pl.when(s == 0)
+        def _():
+            # One big DMA of the whole pool; every later gather is VMEM-local.
+            stage_cp = pltpu.make_async_copy(lhs_hbm, stage_ref,
+                                             stage_sem.at[0])
+            stage_cp.start()
+            stage_cp.wait()
 
     @pl.when(s == 0)
     def _():
@@ -1190,6 +1209,8 @@ def kernel_main_gather(
     gather_sem: jax.Array,  # DMA sem [2]
     gather_idx_smem: jax.Array,  # int32[win_len] SMEM idx window
     gather_idx_sem: jax.Array,  # DMA sem [1] for the idx-window copy
+    stage_ref: jax.Array | None,  # optional VMEM stage of the whole pool
+    stage_sem: jax.Array | None,
     zero_ref: jax.Array | None,
     semaphore_ref: jax.Array | None,
     *,
@@ -1242,6 +1263,8 @@ def kernel_main_gather(
         cfgs=cfgs,
         lhs_hbm=lhs_ref,
         gather_idx_hbm=gather_idx_hbm,
+        stage_ref=stage_ref,
+        stage_sem=stage_sem,
     )
 
     pipeline_fn = pltpu.emit_pipeline(
@@ -1696,6 +1719,7 @@ def get_metadata(cfgs: GmmConfigs) -> dict[str, str | int | float]:
     "maybe_quantize_lhs",
     "zero_initialize",
     "fuse_act",
+    "gather_vmem_stage",
 ])
 def gmm_v2(
     lhs: jax.Array,  # [size_m, size_k]
@@ -1716,6 +1740,7 @@ def gmm_v2(
     maybe_quantize_lhs: bool = True,
     zero_initialize: bool = True,
     fuse_act: str | None = None,
+    gather_vmem_stage: bool = False,
 ) -> jax.Array:
     """GMM kernel implemented with emit_pipeline.
 
@@ -1894,7 +1919,34 @@ def gmm_v2(
             pltpu.SMEM((gw_len, ), jnp.int32),
             pltpu.SemaphoreType.DMA((1, )),
         ]
-        scratch_shapes = base_scratch + gather_scratch + zero_scratch
+        if gather_vmem_stage:
+            # Stage the WHOLE source pool in VMEM (one big DMA at the first
+            # grid step; all per-row gathers become VMEM-local). Only the
+            # legacy 2-D fp32 pool is supported, and only when the stage fits
+            # alongside the pipeline working set.
+            if lhs.ndim != 2:
+                raise ValueError(
+                    "gather_vmem_stage supports the 2-D fp32 source pool.")
+            stage_bytes = lhs.shape[0] * lhs.shape[1] * lhs.dtype.itemsize
+            rhs_bytes_el = jax.dtypes.itemsize_bits(rhs.dtype) // 8
+            fuse_factor = 2 if cfgs.fuse_act is not None else 1
+            working = (fuse_factor * 3 * tiles.tile_k * tiles.tile_n *
+                       max(rhs_bytes_el, 1) +
+                       2 * tiles.tile_m * tiles.tile_k * 4 +
+                       tiles.tile_m * fuse_factor * tiles.tile_n * 4 +
+                       2 * tiles.tile_m * tiles.tile_n * 4)
+            if stage_bytes + working > vmem_limit_bytes:
+                raise ValueError(
+                    f"gather_vmem_stage does not fit: stage {stage_bytes} + "
+                    f"working ~{working} > {vmem_limit_bytes} bytes.")
+            stage_scratch = [
+                pltpu.VMEM(lhs.shape, lhs.dtype),
+                pltpu.SemaphoreType.DMA((1, )),
+            ]
+        else:
+            stage_scratch = [None, None]
+        scratch_shapes = (base_scratch + gather_scratch + stage_scratch +
+                          zero_scratch)
         # Pad so the 128-aligned index window DMA never reads past the array end.
         gather_idx = gather_indices.astype(jnp.int32)
         pad_m = align_to(dims.size_m, 128) + gw_len - dims.size_m
