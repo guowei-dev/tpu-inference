@@ -173,8 +173,9 @@ class GmmV2FusePermuteTest(jtu.JaxTestCase):
         self.assertArraysEqual(fused, unfused)
 
     def test_vmem_staged_gather_matches_unfused(self):
-        # gather_vmem_stage: the whole fp32 pool is staged in VMEM once and
-        # per-row gathers are VMEM-local; results stay bit-exact.
+        # gather_vmem_stage: the whole pool is staged in VMEM once and
+        # per-row gathers are VMEM-local; results stay bit-exact. Covers the
+        # legacy 2-D fp32 pool and the compact 3-D bf16 pool.
         lhs, rhs, group_sizes, idx = _make_inputs(512, 256, 512, 4,
                                                   num_src=512)
         kw = dict(group_offset=jnp.array([0], jnp.int32),
@@ -186,6 +187,14 @@ class GmmV2FusePermuteTest(jtu.JaxTestCase):
                         gather_vmem_stage=True, **kw)
         unfused = gmm_v2(lhs[idx], rhs, group_sizes, **kw)
         self.assertArraysEqual(staged, unfused)
+
+        lhs_c = lhs.astype(jnp.bfloat16).reshape(lhs.shape[0], 1,
+                                                 lhs.shape[1])
+        staged_c = gmm_v2(lhs_c, rhs, group_sizes, gather_indices=idx,
+                          gather_vmem_stage=True, **kw)
+        unfused_c = gmm_v2(lhs.astype(jnp.bfloat16)[idx], rhs, group_sizes,
+                           **kw)
+        self.assertArraysEqual(staged_c, unfused_c)
 
     def test_fused_permute_perf(self):
         # Benchmark the fused gather (tc_fused) against the three unfused permute

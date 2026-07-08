@@ -14,6 +14,7 @@
 
 import dataclasses
 import functools
+import math
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Tuple
 
@@ -1924,10 +1925,11 @@ def gmm_v2(
             # grid step; all per-row gathers become VMEM-local). Only the
             # legacy 2-D fp32 pool is supported, and only when the stage fits
             # alongside the pipeline working set.
-            if lhs.ndim != 2:
+            if lhs.ndim not in (2, 3):
                 raise ValueError(
-                    "gather_vmem_stage supports the 2-D fp32 source pool.")
-            stage_bytes = lhs.shape[0] * lhs.shape[1] * lhs.dtype.itemsize
+                    "gather_vmem_stage supports 2-D fp32 or compact 3-D pools."
+                )
+            stage_bytes = math.prod(lhs.shape) * lhs.dtype.itemsize
             rhs_bytes_el = jax.dtypes.itemsize_bits(rhs.dtype) // 8
             fuse_factor = 2 if cfgs.fuse_act is not None else 1
             working = (fuse_factor * 3 * tiles.tile_k * tiles.tile_n *
