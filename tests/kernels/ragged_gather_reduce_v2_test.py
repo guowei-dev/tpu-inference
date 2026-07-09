@@ -22,8 +22,6 @@ import numpy as np
 from absl.testing import absltest, parameterized
 from jax._src import test_util as jtu
 
-from tpu_inference.kernels.sparse_core.ragged_gather_reduce import \
-    ragged_gather_reduce as ragged_gather_reduce_v1
 from tpu_inference.kernels.sparse_core.ragged_gather_reduce_v2 import \
     ragged_gather_reduce as ragged_gather_reduce_v2
 from tpu_inference.kernels.sparse_core.ragged_scatter import ragged_scatter
@@ -144,7 +142,6 @@ class ScatterTest(jtu.JaxTestCase):
                                                  valid_rows_mask,
                                                  reduce_group_size)
         for rgr, name in (
-            (ragged_gather_reduce_v1, "ragged_gather_reduce_v1"),
             (ragged_gather_reduce_v2, "ragged_gather_reduce_v2"),
         ):
             try:
@@ -243,16 +240,6 @@ class ScatterTest(jtu.JaxTestCase):
             valid_rows_mask,
             start,
             end,
-            reduce_group_size,
-        )
-
-        run_and_time(
-            "ragged_gather_reduce_v1",
-            ragged_gather_reduce_v1,
-            x,
-            indices,
-            topk_weights,
-            valid_rows_mask,
             reduce_group_size,
         )
 
