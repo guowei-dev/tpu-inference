@@ -638,6 +638,7 @@ def gathered_inner_kernel(
     stage_sem: jax.Array | None = None,
     gather_feed: str = "value",
     register_gather: bool = False,
+    onehot_gather: bool = False,
 ):
     """Inner kernel for the FUSED-PERMUTE path: the LHS tile is GATHERED row by
     row from `lhs_hbm` using `gather_idx_hbm`, double-buffered behind the MXU,
@@ -745,7 +746,7 @@ def gathered_inner_kernel(
             stage_cp.start()
             stage_cp.wait()
 
-    if not register_gather:
+    if not register_gather and not onehot_gather:
 
         @pl.when(s == 0)
         def _():
@@ -773,7 +774,36 @@ def gathered_inner_kernel(
             ]
         return jnp.concatenate(strips, axis=-1)
 
-    if register_gather:
+    if onehot_gather:
+        # FUSED ONE-HOT dispatch: build the tile's one-hot selection matrix
+        # P [tile_m, S] from the SMEM idx window and compute the LHS tile as
+        # P @ stage on the MXU. Static slices only -- no row DMAs, no dynamic
+        # sublane addressing, no compact layout; the dispatch flops ride the
+        # MXU slack of the weight-bound gmm. bf16 one-hot is EXACT (each
+        # output row sums exactly one nonzero product).
+        m_start = metadata_ref.gm_id_to_m_offset[gm_id]
+        m_offset = m_start - m_start % sublane
+        aligned_start = (m_offset // 128) * 128
+        delta = m_offset - aligned_start
+        pltpu.make_async_copy(gather_idx_hbm.at[pl.ds(aligned_start, win_len)],
+                              gather_idx_smem, gather_idx_sem.at[0]).start()
+        pltpu.make_async_copy(gather_idx_hbm.at[pl.ds(aligned_start, win_len)],
+                              gather_idx_smem, gather_idx_sem.at[0]).wait()
+        k_base = k_id * tile_k
+        size_s = stage_ref.shape[0]
+        idx_rows = []
+        for r in range(tile_m):
+            pos = jnp.clip(delta + r, 0, win_len - 1)
+            idx_rows.append(gather_idx_smem[pos])
+        idx_col = jnp.stack(idx_rows).reshape(tile_m, 1)
+        iota_s = jax.lax.broadcasted_iota(jnp.int32, (tile_m, size_s), 1)
+        p_tile = (iota_s == idx_col).astype(stage_ref.dtype)
+        lhs_tile = jax.lax.dot(
+            p_tile,
+            stage_ref[:, pl.ds(k_base, tile_k)],
+            preferred_element_type=jnp.float32,
+        )
+    elif register_gather:
         # Descriptor-free gather: rows are read straight from the compact
         # VMEM stage by dynamic outer-dim register loads (the outer dim of a
         # compact ref is untiled, so `pl.ds(row, 1)` is pure addressing) and
@@ -1273,6 +1303,7 @@ def kernel_main_gather(
     cfgs: GmmConfigs,
     gather_feed: str = "value",
     register_gather: bool = False,
+    onehot_gather: bool = False,
 ):
     """Entry point for the FUSED-PERMUTE GMM kernel.
 
@@ -1325,6 +1356,7 @@ def kernel_main_gather(
         stage_sem=stage_sem,
         gather_feed=gather_feed,
         register_gather=register_gather,
+        onehot_gather=onehot_gather,
     )
 
     pipeline_fn = pltpu.emit_pipeline(
@@ -1549,6 +1581,7 @@ def validate_inputs(
     gather_indices: jax.Array | None = None,
     scatter_indices: jax.Array | None = None,
     gather_register_mode: bool = False,
+    gather_onehot_mode: bool = False,
 ) -> Dimensions:
     """Validates the inputs for the GMM kernel."""
 
@@ -1574,7 +1607,8 @@ def validate_inputs(
         else:
             # register mode reads rows from the VMEM stage (no row DMAs), so
             # the 32-bit-granule constraint does not apply to the pool dtype.
-            assert lhs.dtype == jnp.float32 or gather_register_mode, (
+            assert (lhs.dtype == jnp.float32 or gather_register_mode
+                    or gather_onehot_mode), (
                 f"gather_indices requires fp32 lhs for a 2-D source pool "
                 f"(or pass a compact [src, 1, k] pool), got {lhs.dtype}")
             assert lhs.ndim == 2 and lhs.shape[1] == size_k, (
@@ -1682,12 +1716,14 @@ def make_gmm_configs(
     gather_indices: jax.Array | None = None,
     scatter_indices: jax.Array | None = None,
     gather_register_mode: bool = False,
+    gather_onehot_mode: bool = False,
 ):
     """Fills the GMM config for the GMM kernel."""
 
     dims = validate_inputs(lhs, rhs, rhs_scale, rhs_bias, group_sizes,
                            group_offset, fuse_act, gather_indices,
-                           scatter_indices, gather_register_mode)
+                           scatter_indices, gather_register_mode,
+                           gather_onehot_mode)
 
     if rhs_scale is not None:
         has_scale = True
@@ -1786,6 +1822,7 @@ def get_metadata(cfgs: GmmConfigs) -> dict[str, str | int | float]:
     "gather_vmem_stage",
     "gather_feed",
     "gather_register_mode",
+    "gather_onehot_mode",
 ])
 def gmm_v2(
     lhs: jax.Array,  # [size_m, size_k]
@@ -1809,6 +1846,7 @@ def gmm_v2(
     gather_vmem_stage: bool = False,
     gather_feed: str = "value",
     gather_register_mode: bool = False,
+    gather_onehot_mode: bool = False,
 ) -> jax.Array:
     """GMM kernel implemented with emit_pipeline.
 
@@ -1883,6 +1921,7 @@ def gmm_v2(
         gather_indices=gather_indices,
         scatter_indices=scatter_indices,
         gather_register_mode=gather_register_mode,
+        gather_onehot_mode=gather_onehot_mode,
     )
     dims = cfgs.dims
     tiles = cfgs.tiles
@@ -1992,6 +2031,10 @@ def gmm_v2(
             raise ValueError(
                 "gather_register_mode requires gather_vmem_stage (rows are "
                 "read from the VMEM stage by register loads).")
+        if gather_onehot_mode and not (gather_vmem_stage and lhs.ndim == 2):
+            raise ValueError(
+                "gather_onehot_mode requires gather_vmem_stage and a 2-D "
+                "pool (the MXU dispatch reads the stage by static slices).")
         if gather_vmem_stage:
             # Stage the WHOLE source pool in VMEM (one big DMA at the first
             # grid step; all per-row gathers become VMEM-local). Only the
@@ -2029,7 +2072,8 @@ def gmm_v2(
         return pl.pallas_call(
             functools.partial(kernel_main_gather, cfgs=cfgs,
                               gather_feed=gather_feed,
-                              register_gather=gather_register_mode),
+                              register_gather=gather_register_mode,
+                              onehot_gather=gather_onehot_mode),
             out_shape=out_init,
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=2,
