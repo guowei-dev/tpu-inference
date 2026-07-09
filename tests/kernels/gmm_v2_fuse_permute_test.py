@@ -196,6 +196,29 @@ class GmmV2FusePermuteTest(jtu.JaxTestCase):
                            **kw)
         self.assertArraysEqual(staged_c, unfused_c)
 
+    def test_strided_feed_and_register_gather_match(self):
+        # gather_feed="strided" (gdn-style strip feed) and
+        # gather_register_mode (descriptor-free register gather from the
+        # VMEM stage) are bit-exact vs the unfused reference.
+        lhs, rhs, group_sizes, idx = _make_inputs(512, 256, 512, 4,
+                                                  num_src=512)
+        kw = dict(group_offset=jnp.array([0], jnp.int32),
+                  fuse_act="silu",
+                  preferred_element_type=jnp.float32,
+                  maybe_quantize_lhs=False,
+                  zero_initialize=False)
+        lhs_c = lhs.astype(jnp.bfloat16).reshape(lhs.shape[0], 1,
+                                                 lhs.shape[1])
+        unfused = gmm_v2(lhs.astype(jnp.bfloat16)[idx], rhs, group_sizes,
+                         **kw)
+        strided = gmm_v2(lhs_c, rhs, group_sizes, gather_indices=idx,
+                         gather_feed="strided", **kw)
+        self.assertArraysEqual(strided, unfused)
+        reg = gmm_v2(lhs_c, rhs, group_sizes, gather_indices=idx,
+                     gather_vmem_stage=True, gather_register_mode=True,
+                     **kw)
+        self.assertArraysEqual(reg, unfused)
+
     def test_fused_permute_perf(self):
         # Benchmark the fused gather (tc_fused) against the three unfused permute
         # paths at a few representative prefill GMM1 shapes (bf16 matmul, silu):

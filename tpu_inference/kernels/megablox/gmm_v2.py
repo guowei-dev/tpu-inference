@@ -636,6 +636,8 @@ def gathered_inner_kernel(
     # VMEM-local (no HBM per-row DMAs). None when staging is off.
     stage_ref: jax.Array | None = None,
     stage_sem: jax.Array | None = None,
+    gather_feed: str = "value",
+    register_gather: bool = False,
 ):
     """Inner kernel for the FUSED-PERMUTE path: the LHS tile is GATHERED row by
     row from `lhs_hbm` using `gather_idx_hbm`, double-buffered behind the MXU,
@@ -743,22 +745,68 @@ def gathered_inner_kernel(
             stage_cp.start()
             stage_cp.wait()
 
-    @pl.when(s == 0)
-    def _():
-        start_gather(gather_buf.at[0], gather_sem.at[0], gm_id, k_id)
+    if not register_gather:
 
-    @pl.when(s + 1 < num_steps)
-    def _():
-        start_gather(gather_buf.at[nslot], gather_sem.at[nslot], gm1, k1)
+        @pl.when(s == 0)
+        def _():
+            start_gather(gather_buf.at[0], gather_sem.at[0], gm_id, k_id)
 
-    wait_gather(gather_buf.at[slot], gather_sem.at[slot])
+        @pl.when(s + 1 < num_steps)
+        def _():
+            start_gather(gather_buf.at[nslot], gather_sem.at[nslot], gm1, k1)
 
-    # Hand the gathered tile to the shared compute path. A compact buffer
-    # ([tile_m, 1, tile_k]) is relayouted large via reshape (strided loads);
-    # for the legacy buffer inner_kernel's `reshape(-1, tile_k)` is a no-op.
-    lhs_tile = gather_buf[slot]
-    if compact:
-        lhs_tile = lhs_tile.reshape(tile_m, tile_k)
+    def strided_feed(buf_ref):
+        # gdn/v3 `load_compact_to_large` idiom: static 128-lane strip loads,
+        # so the compact->large relayout happens in the load path (vreg-
+        # aligned concat), never as a value reshuffle or a materialized copy.
+        # fp32 compact tiles are (1, 128) -> the ref-level reshape is a pure
+        # view (gdn asserts itemsize==4 for exactly this). bf16 compact tiles
+        # are (2, 128)(2, 1) -- row PAIRS share a 32-bit granule -- so the
+        # reshape is Mosaic-illegal ("2nd minor not aligned to the tile");
+        # strip-load the 3-D ref directly and let the lowering unpack pairs.
+        if buf_ref.dtype.itemsize == 4:
+            flat = buf_ref.reshape(tile_m, tile_k)
+            strips = [flat[:, c:c + 128] for c in range(0, tile_k, 128)]
+        else:
+            strips = [
+                buf_ref[:, 0, c:c + 128] for c in range(0, tile_k, 128)
+            ]
+        return jnp.concatenate(strips, axis=-1)
+
+    if register_gather:
+        # Descriptor-free gather: rows are read straight from the compact
+        # VMEM stage by dynamic outer-dim register loads (the outer dim of a
+        # compact ref is untiled, so `pl.ds(row, 1)` is pure addressing) and
+        # assembled by sublane concat. The only DMA left is the per-tile idx
+        # window copy issued by start_gather's prologue.
+        m_start = metadata_ref.gm_id_to_m_offset[gm_id]
+        m_offset = m_start - m_start % sublane
+        aligned_start = (m_offset // 128) * 128
+        delta = m_offset - aligned_start
+        pltpu.make_async_copy(gather_idx_hbm.at[pl.ds(aligned_start, win_len)],
+                              gather_idx_smem, gather_idx_sem.at[0]).start()
+        pltpu.make_async_copy(gather_idx_hbm.at[pl.ds(aligned_start, win_len)],
+                              gather_idx_smem, gather_idx_sem.at[0]).wait()
+        k_base = k_id * tile_k
+        rows = []
+        for r in range(tile_m):
+            pos = jnp.clip(delta + r, 0, win_len - 1)
+            row = gather_idx_smem[pos]
+            rows.append(stage_ref[pl.ds(row, 1), 0, pl.ds(k_base, tile_k)])
+        lhs_tile = jnp.concatenate(rows, axis=0)
+    else:
+        wait_gather(gather_buf.at[slot], gather_sem.at[slot])
+
+        # Hand the gathered tile to the shared compute path. A compact buffer
+        # ([tile_m, 1, tile_k]) is fed large via the strided strip loads above
+        # (feed="strided") or a value-level reshape (feed="value", the
+        # original form, kept for A/B). The legacy 2-D buffer needs neither.
+        if compact and gather_feed == "strided":
+            lhs_tile = strided_feed(gather_buf.at[slot])
+        else:
+            lhs_tile = gather_buf[slot]
+            if compact:
+                lhs_tile = lhs_tile.reshape(tile_m, tile_k)
 
     # Unquantized matmul: down-cast the gathered fp32 rows to the rhs dtype so the
     # MXU runs e.g. bf16 x bf16. Lossless when the source rows were only widened
@@ -1216,6 +1264,8 @@ def kernel_main_gather(
     semaphore_ref: jax.Array | None,
     *,
     cfgs: GmmConfigs,
+    gather_feed: str = "value",
+    register_gather: bool = False,
 ):
     """Entry point for the FUSED-PERMUTE GMM kernel.
 
@@ -1266,6 +1316,8 @@ def kernel_main_gather(
         gather_idx_hbm=gather_idx_hbm,
         stage_ref=stage_ref,
         stage_sem=stage_sem,
+        gather_feed=gather_feed,
+        register_gather=register_gather,
     )
 
     pipeline_fn = pltpu.emit_pipeline(
@@ -1721,6 +1773,8 @@ def get_metadata(cfgs: GmmConfigs) -> dict[str, str | int | float]:
     "zero_initialize",
     "fuse_act",
     "gather_vmem_stage",
+    "gather_feed",
+    "gather_register_mode",
 ])
 def gmm_v2(
     lhs: jax.Array,  # [size_m, size_k]
@@ -1742,6 +1796,8 @@ def gmm_v2(
     zero_initialize: bool = True,
     fuse_act: str | None = None,
     gather_vmem_stage: bool = False,
+    gather_feed: str = "value",
+    gather_register_mode: bool = False,
 ) -> jax.Array:
     """GMM kernel implemented with emit_pipeline.
 
@@ -1920,6 +1976,11 @@ def gmm_v2(
             pltpu.SMEM((gw_len, ), jnp.int32),
             pltpu.SemaphoreType.DMA((1, )),
         ]
+        if gather_register_mode and not (gather_vmem_stage and lhs.ndim == 3):
+            raise ValueError(
+                "gather_register_mode requires gather_vmem_stage and a "
+                "compact [src, 1, k] pool (dynamic outer-dim register loads "
+                "need the untiled leading axis of the VMEM stage).")
         if gather_vmem_stage:
             # Stage the WHOLE source pool in VMEM (one big DMA at the first
             # grid step; all per-row gathers become VMEM-local). Only the
@@ -1955,7 +2016,9 @@ def gmm_v2(
         if pad_m:
             gather_idx = jnp.pad(gather_idx, (0, pad_m))
         return pl.pallas_call(
-            functools.partial(kernel_main_gather, cfgs=cfgs),
+            functools.partial(kernel_main_gather, cfgs=cfgs,
+                              gather_feed=gather_feed,
+                              register_gather=gather_register_mode),
             out_shape=out_init,
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=2,
