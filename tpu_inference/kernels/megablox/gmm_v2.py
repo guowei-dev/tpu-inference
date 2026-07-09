@@ -792,7 +792,14 @@ def gathered_inner_kernel(
         for r in range(tile_m):
             pos = jnp.clip(delta + r, 0, win_len - 1)
             row = gather_idx_smem[pos]
-            rows.append(stage_ref[pl.ds(row, 1), 0, pl.ds(k_base, tile_k)])
+            if compact:
+                # untiled leading axis: pure addressing
+                rows.append(stage_ref[pl.ds(row, 1), 0,
+                                      pl.ds(k_base, tile_k)])
+            else:
+                # 2-D large-layout stage: dynamic SUBLANE addressing inside
+                # (packed) tiles -- the lowering cost is the experiment
+                rows.append(stage_ref[pl.ds(row, 1), pl.ds(k_base, tile_k)])
         lhs_tile = jnp.concatenate(rows, axis=0)
     else:
         wait_gather(gather_buf.at[slot], gather_sem.at[slot])
@@ -1541,6 +1548,7 @@ def validate_inputs(
     fuse_act: str | None = None,
     gather_indices: jax.Array | None = None,
     scatter_indices: jax.Array | None = None,
+    gather_register_mode: bool = False,
 ) -> Dimensions:
     """Validates the inputs for the GMM kernel."""
 
@@ -1564,7 +1572,9 @@ def validate_inputs(
             assert lhs.shape[1] == 1 and lhs.shape[2] == size_k, (
                 f"{lhs.shape=} must be [size_lhs_src, 1, {size_k=}]")
         else:
-            assert lhs.dtype == jnp.float32, (
+            # register mode reads rows from the VMEM stage (no row DMAs), so
+            # the 32-bit-granule constraint does not apply to the pool dtype.
+            assert lhs.dtype == jnp.float32 or gather_register_mode, (
                 f"gather_indices requires fp32 lhs for a 2-D source pool "
                 f"(or pass a compact [src, 1, k] pool), got {lhs.dtype}")
             assert lhs.ndim == 2 and lhs.shape[1] == size_k, (
@@ -1671,12 +1681,13 @@ def make_gmm_configs(
     fuse_act: str | None = None,
     gather_indices: jax.Array | None = None,
     scatter_indices: jax.Array | None = None,
+    gather_register_mode: bool = False,
 ):
     """Fills the GMM config for the GMM kernel."""
 
     dims = validate_inputs(lhs, rhs, rhs_scale, rhs_bias, group_sizes,
                            group_offset, fuse_act, gather_indices,
-                           scatter_indices)
+                           scatter_indices, gather_register_mode)
 
     if rhs_scale is not None:
         has_scale = True
@@ -1871,6 +1882,7 @@ def gmm_v2(
         fuse_act=fuse_act,
         gather_indices=gather_indices,
         scatter_indices=scatter_indices,
+        gather_register_mode=gather_register_mode,
     )
     dims = cfgs.dims
     tiles = cfgs.tiles
@@ -1976,11 +1988,10 @@ def gmm_v2(
             pltpu.SMEM((gw_len, ), jnp.int32),
             pltpu.SemaphoreType.DMA((1, )),
         ]
-        if gather_register_mode and not (gather_vmem_stage and lhs.ndim == 3):
+        if gather_register_mode and not gather_vmem_stage:
             raise ValueError(
-                "gather_register_mode requires gather_vmem_stage and a "
-                "compact [src, 1, k] pool (dynamic outer-dim register loads "
-                "need the untiled leading axis of the VMEM stage).")
+                "gather_register_mode requires gather_vmem_stage (rows are "
+                "read from the VMEM stage by register loads).")
         if gather_vmem_stage:
             # Stage the WHOLE source pool in VMEM (one big DMA at the first
             # grid step; all per-row gathers become VMEM-local). Only the
