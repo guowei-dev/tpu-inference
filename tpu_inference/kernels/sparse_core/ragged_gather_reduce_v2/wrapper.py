@@ -20,6 +20,7 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
 import jax.numpy as jnp
 
+from tpu_inference.kernels.sparse_core import core_map_helper
 from tpu_inference.kernels.sparse_core.ragged_gather_reduce_v2 import config
 from tpu_inference.kernels.sparse_core.ragged_gather_reduce_v2 import kernel
 from tpu_inference.kernels.sparse_core.ragged_gather_reduce_v2 import memory_ref
@@ -193,7 +194,7 @@ def ragged_gather_reduce_v2(
     )
 
     # The output gets one extra row: the kernel's garbage scatter destination.
-    out = pl.kernel(
+    out = core_map_helper.kernel(
         functools.partial(main_kernel, cfg=cfg),
         out_type=jax.ShapeDtypeStruct(
             (
