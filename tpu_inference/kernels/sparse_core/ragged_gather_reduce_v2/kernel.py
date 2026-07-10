@@ -76,6 +76,21 @@ def call_kernel_pipeline(
         sorted_dma.start()
         sorted_dma.wait()
 
+        # Prefetch the next window's first source row so the last block of this
+        # window can detect a group continuing across the window boundary (the last
+        # window fetches a harmless clamped past-the-end row).
+        peek_dma = pltpu.make_async_copy(
+            scalar_ref.sorted_by_validity.at[pl.ds(
+                jnp.minimum(
+                    row_start_padded + (window_id + 1) * window_words,
+                    scalar_ref.sorted_by_validity.shape[0] - num_simd_lanes),
+                num_simd_lanes)],
+            scratch_ref.next_row_peek_vmem,
+            recv_sem,
+        )
+        peek_dma.start()
+        peek_dma.wait()
+
         blocks_in_window = jnp.minimum(max_window,
                                        num_row_blocks - window_block_base)
 
@@ -89,6 +104,7 @@ def call_kernel_pipeline(
                 num_rows_current_row_partition=num_rows_current_row_partition,
                 col_start=col_start,
                 window_block_base=window_block_base,
+                blocks_in_window=blocks_in_window,
             ),
             grid=(blocks_in_window, ),
             in_specs=(row_gather_specs, row_gather_specs),
@@ -159,6 +175,7 @@ def _row_kernel(
     num_rows_current_row_partition: jax.Array,
     col_start: jax.Array,
     window_block_base: jax.Array,
+    blocks_in_window: jax.Array,
     cfg: config.Config,
 ):
     # The SparseCore indirect DMA requires 32-bit elements, so x is gathered
@@ -166,6 +183,7 @@ def _row_kernel(
     # uint32 row (row index >> 1); float32 is 1:1 (row index unchanged).
     in_32b_hbm_ref = in_hbm_ref.bitcast(jnp.uint32)
     num_simd_lanes = cfg.sc_info.num_lanes
+    window_words = cfg.window_size
     row_block_id = pl.program_id(0)
     # Absolute row-block index within the partition (for the validity mask); the
     # resident sort window is indexed window-relative.
@@ -227,6 +245,29 @@ def _row_kernel(
     src_row_idx_in_vmem = rev_src_row_idx_in_vmem[::-1]
     is_row_valid = rev_is_row_valid[::-1]
 
+    # A reduce group whose last in-block row is the block's final row may continue
+    # into the next block, which writes the group's full reduced value. Suppress
+    # this block's partial write for such a group so each output row has a single
+    # writer -- neither the pipelined row-block emit_pipeline nor the outer window
+    # loop orders the two scatters, so a double write races on the output row. The
+    # next block's first source row is resident within a window; at a window
+    # boundary it is the next window's first row, prefetched into next_row_peek_vmem.
+    is_last_block_in_window = (row_block_id + 1) == blocks_in_window
+    next_block_first_row = (global_block_id + 1) * cfg.row_chunk_size
+    resident_peek = jnp.minimum((row_block_id + 1) * cfg.row_chunk_size,
+                                window_words - num_simd_lanes)
+    next_block_first_idx = jnp.where(
+        is_last_block_in_window,
+        scratch_ref.next_row_peek_vmem[pl.ds(0, num_simd_lanes)][0],
+        scratch_ref.sorted_by_validity_vmem[pl.ds(resident_peek,
+                                                  num_simd_lanes)][0],
+    )
+    group_continues = jnp.logical_and(
+        next_block_first_row < num_rows_current_row_partition,
+        (next_block_first_idx //
+         cfg.reduce_group_size) == dst_indices_list[-1][num_simd_lanes - 1],
+    )
+
     # Per source row, the (VMEM source row, HBM destination row) of its
     # scatter. Rows whose group is not yet fully reduced in this sub-chunk,
     # and padding rows, are routed to a throwaway row.
@@ -243,6 +284,15 @@ def _row_kernel(
                 is_row_valid[global_idx],
                 merge_target < (s + 1) * num_simd_lanes,
             )
+            # Only the last sub-chunk's group can reach the block's final row; earlier
+            # sub-chunks already route such a group to garbage.
+            if s == cfg.num_row_subchunks - 1:
+                is_final_write = jnp.logical_and(
+                    is_final_write,
+                    jnp.logical_not(
+                        jnp.logical_and(merge_target == cfg.row_chunk_size - 1,
+                                        group_continues)),
+                )
             sub_src.append(
                 jnp.where(is_final_write, merge_target % num_simd_lanes, 0))
             sub_dst.append(
