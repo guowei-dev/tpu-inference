@@ -133,14 +133,13 @@ def main_kernel(
     )
 
 
-@jax.jit(static_argnames=("reduce_group_size", "override_fallback"))
+@jax.jit(static_argnames=("reduce_group_size", ))
 def ragged_gather_reduce_v2(
     x: jax.Array,
     indices: jax.Array,
     topk_weights: jax.Array,
     valid_rows_mask: jax.Array,
     reduce_group_size: int,
-    override_fallback: bool = False,
 ) -> jax.Array:
     """Gathers ``x`` by ``indices``, weights and masks, then reduces by group.
 
@@ -150,7 +149,6 @@ def ragged_gather_reduce_v2(
     topk_weights: 1-D per-row weights, ``(input_size,)``.
     valid_rows_mask: 1-D bool mask of valid gathered rows, ``(input_size,)``.
     reduce_group_size: number of consecutive rows summed into one output row.
-    override_fallback: Override XLA fallback for debugging.
 
   Returns:
     Reduced output, ``(input_size // reduce_group_size, hidden_size)``.
@@ -167,7 +165,7 @@ def ragged_gather_reduce_v2(
     )
 
     # Step 2: Fallback to compiler version if needed.
-    if cfg.should_fallback and not override_fallback:
+    if cfg.should_fallback:
         return _fallback_implementation(x, indices, topk_weights,
                                         valid_rows_mask, reduce_group_size)
 
