@@ -34,6 +34,12 @@ def call_kernel_pipeline(
     col_start: jax.Array,
     cfg: config.Config,
 ):
+    num_simd_lanes = cfg.sc_info.num_lanes
+    recv_sem = scratch_ref.sem.at[0]
+    row_start_padded = row_partition_id * cfg.row_partition_size_padded
+    window_words = cfg.window_size
+    max_window = cfg.max_window
+
     num_rows_per_row_partition = scratch_ref.num_rows_per_row_partition_vmem[
         ...]
     num_rows_current_row_partition = jnp.array(0, jnp.int32)
@@ -45,29 +51,52 @@ def call_kernel_pipeline(
         )
     num_row_blocks = pl.cdiv(num_rows_current_row_partition,
                              cfg.row_chunk_size)
+    num_windows = pl.cdiv(num_row_blocks, max_window)
 
-    # Sentinel for the cross-block reduction carry (no previous group).
+    # Sentinel for the cross-block reduction carry (no previous group). The carry
+    # is kernel scratch, so it also persists across window boundaries.
     scratch_ref.prev_dst_row_smem[0] = -1
 
+    # Loop-invariant: each window is re-DMA'd into the same resident buffer.
     row_gather_specs = _row_gather_specs(scratch_ref.sorted_by_validity_vmem,
                                          cfg)
-    row_pipeline_fn = pltpu.emit_pipeline(
-        functools.partial(
-            _row_kernel,
-            cfg=cfg,
-            scratch_ref=scratch_ref,
-            in_hbm_ref=in_hbm_ref,
-            out_hbm_ref=out_hbm_ref,
-            num_rows_current_row_partition=num_rows_current_row_partition,
-            col_start=col_start,
-        ),
-        grid=(num_row_blocks, ),
-        in_specs=(row_gather_specs, row_gather_specs),
-    )
-    row_pipeline_fn(
-        ((scalar_ref.indices, ) * cfg.num_row_subchunks),
-        ((topk_weights_hbm_ref, ) * cfg.num_row_subchunks),
-    )
+
+    # Stream one window of the sort permutation at a time so the resident scratch
+    # is bounded (input-size-independent). The whole window is staged before the
+    # pipeline, so the pl.Indirect source has no hazard.
+    @pl.loop(0, num_windows)
+    def window_loop(window_id):
+        window_block_base = window_id * max_window
+        sorted_dma = pltpu.make_async_copy(
+            scalar_ref.sorted_by_validity.at[pl.ds(
+                row_start_padded + window_id * window_words, window_words)],
+            scratch_ref.sorted_by_validity_vmem,
+            recv_sem,
+        )
+        sorted_dma.start()
+        sorted_dma.wait()
+
+        blocks_in_window = jnp.minimum(max_window,
+                                       num_row_blocks - window_block_base)
+
+        row_pipeline_fn = pltpu.emit_pipeline(
+            functools.partial(
+                _row_kernel,
+                cfg=cfg,
+                scratch_ref=scratch_ref,
+                in_hbm_ref=in_hbm_ref,
+                out_hbm_ref=out_hbm_ref,
+                num_rows_current_row_partition=num_rows_current_row_partition,
+                col_start=col_start,
+                window_block_base=window_block_base,
+            ),
+            grid=(blocks_in_window, ),
+            in_specs=(row_gather_specs, row_gather_specs),
+        )
+        row_pipeline_fn(
+            ((scalar_ref.indices, ) * cfg.num_row_subchunks),
+            ((topk_weights_hbm_ref, ) * cfg.num_row_subchunks),
+        )
 
 
 def _pack_scalars_to_vector(scalar_list: list[jax.Array]) -> jax.Array:
@@ -129,6 +158,7 @@ def _row_kernel(
     out_hbm_ref: jax.Ref,
     num_rows_current_row_partition: jax.Array,
     col_start: jax.Array,
+    window_block_base: jax.Array,
     cfg: config.Config,
 ):
     # The SparseCore indirect DMA requires 32-bit elements, so x is gathered
@@ -137,6 +167,9 @@ def _row_kernel(
     in_32b_hbm_ref = in_hbm_ref.bitcast(jnp.uint32)
     num_simd_lanes = cfg.sc_info.num_lanes
     row_block_id = pl.program_id(0)
+    # Absolute row-block index within the partition (for the validity mask); the
+    # resident sort window is indexed window-relative.
+    global_block_id = window_block_base + row_block_id
 
     # Destination output row of each source row in this block.
     dst_indices_list = []
@@ -187,7 +220,7 @@ def _row_kernel(
             next_src_row_idx = jnp.where(same_group_as_next,
                                          rev_src_row_idx_in_vmem[-1],
                                          row_vmem_idx)
-        global_row_idx = row_block_id * cfg.row_chunk_size + row_vmem_idx
+        global_row_idx = global_block_id * cfg.row_chunk_size + row_vmem_idx
         rev_is_row_valid.append(
             global_row_idx < num_rows_current_row_partition)
         rev_src_row_idx_in_vmem.append(next_src_row_idx)

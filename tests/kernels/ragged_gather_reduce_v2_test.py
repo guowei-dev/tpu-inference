@@ -159,8 +159,30 @@ class ScatterTest(jtu.JaxTestCase):
             except Exception as e:  # pylint: disable=broad-except
                 print(f"Skipping {name} correctness check due to error: {e}")
 
+    def test_sc_ragged_gather_reduce_v2_multiwindow(self):
+        """v2 is correct when the input spans multiple resident sort-permutation
+        windows (out_size large enough for >1 window on v7, no production seam),
+        exercising the windowed DMA + window-relative indexing end to end. hidden
+        is kept small so x stays under the 16 GiB SC per-tensor limit.
+        """
+        out_size, hidden, rgs = 1_835_008, 1024, 8
+        key = jax.random.key(0)
+        x = jax.random.normal(key, (out_size, hidden), jnp.bfloat16)
+        indices = jax.random.permutation(key, out_size)
+        topk_weights = jax.random.normal(key, (out_size, ), jnp.bfloat16)
+        valid_rows_mask = jnp.ones((out_size, ), jnp.bool_)
+        desired = reference_ragged_gather_reduce(x, indices, topk_weights,
+                                                 valid_rows_mask, rgs)
+        actual = ragged_gather_reduce_v2(x, indices, topk_weights,
+                                         valid_rows_mask, rgs)
+        np.testing.assert_allclose(actual, desired, atol=1e-2, rtol=1e-2)
+
     # The first perf test case approximates the DeepSeekV3, 2k-batch-size, EP=16.
     # The second case approximates the Qwen3-Coder-480B, 2k-batch-size, EP=8.
+    # The last case's input_size spans multiple sort-permutation windows; with
+    # run_and_time's must_succeed, a kernel that overflows SparseCore SPMEM (E3000)
+    # on it fails the suite. hidden is kept small so x stays runnable and under the
+    # 16 GiB SparseCore per-tensor limit.
     _perf_test_cases = [
         dict(
             out_size=o,
@@ -193,6 +215,14 @@ class ScatterTest(jtu.JaxTestCase):
                 [jnp.bfloat16],
                 [8],
                 [2048],
+            ),
+            itertools.product(
+                [1_835_008],
+                [(0, 1_835_008)],
+                [1024],
+                [jnp.bfloat16],
+                [8],
+                [512],
             ),
         )
     ]
@@ -227,11 +257,13 @@ class ScatterTest(jtu.JaxTestCase):
         print(f"\n=== Running shape: out={out_size},"
               f" hidden={hidden_size}, start={start}, end={end} ===")
 
-        def run_and_time(name, fn, *args):
+        def run_and_time(name, fn, *args, must_succeed=False):
             try:
                 t_val = _time_function(fn, *args)
                 print(f"{name}: {t_val*1000:.3f} ms")
             except Exception as e:  # pylint: disable=broad-except
+                if must_succeed:
+                    raise  # v2 is the kernel under test -- a failure is a regression
                 print(f"{name} failed: {e}")
 
         run_and_time(
@@ -264,6 +296,7 @@ class ScatterTest(jtu.JaxTestCase):
             topk_weights,
             valid_rows_mask,
             reduce_group_size,
+            must_succeed=True,
         )
 
 
