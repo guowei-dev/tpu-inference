@@ -105,12 +105,20 @@ def main_kernel(
 
     col_start = col_partition_id * cfg.col_size
 
+    refs = memory_ref.KernelRefs.create(
+        scalar_ref=scalar_ref,
+        in_hbm_ref=in_hbm_ref,
+        topk_weights_hbm_ref=topk_weights_hbm_ref,
+        out_hbm_ref=out_hbm_ref,
+        scratch_ref=scratch_ref,
+    )
+
     # Step 2: Stage this partition's row count (the sort permutation is streamed
     # one window at a time in call_kernel_pipeline, bounding the resident scratch).
-    recv_sem = scratch_ref.sem.at[0]
+    recv_sem = refs.scratch.sem.at[0]
     num_rows_dma = pltpu.make_async_copy(
-        scalar_ref.num_src_rows_per_row_partition.at[pl.ds(0, num_simd_lanes)],
-        scratch_ref.num_rows_per_row_partition_vmem,
+        refs.index.num_src_rows_per_row_partition.at[pl.ds(0, num_simd_lanes)],
+        refs.scratch.num_rows_per_row_partition_vmem,
         recv_sem,
     )
     num_rows_dma.start()
@@ -118,11 +126,7 @@ def main_kernel(
 
     kernel.call_kernel_pipeline(
         row_partition_id=row_partition_id,
-        scalar_ref=scalar_ref,
-        scratch_ref=scratch_ref,
-        in_hbm_ref=in_hbm_ref,
-        out_hbm_ref=out_hbm_ref,
-        topk_weights_hbm_ref=topk_weights_hbm_ref,
+        refs=refs,
         col_start=col_start,
         cfg=cfg,
     )
