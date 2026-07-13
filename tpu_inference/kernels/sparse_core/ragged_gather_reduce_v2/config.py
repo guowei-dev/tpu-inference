@@ -106,7 +106,7 @@ class Config:
     num_simd_lanes = self.sc_info.num_lanes
     # Input-size-independent resident scratch (32-bit words): prev-row carry
     # (col_size), out_vmem + column gather double-buffer (3*lanes*col_chunk),
-    # the num_rows + next-block-peek vectors (2*lanes), and 6 row index/dma
+    # the num_rows + next-window-first-row vectors (2*lanes), and 6 row index/dma
     # buffers + the row gather pipeline double-buffers (10*row_chunk).
     fixed = (self.col_size + 3 * num_simd_lanes * self.col_chunk_size +
              2 * num_simd_lanes + 10 * self.row_chunk_size)
