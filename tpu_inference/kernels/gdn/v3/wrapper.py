@@ -23,6 +23,32 @@ from tpu_inference.kernels.gdn.v3 import (compute_conv1d, compute_gdn, config,
                                           memory_ref, metadata, vmem_ldst)
 
 
+def _fit_decode_tile_size(tile_size: int, n_v: int, d_k: int, d_v: int,
+                          vmem_bytes: int) -> int:
+    """Shrink the decode (BATCHED) tile so its per-tile VMEM fits.
+
+    Decode VMEM is dominated by the fp32, double-buffered recurrent-state block
+    (``2 * tile * n_v * d_k * d_v * 4`` bytes), which reaches half of VMEM at the
+    compile-time cliff. Larger tiles do not improve throughput here, so shrinking
+    to a power-of-two that fits is perf-neutral.
+    """
+    while tile_size > 1 and 2 * tile_size * n_v * d_k * d_v * 4 > vmem_bytes // 2:
+        tile_size //= 2
+    return tile_size
+
+
+def _fit_mixed_tile_size(tile_size: int, dim: int, vmem_bytes: int) -> int:
+    """Shrink the prefill (PER_SEQ) tile so its per-tile VMEM fits.
+
+    Prefill VMEM is dominated by the chunk-parallel UT-transform working set,
+    which scales with ``tile * dim`` and fills VMEM at ``tile * dim == 3 / 256 *
+    vmem_capacity`` (measured on v7x). Larger tiles do not improve throughput.
+    """
+    while tile_size > 1 and 256 * tile_size * dim > 3 * vmem_bytes:
+        tile_size //= 2
+    return tile_size
+
+
 def inner_kernel(
     # Inputs.
     qkv_slot_ref: jax.Array,  # [seq, chunk, 1, dim_size]
@@ -359,12 +385,23 @@ def fused_conv1d_gdn(
     act_in_dtype = qkv.dtype
     assert a.dtype == b.dtype == qkv.dtype == act_in_dtype
 
-    num_lanes = pltpu.get_tpu_info().num_lanes
+    tpu_info = pltpu.get_tpu_info()
+    num_lanes = tpu_info.num_lanes
     packing = 4 // act_in_dtype.itemsize
     padded_batch_size = pl.cdiv(batch_size, packing) * packing
+    aligned_num_v_heads = pl.cdiv(n_v, num_lanes) * num_lanes
+
+    # Shrink the tile sizes so the per-tile VMEM footprint stays within budget.
+    # The fixed defaults overflow VMEM at compile time for GDN configs with large
+    # n_v / dim (or a smaller-VMEM chip). The recurrence is memory-bound and the
+    # chunk-parallel work grows with the tile, so larger tiles are not faster;
+    # shrinking to fit is perf-neutral.
+    vmem_bytes = tpu_info.vmem_capacity_bytes
+    decode_tile_size = _fit_decode_tile_size(decode_tile_size, n_v, d_k, d_v,
+                                             vmem_bytes)
+    mixed_tile_size = _fit_mixed_tile_size(mixed_tile_size, dim, vmem_bytes)
     decode_tile_size = min(decode_tile_size, batch_size)
     mixed_tile_size = min(mixed_tile_size, batch_size)
-    aligned_num_v_heads = pl.cdiv(n_v, num_lanes) * num_lanes
 
     batch_padding_size = padded_batch_size - batch_size
     num_v_padding_size = aligned_num_v_heads - n_v

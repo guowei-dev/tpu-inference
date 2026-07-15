@@ -559,3 +559,42 @@ class GDNAttentionTest(parameterized.TestCase):
                                    output_ref[half:],
                                    rtol=2e-2,
                                    atol=2e-2)
+
+
+class GDNAttentionVmemTest(parameterized.TestCase):
+
+    def test_large_config_tiles_shrink_to_fit_vmem(self):
+        """The fixed default tiles must not overflow VMEM for large-n_v configs.
+
+        A GDN config with many value heads (n_v=80, d_k=d_v=128 -> dim=14336)
+        makes the default decode_tile=4 / mixed_tile=64 exceed the per-tile VMEM
+        budget; without the dim-aware clamp this raises CompileTimeScopedVmemOom.
+        Compile-only (no device execution): a failure to compile fails the test.
+        """
+        n_kq, n_v, d_k, d_v, kernel_size = 16, 80, 128, 128, 4
+        num_tokens, num_blocks = 64, 2
+        dim = n_kq * d_k * 2 + n_v * d_v
+
+        jax.jit(
+            wrapper.fused_conv1d_gdn,
+            static_argnames=["n_kq", "n_v", "d_k", "d_v", "kernel_size"],
+        ).lower(
+            qkv=jnp.zeros((num_tokens, dim)),
+            b=jnp.zeros((num_tokens, n_v)),
+            a=jnp.zeros((num_tokens, n_v)),
+            conv_state=jnp.zeros((num_blocks, kernel_size - 1, dim)),
+            recurrent_state=jnp.zeros((num_blocks, n_v, d_k, d_v)),
+            conv_weight=jnp.zeros((dim, 1, kernel_size)),
+            conv_bias=jnp.zeros((dim, )),
+            a_log=jnp.zeros((n_v, )),
+            dt_bias=jnp.zeros((n_v, )),
+            query_start_loc=jnp.array([0, num_tokens], dtype=jnp.int32),
+            state_indices=jnp.array([1], dtype=jnp.int32),
+            distribution=jnp.array([0, 0, 1], dtype=jnp.int32),
+            seq_lens=jnp.array([num_tokens], dtype=jnp.int32),
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+            kernel_size=kernel_size,
+        ).compile()
