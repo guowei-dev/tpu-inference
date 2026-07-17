@@ -64,6 +64,53 @@ class AllGatherMatmulTest(jtu.JaxTestCase):
             expected_output = jnp.dot(sharded_x, y_for_dot)
             self.assertAllClose(output, expected_output, atol=1e-2, rtol=1e-2)
 
+    def test_all_gather_matmul_default_block_sizes(self):
+        # Regression test: with no tuned entry, the default bn used to resolve
+        # to the GLOBAL n instead of n // tp_size, issuing out-of-bounds DMA on
+        # the per-device [k, n // tp_size] y block (TPU slice failure at
+        # runtime when the oversized scratch still fit VMEM).
+        if jax.device_count() != 8:
+            self.skipTest('Not enough devices for test')
+
+        axis_name = 'x'
+        num_devices = jax.device_count()
+        mesh = utils.make_optimized_mesh((num_devices, ), (axis_name, ))
+        m, k, n = 256, 1024, 512 * num_devices  # no tuned entry for this shape
+
+        k0, k1 = jax.random.split(jax.random.key(1234), 2)
+        sharded_x = jax.device_put(
+            jax.random.normal(k0, (m, k), dtype=jnp.bfloat16),
+            jax.sharding.NamedSharding(mesh, P(axis_name, None)))
+        sharded_y = jax.device_put(
+            jax.random.normal(k1, (k, n), dtype=jnp.bfloat16),
+            jax.sharding.NamedSharding(mesh, P(None, axis_name)))
+
+        output = all_gather_matmul.all_gather_matmul(sharded_x, sharded_y,
+                                                     mesh, axis_name)
+        expected_output = jnp.dot(sharded_x, sharded_y)
+        self.assertAllClose(output, expected_output, atol=1e-2, rtol=1e-2)
+
+    def test_all_gather_matmul_rejects_oversized_bn(self):
+        if jax.device_count() != 8:
+            self.skipTest('Not enough devices for test')
+
+        axis_name = 'x'
+        num_devices = jax.device_count()
+        mesh = utils.make_optimized_mesh((num_devices, ), (axis_name, ))
+        m, k, n = 256, 1024, 512 * num_devices
+
+        k0, k1 = jax.random.split(jax.random.key(1234), 2)
+        sharded_x = jax.device_put(
+            jax.random.normal(k0, (m, k), dtype=jnp.bfloat16),
+            jax.sharding.NamedSharding(mesh, P(axis_name, None)))
+        sharded_y = jax.device_put(
+            jax.random.normal(k1, (k, n), dtype=jnp.bfloat16),
+            jax.sharding.NamedSharding(mesh, P(None, axis_name)))
+
+        with self.assertRaisesRegex(ValueError, "bn .* must be <="):
+            all_gather_matmul.all_gather_matmul(sharded_x, sharded_y, mesh,
+                                                axis_name, bn=n)
+
 
 if __name__ == "__main__":
     absltest.main(testLoader=jtu.JaxTestLoader())

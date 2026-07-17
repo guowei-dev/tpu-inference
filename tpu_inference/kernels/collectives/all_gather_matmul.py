@@ -49,6 +49,7 @@ def _all_gather_kernel(
     axis_name: str,
     bn: int,
     bk: int,
+    bm: int,
     debug_mode=False,
     rhs_transpose: bool = False,
 ):
@@ -70,25 +71,40 @@ def _all_gather_kernel(
     o_vmem_scratch_ref: Scratch memory for output of the matmul.
   """
     num_devices = pl.num_programs(0) - 2
-    grid_n = pl.num_programs(1)
-    grid_k = pl.num_programs(2)
+    m_per_device, _ = x_hbm_ref.shape
+    m_per_device_per_direction = m_per_device // 2
+    # m tiling: the x/o VMEM working sets are [bm, ...] blocks so their size no
+    # longer scales with m. grid_m == 1 (bm == m_per_device) preserves the
+    # original 3-D grid and code paths exactly.
+    grid_m = m_per_device // bm
+    if grid_m > 1:
+        grid_n = pl.num_programs(2)
+        grid_k = pl.num_programs(3)
+        bm_i = pl.program_id(1)
+        bn_i = pl.program_id(2)
+        bk_i = pl.program_id(3)
+    else:
+        grid_n = pl.num_programs(1)
+        grid_k = pl.num_programs(2)
+        bm_i = 0
+        bn_i = pl.program_id(1)
+        bk_i = pl.program_id(2)
     outer_step = pl.program_id(0)
-    bn_i = pl.program_id(1)
-    bk_i = pl.program_id(2)
-    global_step_id = outer_step * grid_n * grid_k + bn_i * grid_k + bk_i
-    mxu_total_steps = num_devices * grid_n * grid_k
     gn_by_gk = grid_n * grid_k
+    steps_per_outer = grid_m * gn_by_gk
+    global_step_id = (outer_step * steps_per_outer + bm_i * gn_by_gk +
+                      bn_i * grid_k + bk_i)
+    mxu_total_steps = num_devices * steps_per_outer
     my_id = lax.axis_index(axis_name)
     left_neighbor = lax.rem(my_id + num_devices - 1, jnp.int32(num_devices))
     right_neighbor = lax.rem(my_id + 1, jnp.int32(num_devices))
     x_hbm_receiving_slot = outer_step
     x_hbm_working_slot = outer_step - 1
-    x_vmem_receiving_slot = outer_step % 2
+    x_vmem_receiving_slot = (outer_step * grid_m + bm_i) % 2
     x_vmem_working_slot = (global_step_id - 1) // gn_by_gk % 2
     o_receiving_slot = lax.rem((global_step_id + grid_k - 1) // grid_k, 2)
     o_working_slot = 1 - o_receiving_slot
-    m_per_device, _ = x_hbm_ref.shape
-    m_per_device_per_direction = m_per_device // 2
+    bm_rows = pl.ds(bm_i * bm, bm)
 
     def debug_print(msg, *args):
         if debug_mode:
@@ -115,8 +131,9 @@ def _all_gather_kernel(
             bk_i,
         )
         k_slice = pl.ds(bk_i * bk, bk)
+        src_rows = bm_rows if grid_m > 1 else slice(None)
         x_local_copy_op = pltpu.make_async_copy(
-            src_ref=x_hbm_ref.at[:, k_slice],
+            src_ref=x_hbm_ref.at[src_rows, k_slice],
             dst_ref=x_vmem_scratch_ref.at[x_vmem_receiving_slot, :, k_slice],
             sem=x_local_copy_sem,
         )
@@ -170,6 +187,23 @@ def _all_gather_kernel(
             sem=x_local_copy_sem,
         )
         _start_or_wait_copy(x_local_copy_op, wait)
+
+    def _do_subsequent_x_local_copy(wait: bool = False):
+        if grid_m > 1:
+            # one bm block lies entirely on one side of the left/right split
+            # (bm divides m_per_device_per_direction), so a single row-sliced
+            # copy replaces the left/right pair.
+            x_local_copy_op = pltpu.make_async_copy(
+                src_ref=x_hbm_scratch_ref.at[x_hbm_working_slot, bm_rows,
+                                             pl.ds(bk_i * bk, bk)],
+                dst_ref=x_vmem_scratch_ref.at[x_vmem_receiving_slot, :,
+                                              pl.ds(bk_i * bk, bk)],
+                sem=x_local_copy_sem,
+            )
+            _start_or_wait_copy(x_local_copy_op, wait)
+        else:
+            _do_subsequent_x_left_local_copy(wait)
+            _do_subsequent_x_right_local_copy(wait)
 
     def _do_y_local_copy(wait: bool = False):
         debug_print(
@@ -354,6 +388,29 @@ def _all_gather_kernel(
         working_global_step_id = global_step_id - grid_k - 1
         working_bn_i = (working_global_step_id % gn_by_gk) // grid_k
         n_slice = pl.ds(working_bn_i * bn, bn)
+        if grid_m > 1:
+            # one bm block targets a single destination row range: chunk base
+            # by travel direction (left half of the chunk = even m_ppd block,
+            # right half = odd), plus the block's offset within its half.
+            working_bm_i = (working_global_step_id %
+                            steps_per_outer) // gn_by_gk
+            offset = working_global_step_id // steps_per_outer
+            left_base = ((my_id + offset) % num_devices *
+                         2) * m_per_device_per_direction
+            right_base = ((my_id - offset + num_devices) % num_devices * 2 +
+                          1) * m_per_device_per_direction
+            row0 = jnp.where(
+                working_bm_i < grid_m // 2,
+                left_base + working_bm_i * bm,
+                right_base + working_bm_i * bm - m_per_device_per_direction,
+            )
+            o_local_copy_op = pltpu.make_async_copy(
+                src_ref=o_vmem_scratch_ref.at[o_working_slot],
+                dst_ref=o_hbm_ref.at[pl.ds(row0, bm), n_slice],
+                sem=o_local_copy_sem,
+            )
+            _start_or_wait_copy(o_local_copy_op, wait)
+            return
         offset = (global_step_id - 2) // gn_by_gk
         left_o_idx = (my_id + offset) % num_devices
         left_o_idx = left_o_idx * 2
@@ -418,7 +475,7 @@ def _all_gather_kernel(
 
     cond_start_subsequent_remote_copy = jnp.logical_and(
         jnp.logical_and(outer_step > 0, outer_step < num_devices - 1),
-        global_step_id % gn_by_gk == 0,
+        global_step_id % steps_per_outer == 0,
     )
 
     @pl.when(cond_start_subsequent_remote_copy)
@@ -438,10 +495,12 @@ def _all_gather_kernel(
     @pl.when(cond_subsequent_x_local_copy)
     @jax.named_scope("_start_subsequent_x_local_copy")
     def _start_subsequent_x_local_copy():
-        _do_subsequent_x_left_local_copy(wait=False)
-        _do_subsequent_x_right_local_copy(wait=False)
+        _do_subsequent_x_local_copy(wait=False)
 
-    @pl.when(outer_step == 0)
+    y_copy_cond = (outer_step == 0 if grid_m == 1 else jnp.logical_and(
+        outer_step == 0, bm_i == 0))
+
+    @pl.when(y_copy_cond)
     @jax.named_scope("_start_y_local_copy")
     def _start_y_local_copy():
         _do_y_local_copy(wait=False)
@@ -489,7 +548,7 @@ def _all_gather_kernel(
     def _wait_o_local_copy():
         _do_o_local_copy(wait=True)
 
-    @pl.when(outer_step == 0)
+    @pl.when(y_copy_cond)
     @jax.named_scope("_wait_y_local_copy")
     def _wait_y_local_copy():
         _do_y_local_copy(wait=True)
@@ -502,10 +561,9 @@ def _all_gather_kernel(
     @pl.when(cond_subsequent_x_local_copy)
     @jax.named_scope("_wait_subsequent_x_local_copy")
     def _wait_subsequent_x_local_copy():
-        _do_subsequent_x_left_local_copy(wait=True)
-        _do_subsequent_x_right_local_copy(wait=True)
+        _do_subsequent_x_local_copy(wait=True)
 
-    @pl.when(global_step_id == gn_by_gk - 1)
+    @pl.when(global_step_id == steps_per_outer - 1)
     @jax.named_scope("_wait_first_remote_copy")
     def _wait_first_remote_copy():
         _do_first_left_remote_copy(wait=True)
@@ -513,7 +571,7 @@ def _all_gather_kernel(
 
     cond_wait_subsequent_remote_copy = jnp.logical_and(
         jnp.logical_and(outer_step > 0, outer_step < num_devices - 1),
-        global_step_id % gn_by_gk == gn_by_gk - 1,
+        global_step_id % steps_per_outer == steps_per_outer - 1,
     )
 
     @pl.when(cond_wait_subsequent_remote_copy)
@@ -536,16 +594,19 @@ def get_vmem_estimate_bytes(
     x_dtype,
     y_dtype,
     out_dtype,
+    bm=None,
 ):
     """Returns the total vmem bytes used by the kernel."""
     m_per_device = m // tp_size
     n_per_device = n // tp_size
+    if bm is None:
+        bm = m_per_device
     y_vmem_bytes = (n_per_device * k * dtypes.itemsize_bits(y_dtype) // 8)
     total_bytes = (
-        2 * m_per_device * k * dtypes.itemsize_bits(x_dtype) // 8
+        2 * bm * k * dtypes.itemsize_bits(x_dtype) // 8
         # x_vmem_scratch_ref
         + y_vmem_bytes  # y_vmem_scratch_ref
-        + 2 * m * bn * dtypes.itemsize_bits(out_dtype) // 8
+        + 2 * bm * bn * dtypes.itemsize_bits(out_dtype) // 8
         # o_vmem_scratch_ref
         + acc_bytes  # acc_vmem_scratch_ref, jnp.float32
     )
@@ -598,6 +659,7 @@ def all_gather_matmul(
     collective_id: int | None = 0,
     bn: int | None = None,
     bk: int | None = None,
+    bm: int | None = None,
     rhs_transpose: bool = False,
 ):
     """Performs all-gather on the input tensor and then a matmul.
@@ -610,6 +672,9 @@ def all_gather_matmul(
     collective_id: An integer used for barrier semaphore allocation.
     bn: Number of blocks in the n dimension.
     bk: Number of blocks in the k dimension.
+    bm: Row-block size for the x/output VMEM working set. Defaults to the full
+      per-device chunk (m // tp_size); smaller values bound VMEM usage
+      independently of m. Must divide m // tp_size // 2.
     rhs_transpose: If True, y is transposed.
 
   Returns:
@@ -631,12 +696,30 @@ def all_gather_matmul(
             m, n, k,
             jnp.dtype(x.dtype).name, tp_size))
     if bn is None:
-        bn = tuned_bn if tuned_bn is not None else n
+        bn = tuned_bn if tuned_bn is not None else n_per_device
     if bk is None:
         bk = tuned_bk if tuned_bk is not None else k
+    if bn > n_per_device:
+        raise ValueError(
+            f"bn ({bn}) must be <= n // tp_size ({n_per_device}): the kernel "
+            "slices its per-device [k, n // tp_size] y block by bn, so a "
+            "larger bn issues out-of-bounds DMA.")
+    if bk > k:
+        raise ValueError(f"bk ({bk}) must be <= k ({k}).")
+    if bm is None:
+        bm = m_per_device
+    if bm != m_per_device:
+        if bm <= 0 or bm % 8 != 0:
+            raise ValueError(f"bm ({bm}) must be a positive multiple of 8.")
+        if (m_per_device // 2) % bm != 0:
+            raise ValueError(
+                f"bm ({bm}) must divide m // tp_size // 2 "
+                f"({m_per_device // 2}) so a row block stays on one side of "
+                "the bidirectional split.")
+    grid_m = m_per_device // bm
     grid_n = _cdiv(n_per_device, bn)
     grid_k = _cdiv(k, bk)
-    acc_shape = (m_per_device, bn)
+    acc_shape = (bm, bn)
     # NOTE(chengjiyao): acc buffer is not used in the grid_k == 1 case.
     if grid_k == 1:
         acc_shape = (8, 128)
@@ -653,6 +736,7 @@ def all_gather_matmul(
         x.dtype,
         y.dtype,
         x.dtype,
+        bm=bm,
     )
     out_shape = [
         jax.ShapeDtypeStruct((m, n_per_device), x.dtype),  # output
@@ -679,12 +763,13 @@ def all_gather_matmul(
                 2,
                 tp_size - 1,
             )),  # left and right recv semaphores
-            pltpu.VMEM((2, m_per_device, k), x.dtype),  # x vmem scratch
+            pltpu.VMEM((2, bm, k), x.dtype),  # x vmem scratch
             pltpu.VMEM(y_vmem_shape, y.dtype),  # y vmem scratch
-            pltpu.VMEM((2, m_per_device, bn), x.dtype),  # output vmem scratch
+            pltpu.VMEM((2, bm, bn), x.dtype),  # output vmem scratch
             pltpu.VMEM(acc_shape, jnp.float32),  # acc vmem scratch
         ),
-        grid=(tp_size + 2, grid_n, grid_k),
+        grid=((tp_size + 2, grid_m, grid_n, grid_k) if grid_m > 1 else
+              (tp_size + 2, grid_n, grid_k)),
     )
     flops = 2 * m * k * n_per_device
     bytes_accessed = x.dtype.itemsize * (m * k + k * n_per_device +
@@ -693,13 +778,14 @@ def all_gather_matmul(
                                     bytes_accessed=bytes_accessed,
                                     transcendentals=0)
 
-    @jax.jit(static_argnames=["bn", "bk", "rhs_transpose"])
-    def _all_gather_matmul_call(x, y, bn, bk, rhs_transpose):
+    @jax.jit(static_argnames=["bn", "bk", "bm", "rhs_transpose"])
+    def _all_gather_matmul_call(x, y, bn, bk, bm, rhs_transpose):
         return pl.pallas_call(
             functools.partial(
                 _all_gather_kernel,
                 bn=bn,
                 bk=bk,
+                bm=bm,
                 axis_name=axis_name,
                 rhs_transpose=rhs_transpose,
             ),
@@ -710,7 +796,7 @@ def all_gather_matmul(
                 vmem_limit_bytes=estimated_vmem_bytes + 8 * 1024 * 1024,
             ),
             cost_estimate=cost_estimate,
-            name=get_kernel_name(bn, bk, rhs_transpose),
+            name=get_kernel_name(bn, bk, bm, rhs_transpose),
         )(x, y)[0]
 
     shard_map_kernel = jax.jit(
@@ -719,6 +805,7 @@ def all_gather_matmul(
                 _all_gather_matmul_call,
                 bn=bn,
                 bk=bk,
+                bm=bm,
                 rhs_transpose=rhs_transpose,
             ),
             mesh=mesh,
@@ -730,7 +817,6 @@ def all_gather_matmul(
     return shard_map_kernel(x, y)
 
 
-def get_kernel_name(bn: int, bk: int, rhs_transpose: bool):
-    return (
-        f"all_gather_matmul_kernel_bn_{bn}_bk_{bk}_rhs_transpose_{rhs_transpose}"
-    )
+def get_kernel_name(bn: int, bk: int, bm: int, rhs_transpose: bool):
+    return (f"all_gather_matmul_kernel_bn_{bn}_bk_{bk}_bm_{bm}"
+            f"_rhs_transpose_{rhs_transpose}")
