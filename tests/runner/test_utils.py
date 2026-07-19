@@ -844,3 +844,50 @@ def test_merge_profile_directories_ignores_stale_prior_run_data(tmp_path):
     # New data lands in its own canonical dir.
     new_dst = phase_dir / "plugins" / "profile" / "2026_05_06_04_47_36"
     assert (new_dst / "new.xplane.pb").read_text() == "NEW"
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="stop_trace()+merge run inline on the engine step thread "
+    "(utils.py:721-722); the window-closing step() blocks for the whole "
+    "trace export. Remove this marker when the export is moved off the hot "
+    "thread.")
+def test_phased_profiler_export_does_not_block_step(tmp_path):
+    """The step() that closes a phase's capture window must not block the engine
+    thread on the trace export.
+
+    Device-free: start_trace/stop_trace are patched so nothing claims the TPU;
+    stop_trace stands in for the real ~62s libtpu stop_and_export by sleeping
+    SLEEP. On current code stop_trace()+_merge_profile_directories() run inline
+    at utils.py:721-722, so the window-closing step() blocks ~SLEEP (this assert
+    fails -> xfail). Once the export moves to a background thread the closing
+    step() returns immediately, the assert passes, and strict-xfail turns the
+    XPASS into a signal to drop the marker (and add a join before the patch
+    context exits).
+    """
+    target = "tpu_inference.runner.utils"
+    sleep_s = 1.0
+    stats = {"num_reqs": 2, "total_num_scheduled_tokens": 100}
+
+    with patch(f"{target}.jax.profiler.start_trace"), \
+         patch(f"{target}.jax.profiler.stop_trace",
+               side_effect=lambda: time.sleep(sleep_s)), \
+         patch(f"{target}.determine_phase_from_batch_composition_stats",
+               return_value=InferencePhase.PREFILL_ONLY), \
+         patch.object(PhasedBasedProfiler, "_resolve_canonical_dst_ts",
+                      return_value="2024_01_01_12_00_00"), \
+         patch.object(PhasedBasedProfiler, "_merge_profile_directories"):
+
+        profiler = PhasedBasedProfiler(profile_dir=str(tmp_path))
+        profiler.num_steps_to_profile_for = 2
+
+        profiler.step(stats)  # call 1: opens the capture window (start_trace no-op)
+        profiler.step(stats)  # call 2: mid-window
+        start = time.monotonic()
+        profiler.step(stats)  # call 3: closes window -> inline stop_trace + merge
+        closing_step_seconds = time.monotonic() - start
+
+    assert closing_step_seconds < 0.1 * sleep_s, (
+        f"window-closing step() blocked {closing_step_seconds:.2f}s on the "
+        f"inline stop_trace()+merge (stop_trace slept {sleep_s:.1f}s); the "
+        f"trace export must run off the engine step thread")
