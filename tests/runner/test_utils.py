@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+import contextlib
 import io
 import logging
 import os
@@ -502,6 +503,9 @@ def profiler_fixture(tmp_path):
 
         profiler = PhasedBasedProfiler(profile_dir=str(tmp_path))
         profiler.num_steps_to_profile_for = PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR
+        # These tests assert the phase-sequencing contract synchronously; the
+        # async export path is covered separately below.
+        profiler.async_export = False
 
         yield {
             "profiler": profiler,
@@ -846,48 +850,103 @@ def test_merge_profile_directories_ignores_stale_prior_run_data(tmp_path):
     assert (new_dst / "new.xplane.pb").read_text() == "NEW"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="stop_trace()+merge run inline on the engine step thread "
-    "(utils.py:721-722); the window-closing step() blocks for the whole "
-    "trace export. Remove this marker when the export is moved off the hot "
-    "thread.")
-def test_phased_profiler_export_does_not_block_step(tmp_path):
-    """The step() that closes a phase's capture window must not block the engine
-    thread on the trace export.
-
-    Device-free: start_trace/stop_trace are patched so nothing claims the TPU;
-    stop_trace stands in for the real ~62s libtpu stop_and_export by sleeping
-    SLEEP. On current code stop_trace()+_merge_profile_directories() run inline
-    at utils.py:721-722, so the window-closing step() blocks ~SLEEP (this assert
-    fails -> xfail). Once the export moves to a background thread the closing
-    step() returns immediately, the assert passes, and strict-xfail turns the
-    XPASS into a signal to drop the marker (and add a join before the patch
-    context exits).
+@contextlib.contextmanager
+def _async_profiler(tmp_path, stop_sleep_s):
+    """A PhasedBasedProfiler with its device calls patched (nothing claims the
+    TPU). stop_trace sleeps to stand in for the real libtpu stop_and_export;
+    async export is left at its default (on). num_steps_to_profile_for=2 so a
+    phase opens on the 1st step and closes on the 3rd.
     """
     target = "tpu_inference.runner.utils"
-    sleep_s = 1.0
-    stats = {"num_reqs": 2, "total_num_scheduled_tokens": 100}
-
-    with patch(f"{target}.jax.profiler.start_trace"), \
+    with patch(f"{target}.jax.profiler.start_trace") as mock_start, \
          patch(f"{target}.jax.profiler.stop_trace",
-               side_effect=lambda: time.sleep(sleep_s)), \
-         patch(f"{target}.determine_phase_from_batch_composition_stats",
-               return_value=InferencePhase.PREFILL_ONLY), \
+               side_effect=lambda: time.sleep(stop_sleep_s)) as mock_stop, \
+         patch(f"{target}.determine_phase_from_batch_composition_stats") \
+             as mock_phase, \
          patch.object(PhasedBasedProfiler, "_resolve_canonical_dst_ts",
                       return_value="2024_01_01_12_00_00"), \
-         patch.object(PhasedBasedProfiler, "_merge_profile_directories"):
-
+         patch.object(PhasedBasedProfiler, "_merge_profile_directories") \
+             as mock_merge:
         profiler = PhasedBasedProfiler(profile_dir=str(tmp_path))
         profiler.num_steps_to_profile_for = 2
+        yield profiler, mock_start, mock_stop, mock_phase, mock_merge
 
-        profiler.step(stats)  # call 1: opens the capture window (start_trace no-op)
-        profiler.step(stats)  # call 2: mid-window
-        start = time.monotonic()
-        profiler.step(stats)  # call 3: closes window -> inline stop_trace + merge
-        closing_step_seconds = time.monotonic() - start
 
-    assert closing_step_seconds < 0.1 * sleep_s, (
-        f"window-closing step() blocked {closing_step_seconds:.2f}s on the "
-        f"inline stop_trace()+merge (stop_trace slept {sleep_s:.1f}s); the "
-        f"trace export must run off the engine step thread")
+def test_phased_profiler_export_is_async_and_completes(tmp_path):
+    """The window-closing step() must not block the engine thread on the trace
+    export; the export is dispatched to a background daemon thread and still
+    runs stop_trace + merge to completion.
+    """
+    sleep_s = 1.0
+    stats = {"num_reqs": 2, "total_num_scheduled_tokens": 100}
+    with _async_profiler(tmp_path, sleep_s) as (profiler, _start, mock_stop,
+                                                mock_phase, mock_merge):
+        mock_phase.return_value = InferencePhase.PREFILL_ONLY
+        profiler.step(stats)  # opens the capture window (start_trace no-op)
+        profiler.step(stats)  # mid-window
+        t0 = time.monotonic()
+        profiler.step(stats)  # closes window -> dispatch async export
+        closing_step_seconds = time.monotonic() - t0
+
+        # Hot thread returns immediately; the phase is logically done...
+        assert closing_step_seconds < 0.1 * sleep_s, (
+            f"window-closing step() blocked {closing_step_seconds:.2f}s; the "
+            f"export must run off the engine step thread")
+        assert profiler.current_phase == ""
+        # ...while the export runs on a live background daemon thread.
+        assert profiler._export_thread is not None
+        assert profiler._export_thread.daemon
+        assert profiler._export_thread.is_alive()
+
+        profiler._join_export()
+        assert not profiler._export_thread.is_alive()
+        mock_stop.assert_called_once()
+        mock_merge.assert_called_once()
+
+
+def test_phased_profiler_start_joins_prior_export(tmp_path):
+    """Starting a new phase joins the previous phase's in-flight export before
+    calling start_trace, so only one trace is ever active per process.
+    """
+    sleep_s = 1.0
+    stats = {"num_reqs": 2, "total_num_scheduled_tokens": 100}
+    with _async_profiler(tmp_path, sleep_s) as (profiler, mock_start, mock_stop,
+                                                mock_phase, _merge):
+        mock_phase.return_value = InferencePhase.PREFILL_ONLY
+        profiler.step(stats)  # open phase 1
+        profiler.step(stats)  # mid
+        profiler.step(stats)  # close phase 1 -> async export in flight
+        assert profiler._export_thread.is_alive()
+
+        # Starting phase 2 must block until phase 1's export finishes.
+        mock_phase.return_value = InferencePhase.PREFILL_HEAVY
+        t0 = time.monotonic()
+        profiler.step(stats)  # start phase 2 -> joins phase 1 export first
+        start_block_seconds = time.monotonic() - t0
+
+    assert start_block_seconds >= 0.9 * sleep_s
+    assert mock_stop.call_count == 1  # phase 1 stopped...
+    assert mock_start.call_count == 2  # ...before phase 2 started
+    assert profiler.current_phase == "prefill_heavy"
+
+
+def test_phased_profiler_sync_fallback_blocks_inline(tmp_path, monkeypatch):
+    """PHASED_PROFILER_ASYNC_EXPORT=0 restores the inline export (no background
+    thread) — the escape hatch if async export ever misbehaves on device.
+    """
+    monkeypatch.setenv("PHASED_PROFILER_ASYNC_EXPORT", "0")
+    sleep_s = 1.0
+    stats = {"num_reqs": 2, "total_num_scheduled_tokens": 100}
+    with _async_profiler(tmp_path, sleep_s) as (profiler, _start, mock_stop,
+                                                mock_phase, _merge):
+        assert profiler.async_export is False
+        mock_phase.return_value = InferencePhase.PREFILL_ONLY
+        profiler.step(stats)  # open
+        profiler.step(stats)  # mid
+        t0 = time.monotonic()
+        profiler.step(stats)  # close -> inline stop_trace + merge (blocks)
+        closing_step_seconds = time.monotonic() - t0
+
+    assert closing_step_seconds >= 0.9 * sleep_s
+    assert profiler._export_thread is None
+    mock_stop.assert_called_once()

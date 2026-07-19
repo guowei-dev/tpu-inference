@@ -600,6 +600,14 @@ class PhasedBasedProfiler:
         self.worker_rank = worker_rank
         self.aggregated_stats_logger = None
 
+        # Run the (tens-of-seconds) trace export off the engine step thread so
+        # profiling never freezes serving. Env-gated so a bad device result can
+        # fall back to the inline path without a revert.
+        self.async_export: bool = os.getenv("PHASED_PROFILER_ASYNC_EXPORT",
+                                            "1") != "0"
+        self._export_thread: threading.Thread | None = None
+        atexit.register(self._join_export)
+
         logger.info(
             "Phased-based profiler enabled. Traces will be saved to: %s",
             self.profile_dir)
@@ -677,6 +685,11 @@ class PhasedBasedProfiler:
             phase_dir = os.path.join(self.profile_dir, self.current_phase)
             os.makedirs(phase_dir, exist_ok=True)
 
+            # A prior phase's async export must finish before we start a new
+            # trace (one active trace per process) and before we overwrite the
+            # per-phase paths its merge reads.
+            self._join_export()
+
             # Resolve the canonical destination ts before start_trace so all
             # DP ranks land in the same <phase>/plugins/profile/<ts>/ dir
             # when capture is moved out of the sandbox.
@@ -718,11 +731,39 @@ class PhasedBasedProfiler:
                 batch_composition_stats)
             self.profiling_n_steps_left -= 1
             if self.profiling_n_steps_left <= 0:
-                jax.profiler.stop_trace()
-                self._merge_profile_directories()
-                logger.info(
-                    f"Profiling for {self.current_phase} phase finished")
-                self.current_phase = ""
+                self._stop_and_export()
+
+    def _stop_and_export(self) -> None:
+        """Stop the active trace and merge its per-rank capture dirs.
+
+        `jax.profiler.stop_trace()` -> libtpu `stop_and_export` serializes the
+        (large) on-device XSpace and blocks its calling thread for tens of
+        seconds; run it off the engine step thread so profiling never freezes
+        serving. The next phase's `_start_profiling` joins this export before
+        `start_trace` (only one trace may be active per process) and before it
+        overwrites the per-phase paths the merge reads.
+        """
+        finished_phase = self.current_phase
+        # Mark the phase done up front so the step loop moves on while we export.
+        self.current_phase = ""
+
+        def _export() -> None:
+            jax.profiler.stop_trace()
+            self._merge_profile_directories()
+            logger.info(f"Profiling for {finished_phase} phase finished")
+
+        if not self.async_export:
+            _export()
+            return
+        self._export_thread = threading.Thread(target=_export,
+                                               name="phased-profiler-export",
+                                               daemon=True)
+        self._export_thread.start()
+
+    def _join_export(self) -> None:
+        """Block until the in-flight async trace export (if any) finishes."""
+        if self._export_thread is not None and self._export_thread.is_alive():
+            self._export_thread.join()
 
     # How long non-zero DP ranks will wait for rank 0 to publish the
     # canonical-ts marker before falling back to their own timestamp.
