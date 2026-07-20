@@ -237,6 +237,35 @@ class GmmTest(jtu.JaxTestCase):
         self.assertArraysAllClose(actual, expected, atol=3e-1, rtol=3e-1)
 
     @parameterized.product(
+        # block_size 64 -> dequantize before matmul; 256 -> after matmul.
+        block_size=[64, 256], )
+    def test_gmm_weight_quantized_wide_tile_n(self, block_size):
+        """Regression for #3135: the scale zero-stride broadcast must not break
+        Mosaic compile when the scale tile's lane dim (tile_n) exceeds
+        num_lanes. out_size=1024 -> tile_n=1024; both dequant paths request the
+        replicated scale, so both must fall back to the plain load."""
+        batch_size, in_size, out_size, num_groups = 512, 1024, 1024, 16
+        key = jax.random.key(0)
+        lhs = jax.random.uniform(key, (batch_size, in_size), jnp.bfloat16, -1,
+                                 1)
+        rhs = jax.random.uniform(key, (num_groups, in_size, out_size),
+                                 jnp.bfloat16, -1, 1)
+        rhs_q, rhs_scale = quantize_tensor(rhs,
+                                           jnp.float8_e4m3fn,
+                                           axis=1,
+                                           block_size=block_size)
+        rhs_scale = jnp.expand_dims(rhs_scale, axis=2)
+        group_sizes = get_group_sizes(batch_size, num_groups)
+
+        expected = reference_gmm(lhs, rhs_q, group_sizes, rhs_scale=rhs_scale)
+        actual = gmm_v2(lhs,
+                        rhs_q,
+                        group_sizes,
+                        rhs_scale=rhs_scale,
+                        maybe_quantize_lhs=False).astype(lhs.dtype)
+        self.assertArraysAllClose(actual, expected, atol=3e-1, rtol=3e-1)
+
+    @parameterized.product(
         batch_size=[128],
         in_size=[1024],
         out_size=[512],
