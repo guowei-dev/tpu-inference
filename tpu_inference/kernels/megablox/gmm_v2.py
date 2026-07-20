@@ -126,13 +126,7 @@ class WeightsRef(RhsRef):
 
     def get_scale(self, replicate_size: int | None = None) -> jax.Array:
         assert self.scale is not None
-        # The zero-stride sublane broadcast lowers to a Mosaic tpu.strided_load
-        # that is only supported when the lane (last) dim is a single native
-        # register (num_lanes); for wider scale tiles (e.g. tile_n=1024) fall
-        # back to the plain load and let the downstream multiply broadcast the
-        # size-1 sublane dim.
-        if (replicate_size is not None
-                and self.scale.shape[-1] == pltpu.get_tpu_info().num_lanes):
+        if replicate_size is not None:
             # Perform zero-stride load for efficient broadcasting across sublanes.
             return self.scale[:, pl.ds(0, replicate_size, 0), :]
         return self.scale[...]
