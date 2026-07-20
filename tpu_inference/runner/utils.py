@@ -656,6 +656,16 @@ class PhasedBasedProfiler:
             if has_been_seen or phase != current_determined_phase:
                 continue
 
+            # A prior phase's async trace export is still draining. Only one
+            # trace may be active per process, and the engine step thread must
+            # never block on the export — so skip starting a new capture now and
+            # retry on a later step once the export finishes (best-effort: a
+            # phase whose window abuts the previous export may be captured a bit
+            # later, but serving never stalls).
+            if self._export_thread is not None and self._export_thread.is_alive(
+            ):
+                break
+
             # Skip a configurable number of decode-heavy steps before profiling
             if phase == InferencePhase.DECODE_HEAVY and \
                     self.decode_steps_skipped < self.num_decode_steps_to_skip:
@@ -684,11 +694,6 @@ class PhasedBasedProfiler:
             logger.info(f"Batch composition stats: {batch_composition_stats}")
             phase_dir = os.path.join(self.profile_dir, self.current_phase)
             os.makedirs(phase_dir, exist_ok=True)
-
-            # A prior phase's async export must finish before we start a new
-            # trace (one active trace per process) and before we overwrite the
-            # per-phase paths its merge reads.
-            self._join_export()
 
             # Resolve the canonical destination ts before start_trace so all
             # DP ranks land in the same <phase>/plugins/profile/<ts>/ dir
@@ -739,9 +744,10 @@ class PhasedBasedProfiler:
         `jax.profiler.stop_trace()` -> libtpu `stop_and_export` serializes the
         (large) on-device XSpace and blocks its calling thread for tens of
         seconds; run it off the engine step thread so profiling never freezes
-        serving. The next phase's `_start_profiling` joins this export before
-        `start_trace` (only one trace may be active per process) and before it
-        overwrites the per-phase paths the merge reads.
+        serving. While this export is in flight `_start_profiling` skips
+        starting a new capture (only one trace may be active per process, and
+        the export still owns the per-phase paths the merge reads); `atexit`
+        flushes any export still running at shutdown.
         """
         finished_phase = self.current_phase
         # Mark the phase done up front so the step loop moves on while we export.

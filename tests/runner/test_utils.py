@@ -904,13 +904,15 @@ def test_phased_profiler_export_is_async_and_completes(tmp_path):
         mock_merge.assert_called_once()
 
 
-def test_phased_profiler_start_joins_prior_export(tmp_path):
-    """Starting a new phase joins the previous phase's in-flight export before
-    calling start_trace, so only one trace is ever active per process.
+def test_phased_profiler_start_skips_while_exporting(tmp_path):
+    """While a prior phase's export is in flight, starting a new phase is
+    skipped (never joined) so the engine step thread does not block; only one
+    trace is ever active per process, and the phase is captured on a later step
+    once the export has drained.
     """
     sleep_s = 1.0
     stats = {"num_reqs": 2, "total_num_scheduled_tokens": 100}
-    with _async_profiler(tmp_path, sleep_s) as (profiler, mock_start, mock_stop,
+    with _async_profiler(tmp_path, sleep_s) as (profiler, mock_start, _stop,
                                                 mock_phase, _merge):
         mock_phase.return_value = InferencePhase.PREFILL_ONLY
         profiler.step(stats)  # open phase 1
@@ -918,16 +920,22 @@ def test_phased_profiler_start_joins_prior_export(tmp_path):
         profiler.step(stats)  # close phase 1 -> async export in flight
         assert profiler._export_thread.is_alive()
 
-        # Starting phase 2 must block until phase 1's export finishes.
+        # A new phase arriving while the export runs must NOT block the engine
+        # thread and must NOT start a second trace.
         mock_phase.return_value = InferencePhase.PREFILL_HEAVY
         t0 = time.monotonic()
-        profiler.step(stats)  # start phase 2 -> joins phase 1 export first
-        start_block_seconds = time.monotonic() - t0
+        profiler.step(stats)  # export busy -> skip, returns immediately
+        skipped_step_seconds = time.monotonic() - t0
+        assert skipped_step_seconds < 0.1 * sleep_s
+        assert mock_start.call_count == 1  # phase 2 not started yet
+        assert not profiler.inference_phase_seen[InferencePhase.PREFILL_HEAVY]
 
-    assert start_block_seconds >= 0.9 * sleep_s
-    assert mock_stop.call_count == 1  # phase 1 stopped...
-    assert mock_start.call_count == 2  # ...before phase 2 started
-    assert profiler.current_phase == "prefill_heavy"
+        # Once the export drains, the phase is captured on its next occurrence.
+        profiler._join_export()
+        profiler.step(stats)  # export done -> phase 2 starts now
+        assert mock_start.call_count == 2
+        assert profiler.current_phase == "prefill_heavy"
+        assert profiler.inference_phase_seen[InferencePhase.PREFILL_HEAVY]
 
 
 def test_phased_profiler_sync_fallback_blocks_inline(tmp_path, monkeypatch):
