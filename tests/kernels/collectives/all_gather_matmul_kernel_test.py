@@ -64,6 +64,77 @@ class AllGatherMatmulTest(jtu.JaxTestCase):
             expected_output = jnp.dot(sharded_x, y_for_dot)
             self.assertAllClose(output, expected_output, atol=1e-2, rtol=1e-2)
 
+    @parameterized.product(rhs_transpose=[True, False])
+    def test_all_gather_matmul_unrolled_matches_grid(self, rhs_transpose):
+        # The unrolled-ring variant must be interchangeable with the grid
+        # kernel on the single-block schedule: same result (bitwise, checked
+        # across 10 runs to expose races) and the same reference tolerance.
+        if jax.device_count() != 8:
+            self.skipTest('Not enough devices for test')
+
+        axis_name = 'x'
+        num_devices = jax.device_count()
+        mesh = utils.make_optimized_mesh((num_devices, ), (axis_name, ))
+        m, k, n = 1024, 2048, 1024 * num_devices
+        bn, bk = n // num_devices, k
+
+        for i in range(10):
+            k0, k1 = jax.random.split(jax.random.key(4321 + i), 2)
+            x = jax.random.normal(k0, (m, k), dtype=jnp.bfloat16)
+            y_shape = (n, k) if rhs_transpose else (k, n)
+            y_sharding = P(axis_name, None) if rhs_transpose else P(
+                None, axis_name)
+            sharded_x = jax.device_put(
+                x, jax.sharding.NamedSharding(mesh, P(axis_name, None)))
+            sharded_y = jax.device_put(
+                jax.random.normal(k1, y_shape, dtype=jnp.bfloat16),
+                jax.sharding.NamedSharding(mesh, y_sharding))
+
+            kwargs = dict(bn=bn, bk=bk, rhs_transpose=rhs_transpose)
+            out_grid = all_gather_matmul.all_gather_matmul(sharded_x,
+                                                           sharded_y,
+                                                           mesh,
+                                                           axis_name,
+                                                           unroll=False,
+                                                           **kwargs)
+            out_unrolled = all_gather_matmul.all_gather_matmul(sharded_x,
+                                                               sharded_y,
+                                                               mesh,
+                                                               axis_name,
+                                                               unroll=True,
+                                                               **kwargs)
+            self.assertArraysEqual(out_grid, out_unrolled)
+            y_for_dot = sharded_y.T if rhs_transpose else sharded_y
+            self.assertAllClose(out_unrolled,
+                                jnp.dot(sharded_x, y_for_dot),
+                                atol=1e-2,
+                                rtol=1e-2)
+
+    def test_all_gather_matmul_unrolled_rejects_multi_block(self):
+        if jax.device_count() != 8:
+            self.skipTest('Not enough devices for test')
+
+        axis_name = 'x'
+        num_devices = jax.device_count()
+        mesh = utils.make_optimized_mesh((num_devices, ), (axis_name, ))
+        m, k, n = 256, 1024, 512 * num_devices
+
+        k0, k1 = jax.random.split(jax.random.key(1234), 2)
+        sharded_x = jax.device_put(
+            jax.random.normal(k0, (m, k), dtype=jnp.bfloat16),
+            jax.sharding.NamedSharding(mesh, P(axis_name, None)))
+        sharded_y = jax.device_put(
+            jax.random.normal(k1, (k, n), dtype=jnp.bfloat16),
+            jax.sharding.NamedSharding(mesh, P(None, axis_name)))
+
+        with self.assertRaisesRegex(ValueError, 'unroll=True requires'):
+            all_gather_matmul.all_gather_matmul(sharded_x,
+                                                sharded_y,
+                                                mesh,
+                                                axis_name,
+                                                bn=n // num_devices // 2,
+                                                unroll=True)
+
     def test_all_gather_matmul_default_block_sizes(self):
         # Regression test: with no tuned entry, the default bn used to resolve
         # to the GLOBAL n instead of n // tp_size, issuing out-of-bounds DMA on
@@ -108,8 +179,11 @@ class AllGatherMatmulTest(jtu.JaxTestCase):
             jax.sharding.NamedSharding(mesh, P(None, axis_name)))
 
         with self.assertRaisesRegex(ValueError, "bn .* must be <="):
-            all_gather_matmul.all_gather_matmul(sharded_x, sharded_y, mesh,
-                                                axis_name, bn=n)
+            all_gather_matmul.all_gather_matmul(sharded_x,
+                                                sharded_y,
+                                                mesh,
+                                                axis_name,
+                                                bn=n)
 
 
 if __name__ == "__main__":

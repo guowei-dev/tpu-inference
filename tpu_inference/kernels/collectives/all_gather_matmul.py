@@ -583,6 +583,149 @@ def _all_gather_kernel(
     ### ------- Kernel end ------- ###
 
 
+def _all_gather_kernel_unrolled(
+    # Inputs
+    x_hbm_ref,  # [m_per_device, k]
+    y_hbm_ref,  # [k, n_per_device] (or transposed)
+    # Outputs
+    o_hbm_ref,  # [m, n_per_device]
+    x_hbm_scratch_ref,  # [num_devices - 1, m_per_device, k]
+    # Scratches
+    x_local_copy_sem,
+    y_local_copy_sem,
+    o_local_copy_sem,
+    send_sems,  # [2, num_devices - 1]
+    recv_sems,  # [2, num_devices - 1]
+    x_vmem_scratch_ref,  # [2, m_per_device, k]
+    y_vmem_scratch_ref,  # [k, n_per_device]
+    o_vmem_scratch_ref,  # [2, m_per_device, bn]
+    acc_vmem_scratch_ref,  # unused (single k block)
+    axis_name: str,
+    rhs_transpose: bool = False,
+):
+    """Unrolled-ring variant of _all_gather_kernel for the single-block case
+    (bn == n_per_device, bk == k, bm == m_per_device).
+
+    Same schedule as the grid kernel — hop s and the local copy of hop s-1's
+    chunk are started at step s, the MXU for chunk s-1 runs between the starts
+    and the waits, and every hop is waited at the end of its own step — but as
+    one pallas invocation with a Python loop, so slot and semaphore indices
+    are static and there is no per-step grid re-entry. Profitable in the
+    latency-bound mid-M range where the grid machinery is a visible fraction
+    of the per-hop time.
+    """
+    del acc_vmem_scratch_ref
+    num_devices = x_hbm_scratch_ref.shape[0] + 1
+    m_per_device, _ = x_hbm_ref.shape
+    half = m_per_device // 2
+    my_id = lax.axis_index(axis_name)
+    left_neighbor = lax.rem(my_id + num_devices - 1, jnp.int32(num_devices))
+    right_neighbor = lax.rem(my_id + 1, jnp.int32(num_devices))
+
+    def _start_or_wait(op, wait):
+        if wait:
+            op.wait()
+        else:
+            op.start()
+
+    def _hop(step, wait):
+        # Ring hop `step`: send our (step 0) or the last-received (else) chunk
+        # halves to the left/right neighbors' scratch slot `step`.
+        src = x_hbm_ref if step == 0 else x_hbm_scratch_ref.at[step - 1]
+        for direction, rows, neighbor in (
+            (0, slice(0, half), left_neighbor),
+            (1, slice(half, m_per_device), right_neighbor),
+        ):
+            _start_or_wait(
+                pltpu.make_async_remote_copy(
+                    src_ref=src.at[rows],
+                    dst_ref=x_hbm_scratch_ref.at[step, rows],
+                    send_sem=send_sems.at[direction, step],
+                    recv_sem=recv_sems.at[direction, step],
+                    device_id=(neighbor, ),
+                    device_id_type=pl.DeviceIdType.MESH,
+                ), wait)
+
+    def _x_local(step, wait):
+        src = x_hbm_ref if step == 0 else x_hbm_scratch_ref.at[step - 1]
+        _start_or_wait(
+            pltpu.make_async_copy(
+                src_ref=src,
+                dst_ref=x_vmem_scratch_ref.at[step % 2],
+                sem=x_local_copy_sem,
+            ), wait)
+
+    def _y_local(wait):
+        _start_or_wait(
+            pltpu.make_async_copy(
+                src_ref=y_hbm_ref,
+                dst_ref=y_vmem_scratch_ref,
+                sem=y_local_copy_sem,
+            ), wait)
+
+    def _mxu(step):
+        lhs = x_vmem_scratch_ref.at[(step - 1) % 2][...]
+        if rhs_transpose:
+            out = lax.dot_general(
+                lhs,
+                y_vmem_scratch_ref[...],
+                dimension_numbers=(((1, ), (1, )), ((), ())),
+                preferred_element_type=jnp.float32,
+            )
+        else:
+            out = jnp.dot(lhs,
+                          y_vmem_scratch_ref[...],
+                          preferred_element_type=jnp.float32)
+        o_vmem_scratch_ref.at[step % 2][...] = out.astype(
+            x_vmem_scratch_ref.dtype)
+
+    def _o_export(step, wait):
+        # Export the MXU result of step - 1 (slot (step-1) % 2): its left half
+        # is the chunk gathered from `offset` devices to the left, the right
+        # half from `offset` to the right (same mapping as the grid kernel).
+        offset = step - 2
+        slot = (step - 1) % 2
+        left_o_idx = (my_id + offset) % num_devices * 2
+        right_o_idx = (my_id - offset + num_devices) % num_devices * 2 + 1
+        for rows, o_idx in ((slice(0, half), left_o_idx),
+                            (slice(half, m_per_device), right_o_idx)):
+            _start_or_wait(
+                pltpu.make_async_copy(
+                    src_ref=o_vmem_scratch_ref.at[slot, rows],
+                    dst_ref=o_hbm_ref.at[pl.ds(half * o_idx, half), :],
+                    sem=o_local_copy_sem,
+                ), wait)
+
+    util.local_barrier(left_neighbor, right_neighbor)
+    for step in range(num_devices + 2):
+        if step == 0:
+            _hop(0, wait=False)
+            _x_local(0, wait=False)
+            _y_local(wait=False)
+            _y_local(wait=True)
+            _x_local(0, wait=True)
+            _hop(0, wait=True)
+        elif step < num_devices:
+            if step <= num_devices - 2:
+                _hop(step, wait=False)
+            _x_local(step, wait=False)
+            if step >= 2:
+                _o_export(step, wait=False)
+            _mxu(step)
+            if step >= 2:
+                _o_export(step, wait=True)
+            _x_local(step, wait=True)
+            if step <= num_devices - 2:
+                _hop(step, wait=True)
+        elif step == num_devices:
+            _o_export(step, wait=False)
+            _mxu(step)
+            _o_export(step, wait=True)
+        else:
+            _o_export(step, wait=False)
+            _o_export(step, wait=True)
+
+
 # FIXME(chengjiyao): make it accurate for the cases of quantization
 def get_vmem_estimate_bytes(
     m,
@@ -661,6 +804,7 @@ def all_gather_matmul(
     bk: int | None = None,
     bm: int | None = None,
     rhs_transpose: bool = False,
+    unroll: bool | None = None,
 ):
     """Performs all-gather on the input tensor and then a matmul.
 
@@ -676,6 +820,9 @@ def all_gather_matmul(
       per-device chunk (m // tp_size); smaller values bound VMEM usage
       independently of m. Must divide m // tp_size // 2.
     rhs_transpose: If True, y is transposed.
+    unroll: Use the unrolled-ring kernel (single-block schedules only, i.e.
+      bn == n // tp_size, bk == k, bm == m // tp_size). None picks it
+      automatically for such schedules; False forces the grid kernel.
 
   Returns:
     all-gather(x, axis=0) @ y
@@ -719,6 +866,16 @@ def all_gather_matmul(
     grid_m = m_per_device // bm
     grid_n = _cdiv(n_per_device, bn)
     grid_k = _cdiv(k, bk)
+    single_block = grid_m == grid_n == grid_k == 1
+    if unroll and not single_block:
+        raise ValueError(
+            "unroll=True requires the single-block schedule (bn == n // "
+            f"tp_size, bk == k, bm == m // tp_size); got grid ({grid_m}, "
+            f"{grid_n}, {grid_k}).")
+    # Measured perf-neutral vs the grid kernel (bitwise-identical output), so
+    # the proven grid path stays the default; the unrolled form is kept as the
+    # simpler single-block schedule and the base for future ring variants.
+    use_unroll = bool(unroll)
     acc_shape = (bm, bn)
     # NOTE(chengjiyao): acc buffer is not used in the grid_k == 1 case.
     if grid_k == 1:
@@ -768,7 +925,8 @@ def all_gather_matmul(
             pltpu.VMEM((2, bm, bn), x.dtype),  # output vmem scratch
             pltpu.VMEM(acc_shape, jnp.float32),  # acc vmem scratch
         ),
-        grid=((tp_size + 2, grid_m, grid_n, grid_k) if grid_m > 1 else
+        grid=((1, ) if use_unroll else
+              (tp_size + 2, grid_m, grid_n, grid_k) if grid_m > 1 else
               (tp_size + 2, grid_n, grid_k)),
     )
     flops = 2 * m * k * n_per_device
@@ -778,17 +936,29 @@ def all_gather_matmul(
                                     bytes_accessed=bytes_accessed,
                                     transcendentals=0)
 
+    if use_unroll:
+        kernel_body = functools.partial(
+            _all_gather_kernel_unrolled,
+            axis_name=axis_name,
+            rhs_transpose=rhs_transpose,
+        )
+    else:
+        kernel_body = functools.partial(
+            _all_gather_kernel,
+            bn=bn,
+            bk=bk,
+            bm=bm,
+            axis_name=axis_name,
+            rhs_transpose=rhs_transpose,
+        )
+    kernel_name = get_kernel_name(bn, bk, bm, rhs_transpose)
+    if use_unroll:
+        kernel_name += "_unrolled"
+
     @jax.jit(static_argnames=["bn", "bk", "bm", "rhs_transpose"])
     def _all_gather_matmul_call(x, y, bn, bk, bm, rhs_transpose):
         return pl.pallas_call(
-            functools.partial(
-                _all_gather_kernel,
-                bn=bn,
-                bk=bk,
-                bm=bm,
-                axis_name=axis_name,
-                rhs_transpose=rhs_transpose,
-            ),
+            kernel_body,
             out_shape=out_shape,
             grid_spec=grid_spec,
             compiler_params=pltpu.CompilerParams(
@@ -796,7 +966,7 @@ def all_gather_matmul(
                 vmem_limit_bytes=estimated_vmem_bytes + 8 * 1024 * 1024,
             ),
             cost_estimate=cost_estimate,
-            name=get_kernel_name(bn, bk, bm, rhs_transpose),
+            name=kernel_name,
         )(x, y)[0]
 
     shard_map_kernel = jax.jit(
