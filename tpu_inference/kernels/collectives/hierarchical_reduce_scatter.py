@@ -148,7 +148,7 @@ def hier_rs_kernel(
                     send_sem=phase1_sync_sems.at[pair_idx, micro_batch_idx],
                     recv_sem=phase1_sync_sems.at[pair_idx, micro_batch_idx],
                     device_id=twin_id,
-                    device_id_type=pltpu.DeviceIdType.LOGICAL,
+                    device_id_type=pl.DeviceIdType.LOGICAL,
                 )
                 op.start()
                 mb_ops.append(op)
@@ -289,7 +289,7 @@ def hier_rs_kernel(
                                     hypercube_dim_idx, op_idx],
                                 device_id=neighbor_chip_id * 2 +
                                 cur_chiplet_bit,
-                                device_id_type=pltpu.DeviceIdType.LOGICAL,
+                                device_id_type=pl.DeviceIdType.LOGICAL,
                             )
                             op.start()
                             mb_ops.append(
