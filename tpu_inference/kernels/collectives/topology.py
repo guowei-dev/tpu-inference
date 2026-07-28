@@ -175,23 +175,149 @@ def hier_device_order(devices):
 # ---------------------------------------------------------------------------
 
 
+def allport_schedule(num_dims):
+    """Relative-label ladder for the all-port (concurrent-dims) RS schedule.
+
+    Everything is expressed in RELATIVE chip labels l = q XOR my_chip, which
+    makes the whole dependency ladder device-invariant: every send/wait sits
+    at the same static program point on every device (only traced values —
+    absolute labels, partner ids, row offsets — differ). Band b trades dim
+    (b + s) % num_dims at round s; op bits enumerate the dims not yet traded
+    in that band's rotation.
+
+    Returns a dict with (all in relative-label space):
+      l_twin:      twin emission order, popcount-descending — the first twin
+                   merge unlocks one round-0 send on EVERY dim.
+      sends:       {(s, b, op): send_label}   (label's dim-s bit is 1)
+      merges:      {(s, b, op): target_label} (the kept label the arrival
+                   adds into)
+      r0_unlock:   {twin label l: [(b, op), ...]} round-0 sends unlocked by
+                   that twin merge
+      send_prereqs:{(s, b, op): [('twin', l), ('merge', (r, b, op_r)), ...]}
+                   every merge into the send label at rounds < s in band b,
+                   plus its twin merge
+      slot:        {(s, b, op): static landing-slot / sem-cell index}
+      n_slots:     total phase-2 slots
+    """
+    d = num_dims
+    dims = lambda b: [(b + r) % d for r in range(d)]
+    sched = dict(num_dims=d, sends={}, merges={}, r0_unlock={},
+                 send_prereqs={}, slot={})
+    total = 0
+    for s in range(d):
+        ops = 2**(d - 1 - s)
+        for b in range(d):
+            delta = dims(b)
+            for op in range(ops):
+                label_hi = sum(((op >> i) & 1) << delta[s + 1 + i]
+                               for i in range(d - 1 - s))
+                sched["sends"][(s, b, op)] = (1 << delta[s]) | label_hi
+                sched["merges"][(s, b, op)] = label_hi
+                sched["slot"][(s, b, op)] = total
+                total += 1
+    sched["n_slots"] = max(total, 1)
+    sched["l_twin"] = sorted(range(2**d),
+                             key=lambda l: (-bin(l).count("1"), l))
+    for (s, b, op), lbl in sched["sends"].items():
+        prereqs = [("twin", lbl)]
+        delta = dims(b)
+        for r in range(s):
+            # the round-r merge into this label: op_r bit i indexes dim
+            # delta[r+1+i]; the label's bit at delta[s] (==1) and its op'
+            # bits sit above.
+            op_r = sum(((lbl >> delta[r + 1 + i]) & 1) << i
+                       for i in range(d - 1 - r))
+            prereqs.append(("merge", (r, b, op_r)))
+        sched["send_prereqs"][(s, b, op)] = prereqs
+        if s == 0:
+            sched["r0_unlock"].setdefault(lbl, []).append((b, op))
+    return sched
+
+
+def allport_program(num_dims):
+    """The all-port kernel's static emission order (one program, all devices).
+
+    Abstract ops over the allport_schedule ladder, all in relative-label
+    space: ('compute_tw', l) ('twin_start', l) ('compute_own', l)
+    ('twin_wait', l) ('twin_merge', l) ('p2_start', key) ('p2_wait', key)
+    ('p2_merge', key) ('out',) with key = (round, band, op).
+
+    Construction: twin pairs in l_twin order; each twin merge immediately
+    starts the round-0 sends it unlocks; at the end of each pair, HOIST —
+    greedily wait+merge any started phase-2 op whose merge target's twin
+    merge is done, and start every send whose prereqs that completes (the
+    phase-barrier breaker); leftovers drain after the last pair in start
+    order. Deadlock-freedom rests on this being ONE static sequence for
+    every device — see allport_schedule and the kernel docstring.
+    """
+    sched = allport_schedule(num_dims)
+    prog, started, waited, done = [], [], set(), set()
+
+    def merges_done(key):
+        return all(p in done for p in sched["send_prereqs"][key])
+
+    def start(key):
+        prog.append(("p2_start", key))
+        started.append(key)
+
+    def hoist():
+        progressed = True
+        while progressed:
+            progressed = False
+            for key in list(started):
+                if key in waited:
+                    continue
+                target = sched["merges"][key]
+                if ("twin", target) not in done:
+                    continue
+                prog.extend([("p2_wait", key), ("p2_merge", key)])
+                waited.add(key)
+                done.add(("merge", key))
+                progressed = True
+                for nxt, pre in sched["send_prereqs"].items():
+                    if nxt not in started and all(p in done for p in pre):
+                        start(nxt)
+
+    for l in sched["l_twin"]:
+        prog.extend([("compute_tw", l), ("twin_start", l),
+                     ("compute_own", l), ("twin_wait", l),
+                     ("twin_merge", l)])
+        done.add(("twin", l))
+        for key in sched["r0_unlock"].get(l, []):
+            start((0, ) + key)
+        hoist()
+    assert all(k in waited for k in started) and len(started) == len(
+        sched["sends"]), "allport_program: ladder did not drain"
+    prog.append(("out", ))
+    return sched, prog
+
+
 def select_path(pattern, m, tp_size):
     """Measured per-M dispatch for the collective-matmul patterns.
 
-    Thresholds from the v7x-8 (2x2x1, 8-device) same-process lat-basis study:
-    XLA's serve-flag serial lowering wins at M <= 512 for both patterns; the
-    single-hop-ring fused kernels win at M >= 1024 (AG 1.25x / RS 1.33x at
-    M=8192); the hierarchical kernels never win on the 2-dim slice (their
-    phase-boundary exposure outweighs the shorter round count) — they are the
-    expected candidates on 3-dim (2x2x2) slices, unmeasured there. The ring
-    MM-RS cannot compile M = tp_size * 16 (Mosaic E2003), where XLA wins
-    anyway.
+    Thresholds from the v7x-8 (2x2x1, 8-device) same-process lat-basis study
+    (ABBA-certified, spread 0.1-0.3%): XLA's serve-flag serial lowering wins
+    at M <= 512 for both patterns; for MM-RS the all-port pipelined kernel
+    (allport_matmul_reduce_scatter) wins at M = 1024 (115.5 vs ring 119.8 us,
+    and 0.71-0.78x vs ring at 256-512 where XLA still leads overall); the
+    single-hop-ring kernels win at larger M — at M >= 2048 both MM-RS
+    kernels sit on their shared-chip-ICI-port wire walls (allport 3P/port
+    but round-0 sends unlock only after their twin merges; ring 3.5P/port
+    pipelined from t=0) and the ring's head start wins. AG-MM: ring from
+    M >= 1024 (1.25x vs best XLA at 8192). The bulk-synchronous hier
+    kernels never win here; the >= 3-dim (2x2x2) slice, where all-port has
+    a ~1.6x per-port wire advantage, is unmeasured.
 
-    pattern: 'ag_mm' | 'mm_rs'; m = GLOBAL row count. Returns 'xla' | 'ring'.
+    pattern: 'ag_mm' | 'mm_rs'; m = GLOBAL row count.
+    Returns 'xla' | 'allport' | 'ring'.
     """
     if pattern not in ("ag_mm", "mm_rs"):
         raise ValueError(f"unknown pattern {pattern!r} (ag_mm|mm_rs)")
-    return "xla" if m <= 64 * tp_size else "ring"
+    if m <= 64 * tp_size:
+        return "xla"
+    if pattern == "mm_rs" and m <= 128 * tp_size:
+        return "allport"
+    return "ring"
 
 
 def make_collective_mesh(kind="ring", *, devices=None, axis_name=AXIS):

@@ -1,0 +1,388 @@
+# SPDX-License-Identifier: Apache-2.0
+"""All-port fused matmul reduce-scatter (hierarchical schedule, ring-style
+pipelining).
+
+Same schedule as hier_matmul_reduce_scatter (twin-pair D2D + concurrent-dims
+hypercube: band b trades dim (b+s) % D at round s, so every ICI axis is busy
+every round) but with the phase barriers removed: the emission order comes
+from topology.allport_program — twin pairs in popcount-descending order (the
+first twin merge lights a round-0 send on EVERY dim), each merge immediately
+starts the sends it unlocks, and ladder waits are hoisted between pair
+computes. Round r+1's send of a region depends only on that region's round-r
+merge, never on the whole round.
+
+Deadlock-freedom (the rule future edits must keep): every device emits the
+SAME static sequence of DMA starts and semaphore waits — the ladder is
+enumerated in RELATIVE labels l = q XOR my_chip, so slot indices and program
+positions are device-invariant and only traced values (absolute labels,
+partner ids, row offsets) differ. A wait on a shared cell then only needs the
+partner to have issued its symmetric start, which it did at the same earlier
+program position (induction over wait index; the CPU simulator in
+allport_schedule_test.py re-checks every edit). Never wrap a blocking or
+signaling op in a device-dependent branch, and never make a wait's slot index
+data-dependent.
+
+Layout contract: logical id == chip * 2 + core (topology.make_collective_mesh
+('hier')); wire dtype = input dtype; fp32 local accumulate; hops = 1 +
+log2(num_chips). VMEM-resident run slots bound the envelope to M <= ~2048 at
+perdev spec shapes (larger M FAILs at compile — the ring kernel owns that
+range). collective_id = 4.
+"""
+import functools
+import math
+
+import jax
+import jax.numpy as jnp
+from jax import lax
+from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
+
+from tpu_inference.kernels.collectives import topology, util
+from tpu_inference.kernels.collectives.hier_matmul_reduce_scatter import \
+    validate_inputs  # same input contract as the hier kernel
+
+_COLLECTIVE_ID = 4
+
+
+def _band_bounds(k, num_dims):
+    """K-column bands. (A row-band A/B measured within noise: the p2 stage
+    is wire-bound on the SHARED chip ICI ports — 3P per chip port at D=2 —
+    so banding geometry doesn't move it; columns won 4/5 Ms by 1-3%.)"""
+    fcs = ((k // num_dims + 127) // 128) * 128
+    return [(min(b * fcs, k), min(fcs, k - min(b * fcs, k)))
+            for b in range(num_dims)]
+
+
+def _allport_kernel(
+    a_hbm,
+    w_hbm,
+    out_hbm,
+    recv1_hbm,
+    recv2_hbm,
+    w_vmem,
+    a_vmem,
+    run_vmem,
+    acc_vmem,
+    recv_vmem,
+    sem_a,
+    sem_recv,
+    sem_out,
+    sems_w,
+    sems1,
+    sems2,
+    *,
+    sched,
+    prog,
+    num_dims,
+    m_per,
+    bk,
+    band_bounds,
+    axis_name,
+    ablate,
+):
+    k = w_vmem.shape[1]
+    num_kt = k // bk
+    my_id = lax.axis_index(axis_name)
+    bit = lax.rem(my_id, 2)
+    my_chip = lax.div(my_id, 2)
+    twin = my_id + 1 - 2 * bit
+
+    partners = [twin]
+    for d in range(num_dims):
+        partners.append((my_chip ^ (1 << d)) * 2 + bit)
+    util.local_barrier_logical(partners)
+
+    # w tile loads start immediately; each tile is waited once, at first use.
+    for kt_i in range(num_kt):
+        pltpu.make_async_copy(w_hbm.at[:, pl.ds(kt_i * bk, bk)],
+                              w_vmem.at[:, pl.ds(kt_i * bk, bk)],
+                              sems_w.at[kt_i]).start()
+    w_waited = [False] * num_kt
+
+    # a-chunk prefetch pipeline: chunk order = the program's compute order.
+    compute_chunks = []  # (kind, l) in program order
+    for op in prog:
+        if op[0] in ("compute_tw", "compute_own"):
+            compute_chunks.append(op)
+
+    def chunk_rows(op):
+        kind, l = op
+        q = my_chip ^ l
+        return q * 2 + (1 - bit) if kind == "compute_tw" else q * 2 + bit
+
+    def a_load(i):
+        return pltpu.make_async_copy(
+            a_hbm.at[pl.ds(chunk_rows(compute_chunks[i]) * m_per, m_per), :],
+            a_vmem.at[i % 2], sem_a)
+
+    a_load(0).start()
+    compute_i = [0]  # python cell: index of the compute op being emitted
+
+    def emit_compute(dst_ref, dst_is_acc, l):
+        """dot a[chunk] @ w into dst (k-tiled); prefetch the next a chunk.
+
+        The first chunk's tile loop is Python-unrolled so each w tile is
+        waited exactly once, at first use; every later chunk uses a traced
+        pl.loop so the fp32 dot values stay one-body-deep on the Mosaic
+        stack (all w tiles are waited after chunk 0)."""
+        i = compute_i[0]
+        a_load(i).wait()
+        if i + 1 < len(compute_chunks):
+            a_load(i + 1).start()
+        slot = i % 2
+
+        def tile_body(kt):
+            block = jnp.dot(a_vmem[slot], w_vmem[:, pl.ds(kt, bk)],
+                            preferred_element_type=jnp.float32)
+            if dst_is_acc:
+                dst_ref[slice(None), pl.ds(kt, bk)] = block
+            else:
+                dst_ref[l, slice(None), pl.ds(kt, bk)] = block.astype(
+                    run_vmem.dtype)
+
+        if not all(w_waited):
+            for kt_i in range(num_kt):
+                if not w_waited[kt_i]:
+                    pltpu.make_async_copy(w_hbm.at[:, pl.ds(kt_i * bk, bk)],
+                                          w_vmem.at[:, pl.ds(kt_i * bk, bk)],
+                                          sems_w.at[kt_i]).wait()
+                    w_waited[kt_i] = True
+                tile_body(kt_i * bk)
+        else:
+
+            @pl.loop(0, num_kt)
+            def _tiles(t):
+                tile_body(t * bk)
+
+        compute_i[0] += 1
+
+    def twin_op(l):
+        return pltpu.make_async_remote_copy(
+            src_ref=run_vmem.at[l],
+            dst_ref=recv1_hbm.at[l],
+            send_sem=sems1.at[l],
+            recv_sem=sems1.at[l],
+            device_id=twin,
+            device_id_type=pl.DeviceIdType.LOGICAL,
+        )
+
+    def p2_op(key):
+        s, b, op_i = key
+        dim = (b + s) % num_dims
+        partner = (my_chip ^ (1 << dim)) * 2 + bit
+        start, width = band_bounds[b]
+        slot = sched["slot"][key]
+        return pltpu.make_async_remote_copy(
+            src_ref=run_vmem.at[sched["sends"][key],
+                                slice(None),
+                                pl.ds(start, width)],
+            dst_ref=recv2_hbm.at[slot, slice(None), pl.ds(0, width)],
+            send_sem=sems2.at[slot],
+            recv_sem=sems2.at[slot],
+            device_id=partner,
+            device_id_type=pl.DeviceIdType.LOGICAL,
+        )
+
+    # ablate (instrumentation only, timing-ladder attribution; results are
+    # WRONG for ablate != 3): 1 = computes only, 2 = + twin exchange,
+    # 4 = full minus the p2 merge arithmetic (waits still consume their
+    # symmetric signals), 3 = full. Ops are skipped identically on every
+    # device (no deadlock).
+    skip = {
+        1: ("twin_start", "twin_wait", "twin_merge", "p2_start", "p2_wait",
+            "p2_merge"),
+        2: ("p2_start", "p2_wait", "p2_merge"),
+        4: ("p2_merge", ),
+        3: (),
+    }[ablate]
+
+    for op in prog:
+        kind = op[0]
+        if kind in skip:
+            continue
+        if kind == "compute_tw":
+            with jax.named_scope(f"p1_tw_l{op[1]}"):
+                emit_compute(run_vmem, False, op[1])
+        elif kind == "twin_start":
+            twin_op(op[1]).start()
+        elif kind == "compute_own":
+            with jax.named_scope(f"p1_own_l{op[1]}"):
+                emit_compute(acc_vmem, True, op[1])
+        elif kind == "twin_wait":
+            with jax.named_scope(f"p1_wait_l{op[1]}"):
+                twin_op(op[1]).wait()
+        elif kind == "twin_merge":
+            l = op[1]
+            with jax.named_scope(f"p1_merge_l{l}"):
+                # Pipelined loads: tile kt+1's HBM->VMEM copy flies while
+                # tile kt merges (the serial start;wait form exposed the DMA
+                # latency ~16x per call).
+                def tw_load(kt_i, tile):
+                    return pltpu.make_async_copy(
+                        recv1_hbm.at[l, slice(None), pl.ds(kt_i * bk, bk)],
+                        recv_vmem.at[tile, slice(None), pl.ds(0, bk)],
+                        sem_recv.at[tile])
+
+                tw_load(0, 0).start()
+                for kt_i in range(num_kt):
+                    tile = kt_i % 2
+                    if kt_i + 1 < num_kt:
+                        tw_load(kt_i + 1, (kt_i + 1) % 2).start()
+                    tw_load(kt_i, tile).wait()
+                    kt = kt_i * bk
+                    merged = (acc_vmem[:, pl.ds(kt, bk)] +
+                              recv_vmem[tile, :, pl.ds(0, bk)].astype(
+                                  jnp.float32))
+                    run_vmem[l, slice(None), pl.ds(kt, bk)] = merged.astype(
+                        run_vmem.dtype)
+        elif kind == "p2_start":
+            s, b, op_i = op[1]
+            with jax.named_scope(f"p2_s{s}b{b}k{op_i}_send"):
+                p2_op(op[1]).start()
+        elif kind == "p2_wait":
+            s, b, op_i = op[1]
+            with jax.named_scope(f"p2_s{s}b{b}k{op_i}_wait"):
+                p2_op(op[1]).wait()
+        elif kind == "p2_merge":
+            key = op[1]
+            s, b, op_i = key
+            start, width = band_bounds[b]
+            target = sched["merges"][key]
+            slot = sched["slot"][key]
+            subtiles = [(st, min(bk, width - st))
+                        for st in range(0, width, bk)]
+            with jax.named_scope(f"p2_s{s}b{b}k{op_i}_merge"):
+
+                def p2_load(idx, tile):
+                    st, sw = subtiles[idx]
+                    return pltpu.make_async_copy(
+                        recv2_hbm.at[slot, slice(None), pl.ds(st, sw)],
+                        recv_vmem.at[tile, slice(None), pl.ds(0, sw)],
+                        sem_recv.at[tile])
+
+                p2_load(0, 0).start()
+                for idx, (st, sw) in enumerate(subtiles):
+                    tile = idx % 2
+                    if idx + 1 < len(subtiles):
+                        p2_load(idx + 1, (idx + 1) % 2).start()
+                    p2_load(idx, tile).wait()
+                    merged = (
+                        run_vmem[target, :, pl.ds(start + st, sw)].astype(
+                            jnp.float32) +
+                        recv_vmem[tile, :, pl.ds(0, sw)].astype(jnp.float32))
+                    run_vmem[target, slice(None),
+                             pl.ds(start + st, sw)] = merged.astype(
+                                 run_vmem.dtype)
+        elif kind == "out":
+            with jax.named_scope("out"):
+                o_copy = pltpu.make_async_copy(run_vmem.at[0], out_hbm,
+                                               sem_out)
+                o_copy.start()
+                o_copy.wait()
+
+
+def get_vmem_estimate_bytes(m_per, n_per, k, bk, num_chips, stage_w,
+                            itemsize):
+    return (n_per * k * itemsize            # w resident
+            + 2 * m_per * n_per * itemsize  # a double buffer
+            + num_chips * m_per * k * itemsize  # run slots
+            + m_per * k * 4                 # fp32 acc
+            + 2 * m_per * stage_w * itemsize  # staging tiles
+            + m_per * bk * 4)               # dot value
+
+
+def allport_matmul_reduce_scatter(
+    a,
+    w,
+    mesh,
+    axis_name,
+    collective_id: int = _COLLECTIVE_ID,
+    ablate: int = 3,
+):
+    """reduce_scatter(a @ w, axis=0), all-port pipelined hierarchical kernel.
+
+    a: [M, n_per] P(None, axis), w: [n_per, K] P(axis, None) ->
+    out [M // tp, K] P(axis, None). Mesh from
+    topology.make_collective_mesh('hier').
+    """
+    tp_size = mesh.shape[axis_name]
+    validate_inputs(a, w, tp_size)
+    num_chips = tp_size // 2
+    num_dims = int(math.log2(num_chips)) if num_chips > 1 else 0
+    if num_dims == 0:
+        raise ValueError("allport kernel needs >= 2 chips")
+    m = a.shape[0]
+    k = w.shape[1]
+    m_per = m // tp_size
+    bk = next(c for c in (2048, 1024, 512, 256, 128) if k % c == 0)
+    band_bounds = _band_bounds(k, num_dims)
+    band_w = max(w_ for _, w_ in band_bounds)
+    sched, prog = topology.allport_program(num_dims)
+
+    def per_device(a_local, w_local):
+        n_per = a_local.shape[1]
+        grid_spec = pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=0,
+            in_specs=[
+                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
+                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
+            ],
+            out_specs=(
+                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
+                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
+                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
+            ),
+            scratch_shapes=(
+                pltpu.VMEM(w_local.shape, w_local.dtype),
+                pltpu.VMEM((2, m_per, n_per), a_local.dtype),
+                pltpu.VMEM((num_chips, m_per, k), a_local.dtype),
+                pltpu.VMEM((m_per, k), jnp.float32),
+                pltpu.VMEM((2, m_per, max(bk, band_w)), a_local.dtype),
+                pltpu.SemaphoreType.DMA,
+                pltpu.SemaphoreType.DMA((2, )),
+                pltpu.SemaphoreType.DMA,
+                pltpu.SemaphoreType.DMA((k // bk, )),
+                pltpu.SemaphoreType.DMA((num_chips, )),
+                pltpu.SemaphoreType.DMA((sched["n_slots"], )),
+            ),
+            grid=(1, ),
+        )
+        kernel = functools.partial(
+            _allport_kernel,
+            sched=sched,
+            prog=prog,
+            num_dims=num_dims,
+            m_per=m_per,
+            bk=bk,
+            band_bounds=band_bounds,
+            axis_name=axis_name,
+            ablate=ablate,
+        )
+        out, _, _ = pl.pallas_call(
+            kernel,
+            out_shape=(
+                jax.ShapeDtypeStruct((m_per, k), a_local.dtype),
+                jax.ShapeDtypeStruct((num_chips, m_per, k), a_local.dtype),
+                jax.ShapeDtypeStruct((sched["n_slots"], m_per, band_w),
+                                     a_local.dtype),
+            ),
+            grid_spec=grid_spec,
+            compiler_params=pltpu.CompilerParams(
+                collective_id=collective_id,
+                vmem_limit_bytes=get_vmem_estimate_bytes(
+                    m_per, a_local.shape[1], k, bk, num_chips,
+                    max(bk, band_w), a_local.dtype.itemsize) +
+                8 * 1024 * 1024,
+            ),
+            name=f"allport_matmul_reduce_scatter_d{num_dims}",
+        )(a_local, w_local)
+        return out
+
+    return jax.shard_map(
+        per_device,
+        mesh=mesh,
+        in_specs=(jax.sharding.PartitionSpec(None, axis_name),
+                  jax.sharding.PartitionSpec(axis_name, None)),
+        out_specs=jax.sharding.PartitionSpec(axis_name, None),
+        check_vma=False,
+    )(a, w)

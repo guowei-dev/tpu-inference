@@ -141,7 +141,9 @@ class SelectPathTest(jtu.JaxTestCase):
     def test_measured_thresholds_tp8(self):
         for pattern in ('ag_mm', 'mm_rs'):
             self.assertEqual(topology.select_path(pattern, 512, 8), 'xla')
-            self.assertEqual(topology.select_path(pattern, 1024, 8), 'ring')
+        self.assertEqual(topology.select_path('ag_mm', 1024, 8), 'ring')
+        self.assertEqual(topology.select_path('mm_rs', 1024, 8), 'allport')
+        self.assertEqual(topology.select_path('mm_rs', 2048, 8), 'ring')
 
     def test_rejects_unknown_pattern(self):
         with self.assertRaises(ValueError):
