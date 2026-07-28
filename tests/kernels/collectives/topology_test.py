@@ -136,6 +136,18 @@ class HierOrderTest(jtu.JaxTestCase):
         topology.assert_xor_partners_adjacent(grid((1, 1, 1)))
 
 
+class SelectPathTest(jtu.JaxTestCase):
+
+    def test_measured_thresholds_tp8(self):
+        for pattern in ('ag_mm', 'mm_rs'):
+            self.assertEqual(topology.select_path(pattern, 512, 8), 'xla')
+            self.assertEqual(topology.select_path(pattern, 1024, 8), 'ring')
+
+    def test_rejects_unknown_pattern(self):
+        with self.assertRaises(ValueError):
+            topology.select_path('nope', 1024, 8)
+
+
 class DeriveTopologyTest(jtu.JaxTestCase):
 
     def test_shapes(self):

@@ -175,6 +175,25 @@ def hier_device_order(devices):
 # ---------------------------------------------------------------------------
 
 
+def select_path(pattern, m, tp_size):
+    """Measured per-M dispatch for the collective-matmul patterns.
+
+    Thresholds from the v7x-8 (2x2x1, 8-device) same-process lat-basis study:
+    XLA's serve-flag serial lowering wins at M <= 512 for both patterns; the
+    single-hop-ring fused kernels win at M >= 1024 (AG 1.25x / RS 1.33x at
+    M=8192); the hierarchical kernels never win on the 2-dim slice (their
+    phase-boundary exposure outweighs the shorter round count) — they are the
+    expected candidates on 3-dim (2x2x2) slices, unmeasured there. The ring
+    MM-RS cannot compile M = tp_size * 16 (Mosaic E2003), where XLA wins
+    anyway.
+
+    pattern: 'ag_mm' | 'mm_rs'; m = GLOBAL row count. Returns 'xla' | 'ring'.
+    """
+    if pattern not in ("ag_mm", "mm_rs"):
+        raise ValueError(f"unknown pattern {pattern!r} (ag_mm|mm_rs)")
+    return "xla" if m <= 64 * tp_size else "ring"
+
+
 def make_collective_mesh(kind="ring", *, devices=None, axis_name=AXIS):
     """1-D Auto-axis mesh over the derived device order.
 
