@@ -45,3 +45,41 @@ def local_barrier(left_neighbor, right_neighbor, double_barrier=True):
                     device_id_type=pl.DeviceIdType.MESH,
                 )
             pl.semaphore_wait(second_barrier, 2)
+
+
+def local_barrier_logical(partner_ids, double_barrier=True):
+    """Barrier with an arbitrary partner set, addressed by LOGICAL device id.
+
+  The hierarchical kernels rendezvous with {twin} | {hypercube partners}, not
+  a (left, right) pair, and address peers by flat logical id — so this is the
+  LOGICAL-addressed generalization of local_barrier, with the same
+  double-barrier protection against a partner re-entering the kernel on a
+  subsequent call and double-incrementing the barrier semaphore.
+
+  Args:
+    partner_ids: Logical device ids to rendezvous with (each partner must
+      list this device symmetrically).
+    double_barrier: Whether to perform a second barrier.
+  """
+    partners = list(partner_ids)
+    barrier_sem = pltpu.get_barrier_semaphore()
+    for partner in partners:
+        pl.semaphore_signal(
+            barrier_sem,
+            inc=1,
+            device_id=partner,
+            device_id_type=pl.DeviceIdType.LOGICAL,
+        )
+    pl.semaphore_wait(barrier_sem, len(partners))
+    if double_barrier:
+        @functools.partial(pl.run_scoped,
+                           second_barrier=pltpu.SemaphoreType.REGULAR)
+        def _(second_barrier):
+            for partner in partners:
+                pl.semaphore_signal(
+                    second_barrier,
+                    inc=1,
+                    device_id=partner,
+                    device_id_type=pl.DeviceIdType.LOGICAL,
+                )
+            pl.semaphore_wait(second_barrier, len(partners))

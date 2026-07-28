@@ -256,6 +256,26 @@ def make_optimized_mesh(axis_shapes: Sequence[int],
     if _is_1D(axis_shapes):
         dev_kind = devices[0].device_kind
         device_num = len(devices)
+        if dev_kind in ("TPU7x", "TPU7"):
+            # Single-hop Hamiltonian chip cycle derived from the live coords
+            # (and asserted, never assumed). XLA's collective-permute ring and
+            # the fused collective kernels both walk the mesh's device order,
+            # and on a 2x2 slice the coord-sorted order closes the ring with
+            # two 2-hop diagonal edges that tax every ring step.
+            from tpu_inference.kernels.collectives import topology
+            try:
+                ring = topology.ring_device_order(devices)
+            except ValueError:
+                ring = None  # not an extent<=2 full grid; jax.make_mesh decides
+            if ring is not None:
+                ordered_devices = np.array([devices[i] for i in ring
+                                            ]).reshape(axis_shapes)
+                mesh = mesh_lib.Mesh(ordered_devices,
+                                     axis_names,
+                                     axis_types=(mesh_lib.AxisType.Auto, ) *
+                                     len(axis_shapes))
+                logger.info("Use customized mesh: %s", mesh)
+                return mesh
         if dev_kind == "TPU v6 lite":
             ordered_devices = None
             # NOTE(chengjiyao):

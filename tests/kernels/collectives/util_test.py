@@ -54,6 +54,19 @@ class CollectivesDeprecatedApiTest(jtu.JaxTestCase):
             # eval_shape traces the kernel body and stops there -- no device needed.
             jax.eval_shape(f)
 
+    def test_local_barrier_logical_traces_clean(self):
+
+        def kernel(o_ref):
+            util.local_barrier_logical([1, 4, 5], double_barrier=True)
+            o_ref[...] = jnp.zeros_like(o_ref)
+
+        f = pl.pallas_call(kernel,
+                           out_shape=jax.ShapeDtypeStruct((8, 128),
+                                                          jnp.float32))
+        with warnings.catch_warnings():
+            warnings.simplefilter('error', DeprecationWarning)
+            jax.eval_shape(f)
+
     def test_collectives_package_free_of_deprecated_pltpu_spellings(self):
         # The trace above only reaches the code local_barrier executes; the rest of the package is
         # covered statically, which is also how the sites this test was written for were missed.
