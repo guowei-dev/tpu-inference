@@ -292,6 +292,133 @@ def allport_program(num_dims):
     return sched, prog
 
 
+def allport_ag_schedule(num_dims):
+    """Relative-label dissemination ladder for the all-port AG schedule.
+
+    The rotation mirror of allport_schedule: instead of merging regions toward
+    relative label 0, each core disseminates its own chunk (relative label 0)
+    through its parity plane until every core holds all 2**num_dims chip
+    labels; the other-parity half rides the twin D2D link, each chunk copied
+    over as soon as all its bands are in. Row-band b trades dim
+    (b + s) % num_dims at round s; entering round s band b has covered the
+    label subcube spanned by its first s rotation dims. Unlike the RS ladder
+    there is no unlock chain: a round-0 send carries the core's own chunk and
+    has NO prerequisite, and every later send has exactly ONE — the wait that
+    delivered its label's band.
+
+    All in RELATIVE chip labels l = q XOR my_chip. A send forwards MY copy of
+    band b of label l along dim (b+s)%D; the partner's symmetric send lands as
+    MY label l | (1 << dim). The gather buffer is addressed by GLOBAL chunk
+    id, which is label-invariant across devices, so src slot == dst slot on
+    both ends of every copy.
+
+    Returns a dict:
+      sends:        {(s, b, l): dim} — round-s forward of band b's held
+                    label l along dim (l's dim bit is 0)
+      arrivals:     {(s, b, l): l | (1 << dim)} — the label whose band b MY
+                    wait on that cell delivers
+      send_prereqs: {(s, b, l): None | (r, b, l_src)} — the single earlier
+                    cell whose wait must precede this send (None: l == 0)
+      arrive_key:   {(b, l): (s, b, l_src)} — the cell delivering band b of
+                    label l (l != 0)
+      slot:         {(s, b, l): static sem-cell index}   n_slots
+    """
+    d = num_dims
+    sched = dict(num_dims=d, sends={}, arrivals={}, send_prereqs={},
+                 arrive_key={}, slot={})
+    total = 0
+    for s in range(d):
+        for b in range(d):
+            delta = [(b + r) % d for r in range(d)]
+            held = [l for l in range(2**d)
+                    if all((l >> dim) & 1 == 0 for dim in delta[s:])]
+            for l in held:
+                dim = delta[s]
+                key = (s, b, l)
+                sched["sends"][key] = dim
+                sched["arrivals"][key] = l | (1 << dim)
+                sched["arrive_key"][(b, l | (1 << dim))] = key
+                sched["send_prereqs"][key] = (None if l == 0 else
+                                              sched["arrive_key"][(b, l)])
+                sched["slot"][key] = total
+                total += 1
+    sched["n_slots"] = max(total, 1)
+    return sched
+
+
+def allport_ag_program(num_dims):
+    """The all-port AG kernel's static emission order (one program, all
+    devices).
+
+    Abstract ops over the allport_ag_schedule ladder: ('seed',) ('send', key)
+    ('wait', key) ('dot', (parity, band, l)) ('twin_start', l)
+    ('twin_wait', l) with key = (round, band, label); parity 0 = own plane,
+    1 = the twin's plane.
+
+    Construction: a round opens with ALL of its sends, both bands (the held
+    set is re-forwarded every round — a round-s send's single prerequisite is
+    a round-<s wait, so every one is startable at the boundary; wire before
+    compute), then walks the round's waits with the delivered bands' dots
+    filling the wire time. The round-0 sends carry the core's own chunk and
+    go out before any compute — the ladder pipelines from t=0, the structural
+    edge over the RS ladder's twin-merge unlock. A completed chunk is copied
+    to the twin right at its completing wait; twin_wait(0) (+ its dots) is
+    hoisted right after round 0 as stall fill, the rest of the twin plane
+    drains last. Deadlock-freedom rests on this being ONE static sequence for
+    every device — see allport_schedule and the RS kernel docstring; the CPU
+    simulator in allport_ag_schedule_test.py re-checks every edit.
+    """
+    d = num_dims
+    sched = allport_ag_schedule(d)
+    if d == 0:  # single chip: twin-only, one band
+        prog = [("seed", ), ("twin_start", 0), ("dot", (0, 0, 0)),
+                ("twin_wait", 0), ("dot", (1, 0, 0))]
+        return sched, prog
+
+    def held(s, b):
+        delta = [(b + r) % d for r in range(d)]
+        return [l for l in range(2**d)
+                if all((l >> dim) & 1 == 0 for dim in delta[s:])]
+
+    prog = [("seed", )]
+    arrived_bands = {}
+    twin_started, twin_waited = set(), set()
+    for s in range(d):
+        for b in range(d):
+            for l in held(s, b):
+                prog.append(("send", (s, b, l)))
+        if s == 0:
+            prog.append(("twin_start", 0))
+            twin_started.add(0)
+            for b in range(d):
+                prog.append(("dot", (0, b, 0)))
+        for b in range(d):
+            for l in held(s, b):
+                key = (s, b, l)
+                prog.append(("wait", key))
+                arr = sched["arrivals"][key]
+                bands = arrived_bands.setdefault(arr, set())
+                bands.add(b)
+                if len(bands) == d and arr not in twin_started:
+                    prog.append(("twin_start", arr))
+                    twin_started.add(arr)
+                prog.append(("dot", (0, b, arr)))
+        if s == 0:
+            prog.append(("twin_wait", 0))
+            twin_waited.add(0)
+            for b in range(d):
+                prog.append(("dot", (1, b, 0)))
+    assert twin_started == set(range(2**d)), (
+        "allport_ag_program: dissemination did not complete every label")
+    for l in range(2**d):
+        if l in twin_waited:
+            continue
+        prog.append(("twin_wait", l))
+        for b in range(d):
+            prog.append(("dot", (1, b, l)))
+    return sched, prog
+
+
 def select_path(pattern, m, tp_size):
     """Measured per-M dispatch for the collective-matmul patterns.
 
