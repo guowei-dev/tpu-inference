@@ -431,9 +431,13 @@ def select_path(pattern, m, tp_size):
     kernels sit on their shared-chip-ICI-port wire walls (allport 3P/port
     but round-0 sends unlock only after their twin merges; ring 3.5P/port
     pipelined from t=0) and the ring's head start wins. AG-MM: ring from
-    M >= 1024 (1.25x vs best XLA at 8192). The bulk-synchronous hier
+    M >= 1024 (1.25x vs best XLA at 8192); the all-port AG kernel
+    (allport_all_gather_matmul) LOSES to ring at every M on 2 dims
+    (1.20-1.87x ABBA-certified: AG's MXU must wait on arrivals, and the
+    2-round ladder cannot hide the y stream + staging that the ring's 7-hop
+    grid pipeline does) — never dispatched here. The bulk-synchronous hier
     kernels never win here; the >= 3-dim (2x2x2) slice, where all-port has
-    a ~1.6x per-port wire advantage, is unmeasured.
+    a ~1.6x per-port wire advantage, is unmeasured for both patterns.
 
     pattern: 'ag_mm' | 'mm_rs'; m = GLOBAL row count.
     Returns 'xla' | 'allport' | 'ring'.
