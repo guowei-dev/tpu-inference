@@ -17,6 +17,7 @@ XOR partner is one coordinate step (mesh adjacency == torus adjacency; OCS
 wraparound only exists on a full 4x4x4 cube).
 """
 import dataclasses
+import math
 
 import jax
 import numpy as np
@@ -305,14 +306,27 @@ def select_path(pattern, m, tp_size):
     but round-0 sends unlock only after their twin merges; ring 3.5P/port
     pipelined from t=0) and the ring's head start wins. AG-MM: ring from
     M >= 1024 (1.25x vs best XLA at 8192). The bulk-synchronous hier
-    kernels never win here; the >= 3-dim (2x2x2) slice, where all-port has
-    a ~1.6x per-port wire advantage, is unmeasured.
+    kernels never win here.
+
+    On the >= 3-dim (2x2x2, 16-device) slice the measured verdict flips:
+    with the one-weight-sweep small-M compute and the HBM-residency large-M
+    form, all-port MM-RS leads EVERY measured M (tpu7x-16 lat basis, ABBA/
+    matrix 2026-07-29: 61.6/78.1/129.9/173.3/320.9/601.8 us @M=256..8192 vs
+    best-XLA 71.8/88.1/140.6/320.4/491.2/1024.9 and ring 166.6/208.5/220.0/
+    366.9/716.8) — dispatch is all-port across the measured band, ring only
+    beyond it. Below M = 16*tp the kernel is unmeasured; XLA keeps the tail.
 
     pattern: 'ag_mm' | 'mm_rs'; m = GLOBAL row count.
     Returns 'xla' | 'allport' | 'ring'.
     """
     if pattern not in ("ag_mm", "mm_rs"):
         raise ValueError(f"unknown pattern {pattern!r} (ag_mm|mm_rs)")
+    num_chips = tp_size // 2
+    num_dims = int(math.log2(num_chips)) if num_chips > 1 else 0
+    if pattern == "mm_rs" and num_dims >= 3:
+        if m < 16 * tp_size:
+            return "xla"
+        return "allport" if m <= 512 * tp_size else "ring"
     if m <= 64 * tp_size:
         return "xla"
     if pattern == "mm_rs" and m <= 128 * tp_size:

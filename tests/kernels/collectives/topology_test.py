@@ -144,6 +144,13 @@ class SelectPathTest(jtu.JaxTestCase):
         self.assertEqual(topology.select_path('ag_mm', 1024, 8), 'ring')
         self.assertEqual(topology.select_path('mm_rs', 1024, 8), 'allport')
         self.assertEqual(topology.select_path('mm_rs', 2048, 8), 'ring')
+        # 2x2x2 (16-device) measured verdict: all-port leads every measured M
+        self.assertEqual(topology.select_path('mm_rs', 128, 16), 'xla')
+        self.assertEqual(topology.select_path('mm_rs', 256, 16), 'allport')
+        self.assertEqual(topology.select_path('mm_rs', 2048, 16), 'allport')
+        self.assertEqual(topology.select_path('mm_rs', 8192, 16), 'allport')
+        self.assertEqual(topology.select_path('mm_rs', 16384, 16), 'ring')
+        self.assertEqual(topology.select_path('ag_mm', 2048, 16), 'ring')
 
     def test_rejects_unknown_pattern(self):
         with self.assertRaises(ValueError):
