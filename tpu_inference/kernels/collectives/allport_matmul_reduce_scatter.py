@@ -70,6 +70,7 @@ def _allport_kernel(
     run_vmem,
     acc_vmem,
     recv_vmem,
+    prod_vmem,
     sem_a,
     sem_recv,
     sem_out,
@@ -82,6 +83,9 @@ def _allport_kernel(
     num_dims,
     m_per,
     bk,
+    bk_merge,
+    whole_a,
+    use_prod,
     band_bounds,
     axis_name,
     ablate,
@@ -121,7 +125,43 @@ def _allport_kernel(
             a_hbm.at[pl.ds(chunk_rows(compute_chunks[i]) * m_per, m_per), :],
             a_vmem.at[i % 2], sem_a)
 
-    a_load(0).start()
+    # whole_a (small M): ONE load of the full local a, and ONE weight sweep —
+    # per w tile a single [M, bk] dot whose rows are then scattered into the
+    # run/acc slots. The v3 per-chunk form re-sweeps all of w through the MXU
+    # 2*num_chips times; at m_per <= 64 that re-sweep IS the floor (measured
+    # 82.6 us "compute" vs 11.4 us for the same FLOPs as one matmul @M=256).
+    if whole_a:
+        a_all = pltpu.make_async_copy(a_hbm, a_vmem, sem_a)
+        a_all.start()
+        a_all.wait()
+        for kt_i in range(num_kt):
+            pltpu.make_async_copy(w_hbm.at[:, pl.ds(kt_i * bk, bk)],
+                                  w_vmem.at[:, pl.ds(kt_i * bk, bk)],
+                                  sems_w.at[kt_i]).wait()
+            w_waited[kt_i] = True
+            kt = kt_i * bk
+            if use_prod:
+                prod_vmem[:, :] = jnp.dot(a_vmem[:],
+                                          w_vmem[:, pl.ds(kt, bk)],
+                                          preferred_element_type=jnp.float32)
+            for c_op in compute_chunks:
+                kind_c, l_c = c_op
+                rows = chunk_rows(c_op) * m_per
+                if use_prod:
+                    sl = prod_vmem[pl.ds(rows, m_per), :]
+                else:  # tile-major per-chunk dot, w tile stationary
+                    sl = jnp.dot(a_vmem[pl.ds(rows, m_per)],
+                                 w_vmem[:, pl.ds(kt, bk)],
+                                 preferred_element_type=jnp.float32)
+                if kind_c == "compute_tw":
+                    run_vmem[l_c, slice(None), pl.ds(kt, bk)] = sl.astype(
+                        run_vmem.dtype)
+                else:  # compute_own -> per-label acc slot (bf16, one extra
+                    #      rounding of the own addend; gated by the err check)
+                    acc_vmem[l_c, slice(None), pl.ds(kt, bk)] = sl.astype(
+                        acc_vmem.dtype)
+    else:
+        a_load(0).start()
     compute_i = [0]  # python cell: index of the compute op being emitted
 
     def emit_compute(dst_ref, dst_is_acc, l):
@@ -207,13 +247,15 @@ def _allport_kernel(
         if kind in skip:
             continue
         if kind == "compute_tw":
-            with jax.named_scope(f"p1_tw_l{op[1]}"):
-                emit_compute(run_vmem, False, op[1])
+            if not whole_a:
+                with jax.named_scope(f"p1_tw_l{op[1]}"):
+                    emit_compute(run_vmem, False, op[1])
         elif kind == "twin_start":
             twin_op(op[1]).start()
         elif kind == "compute_own":
-            with jax.named_scope(f"p1_own_l{op[1]}"):
-                emit_compute(acc_vmem, True, op[1])
+            if not whole_a:
+                with jax.named_scope(f"p1_own_l{op[1]}"):
+                    emit_compute(acc_vmem, True, op[1])
         elif kind == "twin_wait":
             with jax.named_scope(f"p1_wait_l{op[1]}"):
                 twin_op(op[1]).wait()
@@ -223,24 +265,30 @@ def _allport_kernel(
                 # Pipelined loads: tile kt+1's HBM->VMEM copy flies while
                 # tile kt merges (the serial start;wait form exposed the DMA
                 # latency ~16x per call).
+                nkt_m = k // bk_merge
+
                 def tw_load(kt_i, tile):
                     return pltpu.make_async_copy(
-                        recv1_hbm.at[l, slice(None), pl.ds(kt_i * bk, bk)],
-                        recv_vmem.at[tile, slice(None), pl.ds(0, bk)],
+                        recv1_hbm.at[l, slice(None),
+                                     pl.ds(kt_i * bk_merge, bk_merge)],
+                        recv_vmem.at[tile, slice(None), pl.ds(0, bk_merge)],
                         sem_recv.at[tile])
 
                 tw_load(0, 0).start()
-                for kt_i in range(num_kt):
+                for kt_i in range(nkt_m):
                     tile = kt_i % 2
-                    if kt_i + 1 < num_kt:
+                    if kt_i + 1 < nkt_m:
                         tw_load(kt_i + 1, (kt_i + 1) % 2).start()
                     tw_load(kt_i, tile).wait()
-                    kt = kt_i * bk
-                    merged = (acc_vmem[:, pl.ds(kt, bk)] +
-                              recv_vmem[tile, :, pl.ds(0, bk)].astype(
+                    kt = kt_i * bk_merge
+                    own = (acc_vmem[l, slice(None), pl.ds(kt, bk_merge)]
+                           if whole_a else acc_vmem[:, pl.ds(kt, bk_merge)])
+                    merged = (own.astype(jnp.float32) +
+                              recv_vmem[tile, :, pl.ds(0, bk_merge)].astype(
                                   jnp.float32))
-                    run_vmem[l, slice(None), pl.ds(kt, bk)] = merged.astype(
-                        run_vmem.dtype)
+                    run_vmem[l, slice(None),
+                             pl.ds(kt, bk_merge)] = merged.astype(
+                                 run_vmem.dtype)
         elif kind == "p2_start":
             s, b, op_i = op[1]
             with jax.named_scope(f"p2_s{s}b{b}k{op_i}_send"):
@@ -255,8 +303,8 @@ def _allport_kernel(
             start, width = band_bounds[b]
             target = sched["merges"][key]
             slot = sched["slot"][key]
-            subtiles = [(st, min(bk, width - st))
-                        for st in range(0, width, bk)]
+            subtiles = [(st, min(bk_merge, width - st))
+                        for st in range(0, width, bk_merge)]
             with jax.named_scope(f"p2_s{s}b{b}k{op_i}_merge"):
 
                 def p2_load(idx, tile):
@@ -313,6 +361,9 @@ def _allport_kernel_hbm(
     num_dims,
     m_per,
     bk,
+    bk_merge,
+    whole_a,
+    use_prod,
     band_bounds,
     axis_name,
     ablate,
@@ -322,6 +373,7 @@ def _allport_kernel_hbm(
     staging + 2-slot RMW loads). Slot 0 is ALIASED to out_hbm so the trailing
     'out' copy drops. All added DMA starts/waits are unconditional with static
     slot ids — the deadlock rule is preserved."""
+    del bk_merge, whole_a, use_prod  # large-M path: chunked a, bk-tiled
     k = w_vmem.shape[1]
     num_kt = k // bk
     my_id = lax.axis_index(axis_name)
@@ -618,6 +670,28 @@ def allport_matmul_reduce_scatter(
                   8 * 1024 * 1024 <= _VMEM_CAP_BYTES)
     else:
         bk = bk_v
+    # Small M (VMEM path): one weight sweep + whole-a residency + full-width
+    # merges — the floor is MXU weight re-sweeps and DMA-op latency, not
+    # bytes (measured @256: "compute" 82.6 us vs 11.4 us of matmul).
+    whole_a = (not use_hbm) and m_per <= 64
+    bk_merge = k if whole_a else bk
+    use_prod = False
+    if whole_a:
+        # One-sweep variant A (prod): a single [m, bk] dot per w tile, rows
+        # then scattered. Stack cost ≈ a value + w tile + prod value, plus
+        # the prod scratch — shrink bk until it fits; if nothing fits, fall
+        # back to variant B (tile-major per-chunk dots against a stationary
+        # w tile — no prod buffer, weights stay loaded across chunks).
+        isz = a.dtype.itemsize
+        fixed = (n_per_est * k * isz + m * n_per_est * isz +
+                 2 * num_chips * m_per * k * isz + 2 * m_per * k * isz)
+        for c in (2048, 1024, 512, 256, 128):
+            if k % c == 0 and (fixed + 2 * m * c * 4 + m * n_per_est * isz +
+                               n_per_est * c * isz + 4 * 1024 * 1024
+                               <= _VMEM_CAP_BYTES):
+                bk = c
+                use_prod = True
+                break
 
     def per_device(a_local, w_local):
         n_per = a_local.shape[1]
@@ -652,12 +726,21 @@ def allport_matmul_reduce_scatter(
                                             a_local.dtype.itemsize) +
                 8 * 1024 * 1024, _VMEM_CAP_BYTES)
         else:
+            a_shape = ((m, n_per) if whole_a else (2, m_per, n_per))
+            # whole_a: per-label own slots (wire dtype, one extra rounding);
+            # chunked: one fp32 accumulator reused per pair.
+            acc_spec = (pltpu.VMEM((num_chips, m_per, k), a_local.dtype)
+                        if whole_a else pltpu.VMEM((m_per, k), jnp.float32))
+            recv_w = max(bk_merge, band_w)
+            prod_shape = ((m, bk) if whole_a and use_prod
+                          else (8, 128))  # dummy if unused
             scratch_shapes = (
                 pltpu.VMEM(w_local.shape, w_local.dtype),
-                pltpu.VMEM((2, m_per, n_per), a_local.dtype),
+                pltpu.VMEM(a_shape, a_local.dtype),
                 pltpu.VMEM((num_chips, m_per, k), a_local.dtype),
-                pltpu.VMEM((m_per, k), jnp.float32),
-                pltpu.VMEM((2, m_per, max(bk, band_w)), a_local.dtype),
+                acc_spec,
+                pltpu.VMEM((2, m_per, recv_w), a_local.dtype),
+                pltpu.VMEM(prod_shape, jnp.float32),
                 pltpu.SemaphoreType.DMA,
                 pltpu.SemaphoreType.DMA((2, )),
                 pltpu.SemaphoreType.DMA,
@@ -673,10 +756,11 @@ def allport_matmul_reduce_scatter(
             )
             out_specs = (hbm, hbm, hbm)
             kernel_fn = _allport_kernel
+            a_bytes = (m if whole_a else 2 * m_per) * n_per
             vmem_limit = min(
                 get_vmem_estimate_bytes(m_per, n_per, k, bk, num_chips,
-                                        max(bk, band_w),
-                                        a_local.dtype.itemsize) +
+                                        recv_w, a_local.dtype.itemsize) +
+                (a_bytes - 2 * m_per * n_per) * a_local.dtype.itemsize +
                 8 * 1024 * 1024, _VMEM_CAP_BYTES)
         grid_spec = pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=0,
@@ -692,6 +776,9 @@ def allport_matmul_reduce_scatter(
             num_dims=num_dims,
             m_per=m_per,
             bk=bk,
+            bk_merge=bk_merge,
+            whole_a=whole_a,
+            use_prod=use_prod,
             band_bounds=band_bounds,
             axis_name=axis_name,
             ablate=ablate,
