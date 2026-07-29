@@ -5,9 +5,11 @@ pipelining).
 The dissemination mirror of allport_matmul_reduce_scatter: row-band b of each
 core's x chunk trades dim (b+s) % D at round s (every ICI axis busy every
 round — a row band is a complete [rows, K] sub-chunk, so each arrival is
-dotted the moment it lands, with no reassembly), the whole held set forwarded
-every round, and each completed chunk copied to the twin over the D2D link as
-it completes. Unlike the RS ladder there is NO unlock gap: the round-0 sends
+dottable the moment it lands, with no reassembly), the whole held set
+forwarded every round, and each completed chunk copied to the twin over the
+D2D link as it completes. Bands >= 128 rows are dotted per band; thinner
+bands are folded into one full-chunk dot at the last band's arrival (the MXU
+runs 2.5x/10x below ideal at 64/32 rows — measured, probe_allport_ag_ablate). Unlike the RS ladder there is NO unlock gap: the round-0 sends
 carry the core's own chunk and go out before any compute, so the wire
 pipelines from t=0 exactly like the ring's. The emission order comes from
 topology.allport_ag_program; arrival dots run one step behind their loads (a
@@ -158,17 +160,15 @@ def _allport_ag_kernel(
     dot_i = [0]
 
     def x_load(spec, buf):
-        parity, b, l = spec
-        r0, rw = row_bands[b]
+        parity, l, r0, rw = spec
         return pltpu.make_async_copy(
             gather_hbm.at[chunk_of(l, parity), pl.ds(r0, rw), slice(None)],
             x_vmem.at[buf, pl.ds(0, rw), slice(None)], sem_x.at[buf])
 
     def flush_dot():
         spec, buf = pending.pop()
-        parity, b, l = spec
-        r0, rw = row_bands[b]
-        with jax.named_scope(f"dot_p{parity}b{b}l{l}"):
+        parity, l, r0, rw = spec
+        with jax.named_scope(f"dot_p{parity}l{l}r{r0}"):
             x_load(spec, buf).wait()
             if o_pending[buf] is not None:
                 o_pending[buf].wait()
@@ -230,6 +230,27 @@ def _allport_ag_kernel(
             return parity == 1
         return False
 
+    # Sub-128-row dots starve the MXU (measured 2.5x/10x off ideal at 64/32
+    # rows) — when the row bands are thinner than 128, fold a chunk's band
+    # dots into ONE full-chunk dot fired at the LAST band's program point
+    # (its data is complete there; the fold is local, the static send/wait
+    # sequence is untouched). Bands >= 128 rows keep per-band dots (smaller
+    # VMEM buffers, earlier starts).
+    chunk_dots = min(rw for _, rw in row_bands) < 128
+    nbands = max(num_dims, 1)
+    bands_seen = {}
+
+    def dot_specs(pspec):
+        parity, b, l = pspec
+        if not chunk_dots:
+            r0, rw = row_bands[b]
+            return [(parity, l, r0, rw)]
+        seen = bands_seen.setdefault((parity, l), set())
+        seen.add(b)
+        if len(seen) == nbands:
+            return [(parity, l, 0, m_per)]
+        return []
+
     for op in prog:
         kind = op[0]
         if kind in skip:
@@ -256,7 +277,8 @@ def _allport_ag_kernel(
                 twin_op(op[1]).wait()
         elif kind == "dot":
             if not skip_dot(op[1]):
-                push_dot(op[1])
+                for spec in dot_specs(op[1]):
+                    push_dot(spec)
     if pending:
         flush_dot()
     for buf in (0, 1):
@@ -264,11 +286,11 @@ def _allport_ag_kernel(
             o_pending[buf].wait()
 
 
-def get_vmem_estimate_bytes(m_per, k, n_per, band_max, bn, itemsize):
+def get_vmem_estimate_bytes(m_per, k, n_per, rows_dot, bn, itemsize):
     return (k * n_per * itemsize            # y resident
-            + 2 * band_max * k * itemsize   # x band double buffer
-            + 2 * band_max * n_per * itemsize  # o staging double buffer
-            + band_max * bn * 4)            # dot value
+            + 2 * rows_dot * k * itemsize   # x double buffer
+            + 2 * rows_dot * n_per * itemsize  # o staging double buffer
+            + rows_dot * bn * 4)            # dot value
 
 
 def allport_all_gather_matmul(
@@ -294,7 +316,9 @@ def allport_all_gather_matmul(
     n_per = y.shape[1] // tp_size
     bn = next(c for c in (2048, 1024, 512, 256, 128) if n_per % c == 0)
     row_bands = _row_bands(m_per, num_dims)
-    band_max = max(rw for _, rw in row_bands)
+    # dot buffers hold full chunks when the kernel folds thin band dots
+    rows_dot = m_per if min(rw for _, rw in row_bands) < 128 else max(
+        rw for _, rw in row_bands)
     sched, prog = topology.allport_ag_program(num_dims)
 
     def per_device(x_local, y_local):
@@ -311,8 +335,8 @@ def allport_all_gather_matmul(
             ),
             scratch_shapes=(
                 pltpu.VMEM(y_local.shape, y_local.dtype),
-                pltpu.VMEM((2, band_max, k), x_local.dtype),
-                pltpu.VMEM((2, band_max, y_local.shape[1]), x_local.dtype),
+                pltpu.VMEM((2, rows_dot, k), x_local.dtype),
+                pltpu.VMEM((2, rows_dot, y_local.shape[1]), x_local.dtype),
                 pltpu.SemaphoreType.DMA,
                 pltpu.SemaphoreType.DMA((2, )),
                 pltpu.SemaphoreType.DMA((2, )),
@@ -343,7 +367,7 @@ def allport_all_gather_matmul(
             compiler_params=pltpu.CompilerParams(
                 collective_id=collective_id,
                 vmem_limit_bytes=get_vmem_estimate_bytes(
-                    m_per, k, y_local.shape[1], band_max, bn,
+                    m_per, k, y_local.shape[1], rows_dot, bn,
                     x_local.dtype.itemsize) + 8 * 1024 * 1024,
             ),
             name=f"allport_all_gather_matmul_d{num_dims}",
