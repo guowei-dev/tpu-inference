@@ -315,7 +315,7 @@ class IndexMaps:
 
 
 def generate_block_specs(
-        metadata_ref: MetadataRef, cfgs: GmmConfigs
+        metadata_ref: MetadataRef, cfgs: GmmConfigs, rhs_buffer_count: int = 3
 ) -> Tuple[Tuple[pl.BlockSpec, WeightsRef], pl.BlockSpec]:
     """Generates block specs for the given lhs, rhs, and out refs."""
 
@@ -331,7 +331,7 @@ def generate_block_specs(
     rhs_weight_spec = pl.BlockSpec(
         (None, cfgs.tiles.tile_k, cfgs.tiles.tile_n),
         index_map.rhs_weight_index_map,
-        pipeline_mode=pl.Buffered(buffer_count=3),
+        pipeline_mode=pl.Buffered(buffer_count=rhs_buffer_count),
     )
     rhs_scale_block_spec = rhs_bias_block_spec = None
     if cfgs.rhs_cfgs.has_bias:
@@ -905,6 +905,267 @@ def kernel_main(
         zero_out_end(out_ref, semaphore_ref, zero_size, dims=cfgs.dims)
 
 
+def idx_window_len(tile_m: int) -> int:
+    # The idx-window copy must start 128-aligned while a tile's rows start at
+    # the sublane-aligned m_offset, so the window carries up to 112 rows of
+    # leading slack (delta) on top of tile_m.
+    return tile_m + 128
+
+
+def gathered_inner_kernel(
+    # In (pipelined)
+    tiled_rhs_ref: RhsRef,
+    # Out (pipelined)
+    tiled_out_ref: jax.Array,
+    # Scratch
+    partial_out_ref: jax.Array,
+    acc_ref: jax.Array,
+    metadata_ref: MetadataRef,
+    gather_buf: jax.Array,  # [2, tile_m, tile_k] int32 (bf16 pool) / lhs dtype
+    gather_sem: jax.Array,  # DMA[2]
+    idx_smem: jax.Array,  # SMEM int32[win_len] (single buffer)
+    idx_col_buf: jax.Array,  # VMEM [2, tile_m, 1] int32 (parity source)
+    win_sem: jax.Array,  # DMA[2]
+    *,
+    cfgs: GmmConfigs,
+    lhs_pool: jax.Array,  # closed over: [size_src(/packing), size_k] HBM
+    idx_hbm: jax.Array,  # closed over: int32[padded_m] HBM
+    idx_col_hbm: jax.Array,  # closed over: int32[padded_m, 1] HBM
+    packing: int,
+):
+    """Inner body for the FUSED-PERMUTE path (Bulk-Issue Row Streaming).
+
+    The LHS tile is gathered per-row from the un-permuted `lhs_pool` and handed
+    to the unchanged `inner_kernel` as a value; rhs/out stay pipelined. Row DMAs
+    for grid step s+1 are batch-issued at the top of step s (before this step's
+    extract + matmul) so the engine is fed during compute; index/parity windows
+    are prefetched one step further ahead and waited asynchronously. A bf16
+    pool is read through its int32 view (u32 row r = bf16 rows 2r|2r+1, even
+    row in the LOW 16 bits) at row idx>>1 and extracted on the VPU:
+    bitcast((v << sh) & 0xFFFF0000, f32).astype(bf16), sh = 16*(1-(idx&1)).
+    Rows are issued in 16-row chunks guarded on the tile's live row count, so
+    a sparsely-populated gm tile does not pay a full-tile gather.
+    """
+
+    tile_m = cfgs.tiles.tile_m
+    tile_k = cfgs.tiles.tile_k
+    sublane = cfgs.dims.size_lhs_sublane
+    win_len = idx_window_len(tile_m)
+
+    num_n = pl.num_programs(0)
+    num_gm = pl.num_programs(1)
+    num_k = pl.num_programs(2)
+    gm_id = pl.program_id(1)
+    s = (pl.program_id(0) * num_gm + gm_id) * num_k + pl.program_id(2)
+    num_steps = num_n * num_gm * num_k
+
+    def gm_of(st):
+        return lax.rem(st // num_k, num_gm)
+
+    def k_of(st):
+        return lax.rem(st, num_k)
+
+    def win_base(gm):
+        m_start = metadata_ref.gm_id_to_m_offset[gm]
+        m_offset = m_start - m_start % sublane
+        aligned = (m_offset // 128) * 128
+        return aligned, m_offset - aligned
+
+    def rows_cnt_of(gm):
+        m_end = metadata_ref.gm_id_to_m_offset[gm + 1]
+        m_start = metadata_ref.gm_id_to_m_offset[gm]
+        return m_end - (m_start - m_start % sublane)
+
+    def start_win(st):
+        # The 1-D SMEM window copy must start 128-aligned (row index lives on
+        # LANES); the column copy is sublane-granular, so it starts straight
+        # at the 16-aligned m_offset — parity rows align 1:1 with tile rows.
+        aligned, delta = win_base(gm_of(st))
+        wsem = win_sem.at[lax.rem(st, 2)]
+        pltpu.make_async_copy(idx_hbm.at[pl.ds(aligned, win_len)], idx_smem,
+                              wsem).start()
+        pltpu.make_async_copy(idx_col_hbm.at[pl.ds(aligned + delta, tile_m)],
+                              idx_col_buf.at[lax.rem(st, 2)], wsem).start()
+
+    def wait_win(st):
+        wsem = win_sem.at[lax.rem(st, 2)]
+        pltpu.make_async_copy(idx_hbm.at[pl.ds(0, win_len)], idx_smem,
+                              wsem).wait()
+        pltpu.make_async_copy(idx_col_hbm.at[pl.ds(0, tile_m)],
+                              idx_col_buf.at[lax.rem(st, 2)], wsem).wait()
+
+    def start_rows(st):
+        gm, k = gm_of(st), k_of(st)
+        _, delta = win_base(gm)
+        cnt = rows_cnt_of(gm)
+        k_base = k * tile_k
+        bsem = gather_sem.at[lax.rem(st, 2)]
+        buf = gather_buf.at[lax.rem(st, 2)]
+        for c in range(0, tile_m, 16):
+
+            @pl.when(c < cnt)
+            def _(c=c):
+                dmas = []
+                for j in range(c, c + 16):
+                    pos = jnp.clip(delta + j, 0, win_len - 1)
+                    row = idx_smem[pos]
+                    if packing > 1:
+                        row = row >> (packing.bit_length() - 1)
+                    dmas.append(pltpu.make_async_copy(
+                        lhs_pool.at[pl.ds(row, 1), pl.ds(k_base, tile_k)],
+                        buf.at[pl.ds(j, 1)], bsem))
+                for d in dmas:
+                    d.start()
+
+    def wait_rows(st):
+        cnt = rows_cnt_of(gm_of(st))
+        bsem = gather_sem.at[lax.rem(st, 2)]
+        buf = gather_buf.at[lax.rem(st, 2)]
+        for c in range(0, tile_m, 16):
+
+            @pl.when(c < cnt)
+            def _(c=c):
+                for _ in range(16):
+                    pltpu.make_async_copy(
+                        lhs_pool.at[pl.ds(0, 1), pl.ds(0, tile_k)],
+                        buf.at[pl.ds(0, 1)], bsem).wait()
+
+    @pl.when(s == 0)
+    def _():
+        # idx_smem is a SINGLE buffer: never two window copies in flight —
+        # win(1) starts only after start_rows(0) has consumed win(0) (the
+        # steady state keeps the same invariant by construction: win(s+2)
+        # starts after start_rows(s+1) read win(s+1))
+        start_win(0)
+        wait_win(0)
+        start_rows(0)
+
+        @pl.when(num_steps > 1)
+        def _():
+            start_win(1)
+
+    @pl.when(s + 1 < num_steps)
+    def _():
+        wait_win(s + 1)
+        start_rows(s + 1)  # in flight during this step's extract + matmul
+
+    wait_rows(s)
+    if packing > 1:
+        col = idx_col_buf[lax.rem(s, 2)]  # [tile_m, 1] int32, row j = idx of
+        sh_tile = 16 * (1 - jnp.bitwise_and(col, 1))  # gathered buf row j
+        bits = jnp.bitwise_and(
+            jnp.left_shift(gather_buf[lax.rem(s, 2)], sh_tile),
+            jnp.int32(-65536))
+        lhs_tile = jax.lax.bitcast_convert_type(
+            bits, jnp.float32).astype(cfgs.lhs_cfgs.dtype)
+    else:
+        lhs_tile = gather_buf[lax.rem(s, 2)]
+
+    # windows for step s+2 reuse this step's SMEM buffer and parity slot —
+    # start only after both were consumed above
+    @pl.when(s + 2 < num_steps)
+    def _():
+        start_win(s + 2)
+
+    inner_kernel(
+        lhs_tile,
+        tiled_rhs_ref,
+        tiled_out_ref,
+        partial_out_ref,
+        acc_ref,
+        metadata_ref,
+        cfgs=cfgs,
+    )
+
+
+def kernel_main_gather(
+    # Scalar prefetch
+    lhs_group_sizes_ref: jax.Array,  # int32[size_lhs_group]
+    group_offset_ref: jax.Array,  # int32[1]
+    # In
+    lhs_ref: jax.Array,  # [size_src, size_k] un-permuted source pool (HBM)
+    idx_hbm: jax.Array,  # int32[padded_m] gather indices (HBM)
+    idx_col_hbm: jax.Array,  # int32[padded_m, 1] same values, column layout
+    rhs_ref: WeightsRef,  # [size_group, size_k, size_n]
+    # Out
+    out_ref: jax.Array,  # [size_m, size_n]
+    # Scratch memory
+    partial_out_ref: jax.Array,
+    acc_ref: jax.Array,
+    metadata_ref: MetadataRef,
+    gather_buf: jax.Array,
+    gather_sem: jax.Array,
+    idx_smem: jax.Array,
+    idx_col_buf: jax.Array,
+    win_sem: jax.Array,
+    zero_ref: jax.Array | None,
+    semaphore_ref: jax.Array | None,
+    *,
+    cfgs: GmmConfigs,
+    packing: int,
+):
+    """Entry point for the fused-permute GMM kernel. Mirrors `kernel_main`,
+    but the LHS is gathered per-row from the un-permuted pool instead of being
+    pipelined as a contiguous block (the pool, indices and parity column are
+    closed over by the inner body; only rhs/out are emit_pipeline operands)."""
+
+    num_k = pl.cdiv(cfgs.dims.size_k, cfgs.tiles.tile_k)
+    num_n = pl.cdiv(cfgs.out_size_n, cfgs.tiles.tile_n)
+
+    num_gm = fill_metadata(
+        lhs_group_sizes_ref,
+        group_offset_ref,
+        metadata_ref,
+        cfgs=cfgs,
+    )
+
+    if cfgs.zero_init:
+        zero_size = zero_out_start(
+            out_ref,
+            zero_ref,
+            semaphore_ref,
+            metadata_ref,
+            num_gm,
+            dims=cfgs.dims,
+        )
+
+    (_, rhs_spec), out_spec = generate_block_specs(metadata_ref, cfgs,
+                                                   rhs_buffer_count=2)
+
+    if cfgs.fuse_act is not None:
+        rhs_up_ref = jax.tree.map(lambda x: x.at[..., cfgs.out_size_n:],
+                                  rhs_ref)
+        rhs_ref = FusedWeightsRef(gate=rhs_ref, up=rhs_up_ref)
+        rhs_spec = FusedWeightsRef(gate=rhs_spec, up=rhs_spec)
+
+    lhs_pool = lhs_ref.bitcast(jnp.int32) if packing > 1 else lhs_ref
+    body = functools.partial(
+        gathered_inner_kernel,
+        cfgs=cfgs,
+        lhs_pool=lhs_pool,
+        idx_hbm=idx_hbm,
+        idx_col_hbm=idx_col_hbm,
+        packing=packing,
+    )
+
+    pipeline_fn = pltpu.emit_pipeline(
+        body,
+        grid=(num_n, num_gm, num_k),
+        in_specs=(rhs_spec, ),
+        out_specs=out_spec,
+    )
+
+    out_in = out_ref.reshape(-1, cfgs.dims.size_lhs_sublane, out_ref.shape[-1])
+    scratches = [
+        partial_out_ref, acc_ref, metadata_ref, gather_buf, gather_sem,
+        idx_smem, idx_col_buf, win_sem
+    ]
+    pipeline_fn(rhs_ref, out_in, scratches=scratches)
+
+    if cfgs.zero_init:
+        zero_out_end(out_ref, semaphore_ref, zero_size, dims=cfgs.dims)
+
+
 def calculate_tiling(
     dims: Dimensions,
     lhs_cfgs: InputConfigs,
@@ -1262,12 +1523,19 @@ def gmm_v2(
     maybe_quantize_lhs: bool = True,
     zero_initialize: bool = True,
     fuse_act: str | None = None,
+    gather_indices: jax.Array | None = None,
 ) -> jax.Array:
     """GMM kernel implemented with emit_pipeline.
 
     Dynamically calculate offset lhs/out tiles to reduce redundant computations.
     Additionally, it adjusts dma size based on number of valid rows and utilize
     triple buffering on weights to better utilize memory.
+
+    When `gather_indices` int32[size_m] is given, `lhs` is the UN-PERMUTED
+    source pool [size_src, size_k] and row i of the effective LHS is
+    lhs[gather_indices[i]] — the permute is fused into the kernel as per-row
+    DMAs (Bulk-Issue Row Streaming; bf16 pools are read through their int32
+    view and extracted on the VPU). Output shape is [size_m, size_n].
 
     Args:
         lhs: lhs with shape [size_m, size_k].
@@ -1300,8 +1568,14 @@ def gmm_v2(
     if vmem_limit_bytes is None:
         vmem_limit_bytes = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.9)
 
+    cfg_lhs = lhs
+    if gather_indices is not None:
+        # dims/tiling see the EFFECTIVE lhs [size_m, size_k]
+        cfg_lhs = jax.ShapeDtypeStruct((gather_indices.shape[0], lhs.shape[1]),
+                                       lhs.dtype)
+
     cfgs = make_gmm_configs(
-        lhs,
+        cfg_lhs,
         rhs,
         rhs_scale,
         rhs_bias,
@@ -1371,6 +1645,54 @@ def gmm_v2(
     aligned_n = align_to(cfgs.out_size_n, num_lanes)
     out_init = jax.ShapeDtypeStruct((dims.size_m, aligned_n), cfgs.out_dtype)
     rhs_weights = WeightsRef(weight=rhs, scale=rhs_scale, bias=rhs_bias)
+
+    if gather_indices is not None:
+        packing = 4 // jnp.dtype(lhs.dtype).itemsize
+        pool = lhs
+        if packing > 1 and pool.shape[0] % packing:
+            pool = jnp.pad(pool,
+                           ((0, packing - pool.shape[0] % packing), (0, 0)))
+        win_len = idx_window_len(tiles.tile_m)
+        pad_to = align_to(dims.size_m, 128) + win_len
+        idx = gather_indices.astype(jnp.int32)
+        idx = jnp.pad(idx, (0, pad_to - dims.size_m), mode="edge")
+        gather_scratch = [
+            pltpu.VMEM((2, tiles.tile_m, tiles.tile_k),
+                       jnp.int32 if packing > 1 else lhs.dtype),
+            pltpu.SemaphoreType.DMA((2, )),
+            pltpu.SMEM((win_len, ), jnp.int32),
+            pltpu.VMEM((2, tiles.tile_m, 1), jnp.int32),
+            pltpu.SemaphoreType.DMA((2, )),
+        ]
+        scratch_shapes = (scratch_shapes[:3] + gather_scratch +
+                          scratch_shapes[3:])
+        return pl.pallas_call(
+            functools.partial(kernel_main_gather, cfgs=cfgs, packing=packing),
+            out_shape=out_init,
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=2,
+                in_specs=[
+                    pl.BlockSpec(memory_space=pltpu.HBM),
+                    pl.BlockSpec(memory_space=pltpu.HBM),
+                    pl.BlockSpec(memory_space=pltpu.HBM),
+                    WeightsRef(
+                        weight=pl.BlockSpec(memory_space=pltpu.HBM),
+                        scale=rhs_scale_spec,
+                        bias=rhs_bias_spec,
+                    ),
+                ],
+                out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
+                scratch_shapes=scratch_shapes,
+            ),
+            compiler_params=pltpu.CompilerParams(
+                vmem_limit_bytes=vmem_limit_bytes,
+                disable_bounds_checks=True,
+            ),
+            name=get_scope_name(cfgs) + "-gather",
+            cost_estimate=get_cost_estimate(cfgs),
+            metadata=get_metadata(cfgs),
+        )(group_sizes, group_offset, pool, idx, idx[:, None],
+          rhs_weights)[:, :cfgs.out_size_n]
 
     return pl.pallas_call(
         functools.partial(kernel_main, cfgs=cfgs),
