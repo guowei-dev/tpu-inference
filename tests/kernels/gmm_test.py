@@ -749,3 +749,66 @@ class GmmTest(jtu.JaxTestCase):
 
 if __name__ == "__main__":
     absltest.main(testLoader=jtu.JaxTestLoader())
+
+
+class GmmGatherTest(jtu.JaxTestCase):
+    """gather_indices= (fused-permute) path vs the contiguous path."""
+
+    def _run(self, group_sizes, pool_rows, group_offset, odd_pool=False):
+        num_groups = group_sizes.shape[0]
+        in_size, out_size = 512, 512
+        batch_size = int(group_sizes.sum())
+        num_local_groups = num_groups - group_offset
+        key = jax.random.key(0)
+
+        pool = jax.random.normal(key, (pool_rows, in_size),
+                                 dtype=jnp.bfloat16)
+        if odd_pool:
+            pool = pool[:pool_rows - 1]
+        indices = jax.random.randint(jax.random.key(1), (batch_size, ), 0,
+                                     pool.shape[0], dtype=jnp.int32)
+        rhs = jax.random.normal(key,
+                                (num_local_groups, in_size, out_size),
+                                dtype=jnp.bfloat16)
+        rhs_q, rhs_scale = quantize_tensor(rhs,
+                                           jnp.float8_e4m3fn,
+                                           axis=1,
+                                           block_size=in_size)
+        rhs_scale = jnp.expand_dims(rhs_scale, axis=2)
+        goff = jnp.array([group_offset], dtype=jnp.int32)
+
+        kwargs = dict(rhs_scale=rhs_scale,
+                      group_offset=goff,
+                      fuse_act="silu",
+                      preferred_element_type=jnp.bfloat16,
+                      zero_initialize=False)
+        fused = gmm_v2(pool,
+                       rhs_q,
+                       group_sizes,
+                       gather_indices=indices,
+                       **kwargs)
+        contiguous = gmm_v2(pool[indices], rhs_q, group_sizes, **kwargs)
+
+        offsets = jnp.cumulative_sum(group_sizes, include_initial=True)
+        w0 = int(offsets[group_offset])
+        w1 = int(offsets[group_offset + num_local_groups])
+        # Rows outside the shard window are undefined in both paths
+        # (zero_initialize=False), exactly as in the production chain.
+        self.assertArraysEqual(fused[w0:w1], contiguous[w0:w1])
+
+    def test_gather_matches_contiguous(self):
+        group_sizes = get_group_sizes(2560, 16)
+        self._run(group_sizes, pool_rows=256, group_offset=4)
+
+    def test_gather_window_base_regression(self):
+        # Adjacent gm tiles whose 128-aligned index-window bases DIFFER:
+        # the geometry that exposed the warm-up race on the single SMEM
+        # index window (two window copies in flight at s == 0).
+        group_sizes = jnp.array([68, 70, 40, 30, 50, 60, 25, 57],
+                                dtype=jnp.int32)
+        self._run(group_sizes, pool_rows=128, group_offset=1)
+
+    def test_gather_empty_groups_and_odd_pool(self):
+        group_sizes = jnp.array([64, 0, 48, 0, 0, 32, 16, 0],
+                                dtype=jnp.int32)
+        self._run(group_sizes, pool_rows=129, group_offset=2, odd_pool=True)
