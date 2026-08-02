@@ -103,6 +103,7 @@ def _fused_permute_gmm_inner(
     parity_hbm,  # closed over: int32[padded_m, 1] HBM
     packing: int,
     num_slots: int,
+    chunk: int,
 ):
     """Pipeline body. rhs/out stay pipelined; the LHS tile is gathered."""
     tile_m = cfgs.tiles.tile_m
@@ -140,36 +141,54 @@ def _fused_permute_gmm_inner(
     def start_rows(step, slot):
         """Issue the tile's row DMAs.
 
-        Branch-free: the row count rides in the DMA *size* (0 or 1 rows), so a
-        dead row moves no bytes and needs no `pl.when` region. That matters
-        because a region boundary is exactly what stops an issue bundle from
-        sharing a VLIW bundle with the matmul.
+        The row DMA size is a static 1: Mosaic rejects a slice whose size
+        along a tiled dimension is dynamic ("Slice sizes along tiled
+        dimensions must be aligned to tiles"), so a dead row cannot be
+        expressed as a zero-row copy and has to be skipped by a predicate
+        instead. `chunk` is how many rows share one predicate -- it trades
+        wasted reads (up to chunk-1 dead rows per tile) against the number of
+        regions the issue chain is cut into, and a region boundary is exactly
+        what stops an issue bundle from sharing a VLIW bundle with the matmul.
+        Keeping `tile_m` near the live-row count is what makes a large chunk
+        affordable.
 
         Addresses come from the kernel-invariant SMEM table, so no semaphore
         wait sits in front of this scalar chain.
         """
         m_offset, live = m_base(step)
         k_base = lax.rem(step, num_k) * tile_k
-        for j in range(tile_m):
-            n = jnp.clip(live - j, 0, 1)
-            row = idx_smem[m_offset + j]
-            if packing > 1:
-                row = row >> shift
-            pltpu.make_async_copy(
-                lhs_pool.at[pl.ds(row, n), pl.ds(k_base, tile_k)],
-                gather_buf.at[slot, pl.ds(j, n)],
-                gather_sem.at[slot],
-            ).start()
+        for c in range(0, tile_m, chunk):
+
+            @pl.when(c < live)
+            def _(c=c):
+                copies = [
+                    pltpu.make_async_copy(
+                        lhs_pool.at[pl.ds(_row(m_offset + j), 1),
+                                    pl.ds(k_base, tile_k)],
+                        gather_buf.at[slot, pl.ds(j, 1)],
+                        gather_sem.at[slot],
+                    ) for j in range(c, c + chunk)
+                ]
+                # Build every descriptor before starting any of them.
+                for cp in copies:
+                    cp.start()
+
+    def _row(i):
+        row = idx_smem[i]
+        return row >> shift if packing > 1 else row
 
     def wait_rows(step, slot):
         _, live = m_base(step)
-        # One aggregate wait for the whole tile: same byte count as the
-        # per-row waits, and measured bit-identical in schedule.
-        pltpu.make_async_copy(
-            lhs_pool.at[pl.ds(0, live), pl.ds(0, tile_k)],
-            gather_buf.at[slot, pl.ds(0, live)],
-            gather_sem.at[slot],
-        ).wait()
+        for c in range(0, tile_m, chunk):
+
+            @pl.when(c < live)
+            def _(c=c):
+                for _ in range(chunk):
+                    pltpu.make_async_copy(
+                        lhs_pool.at[pl.ds(0, 1), pl.ds(0, tile_k)],
+                        gather_buf.at[slot, pl.ds(0, 1)],
+                        gather_sem.at[slot],
+                    ).wait()
 
     def extract(slot):
         """u32 row -> the bf16 row the index selected.
@@ -242,6 +261,7 @@ def kernel_main_fpg(
     cfgs: GmmConfigs,
     packing: int,
     num_slots: int,
+    chunk: int,
 ):
     num_k = pl.cdiv(cfgs.dims.size_k, cfgs.tiles.tile_k)
     num_n = pl.cdiv(cfgs.out_size_n, cfgs.tiles.tile_n)
@@ -266,7 +286,7 @@ def kernel_main_fpg(
     body = functools.partial(_fused_permute_gmm_inner, cfgs=cfgs,
                              idx_smem=idx_smem, lhs_pool=lhs_pool,
                              parity_hbm=parity_hbm, packing=packing,
-                             num_slots=num_slots)
+                             num_slots=num_slots, chunk=chunk)
 
     pipeline_fn = pltpu.emit_pipeline(body, grid=(num_n, num_gm, num_k),
                                       in_specs=(rhs_spec, ),
@@ -284,7 +304,7 @@ def kernel_main_fpg(
 @functools.partial(jax.jit, static_argnames=[
     "tile_info", "vmem_limit_bytes", "precision", "preferred_element_type",
     "acc_dtype", "maybe_quantize_lhs", "zero_initialize", "fuse_act",
-    "num_slots",
+    "num_slots", "chunk",
 ])
 def fused_permute_gmm(
     lhs: jax.Array,  # [size_src, size_k] un-permuted pool
@@ -304,6 +324,7 @@ def fused_permute_gmm(
     zero_initialize: bool = True,
     fuse_act: str | None = None,
     num_slots: int = 2,
+    chunk: int = 16,
 ) -> jax.Array:
     """Grouped matmul over `lhs[gather_indices]` without materialising it.
 
@@ -400,7 +421,7 @@ def fused_permute_gmm(
 
     return pl.pallas_call(
         functools.partial(kernel_main_fpg, cfgs=cfgs, packing=packing,
-                          num_slots=num_slots),
+                          num_slots=num_slots, chunk=chunk),
         out_shape=out_init,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=3,
