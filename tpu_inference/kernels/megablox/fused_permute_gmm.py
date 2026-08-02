@@ -105,12 +105,18 @@ def _fused_permute_gmm_inner(
     num_slots: int,
     chunk: int,
     coissue: bool,
+    packed_pool: bool,
 ):
     """Pipeline body. rhs/out stay pipelined; the LHS tile is gathered."""
     tile_m = cfgs.tiles.tile_m
     tile_k = cfgs.tiles.tile_k
     sublane = cfgs.dims.size_lhs_sublane
     shift = packing.bit_length() - 1  # bf16 pool: pool row = idx >> 1
+    # A packed pool stores int32[T, H/2], word (r, c) = bf16 (r, c) in the low
+    # half and (r, c + H/2) in the high half. A row is then 2H bytes instead of
+    # the 4H the u32 row-pair view costs, the row index needs no shift, and the
+    # parity column disappears entirely.
+    row_k = tile_k // 2 if packed_pool else tile_k
 
     num_gm = pl.num_programs(1)
     num_k = pl.num_programs(2)
@@ -157,7 +163,7 @@ def _fused_permute_gmm_inner(
         wait sits in front of this scalar chain.
         """
         m_offset, live = m_base(step)
-        k_base = lax.rem(step, num_k) * tile_k
+        k_base = lax.rem(step, num_k) * row_k
         for c in range(0, tile_m, chunk):
 
             @pl.when(c < live)
@@ -165,7 +171,7 @@ def _fused_permute_gmm_inner(
                 copies = [
                     pltpu.make_async_copy(
                         lhs_pool.at[pl.ds(_row(m_offset + j), 1),
-                                    pl.ds(k_base, tile_k)],
+                                    pl.ds(k_base, row_k)],
                         gather_buf.at[slot, pl.ds(j, 1)],
                         gather_sem.at[slot],
                     ) for j in range(c, c + chunk)
@@ -176,6 +182,8 @@ def _fused_permute_gmm_inner(
 
     def _row(i):
         row = idx_smem[i]
+        if packed_pool:
+            return row  # one word per row-half pair, no row pairing
         return row >> shift if packing > 1 else row
 
     def wait_rows(step, slot):
@@ -186,17 +194,25 @@ def _fused_permute_gmm_inner(
             def _(c=c):
                 for _ in range(chunk):
                     pltpu.make_async_copy(
-                        lhs_pool.at[pl.ds(0, 1), pl.ds(0, tile_k)],
+                        lhs_pool.at[pl.ds(0, 1), pl.ds(0, row_k)],
                         gather_buf.at[slot, pl.ds(0, 1)],
                         gather_sem.at[slot],
                     ).wait()
 
     def extract(slot):
-        """u32 row -> the bf16 row the index selected.
-
-        The pool is viewed as int32, so word r packs bf16 rows 2r (low half)
-        and 2r+1 (high half); shift the selected half up and mask.
-        """
+        """u32 row -> the bf16 row the index selected."""
+        if packed_pool:
+            # Both halves are wanted, so there is no discarded read and no
+            # parity to look up. k is the CONTRACTED axis and the concat lands
+            # on a 128-multiple lane boundary, so it restores the original
+            # column order for free.
+            bits = gather_buf[slot]
+            lo = jax.lax.bitcast_convert_type(
+                jnp.left_shift(bits, 16), jnp.float32)
+            hi = jax.lax.bitcast_convert_type(
+                jnp.bitwise_and(bits, jnp.int32(-65536)), jnp.float32)
+            return jnp.concatenate(
+                [lo, hi], axis=1).astype(cfgs.lhs_cfgs.dtype)
         if packing == 1:
             return gather_buf[slot]
         sh = 16 * (1 - jnp.bitwise_and(parity_buf[slot], 1))
@@ -217,11 +233,11 @@ def _fused_permute_gmm_inner(
         keeps `tile_m` pinned to the live-row count.
         """
         m_offset, _ = m_base(step)
-        k_base = lax.rem(step, num_k) * tile_k
+        k_base = lax.rem(step, num_k) * row_k
         copies = [
             pltpu.make_async_copy(
                 lhs_pool.at[pl.ds(_row(m_offset + j), 1),
-                            pl.ds(k_base, tile_k)],
+                            pl.ds(k_base, row_k)],
                 gather_buf.at[slot, pl.ds(j, 1)],
                 gather_sem.at[slot],
             ) for j in range(lo, hi)
@@ -232,7 +248,7 @@ def _fused_permute_gmm_inner(
     def wait_rows_all(slot):
         for _ in range(tile_m):
             pltpu.make_async_copy(
-                lhs_pool.at[pl.ds(0, 1), pl.ds(0, tile_k)],
+                lhs_pool.at[pl.ds(0, 1), pl.ds(0, row_k)],
                 gather_buf.at[slot, pl.ds(0, 1)],
                 gather_sem.at[slot],
             ).wait()
@@ -259,9 +275,11 @@ def _fused_permute_gmm_inner(
             if packing > 1:
                 wait_parity(slot)
 
-            @pl.when(s + 1 < num_steps)
-            def _():
-                start_parity(s + 1, nxt)
+            if not packed_pool:
+
+                @pl.when(s + 1 < num_steps)
+                def _():
+                    start_parity(s + 1, nxt)
 
             inner_kernel(extract(slot), tiled_rhs_ref, tiled_out_ref,
                          partial_out_ref, acc_ref, metadata_ref, cfgs=cfgs,
@@ -273,10 +291,11 @@ def _fused_permute_gmm_inner(
             # Issue-first: feed the engine for the next tile before this
             # tile's data is touched.
             start_rows(s + 1, nxt)
-            start_parity(s + 1, nxt)
+            if not packed_pool:
+                start_parity(s + 1, nxt)
 
         wait_rows(s, slot)
-        if packing > 1:
+        if packing > 1 and not packed_pool:
             wait_parity(slot)
         inner_kernel(extract(slot), tiled_rhs_ref, tiled_out_ref,
                      partial_out_ref, acc_ref, metadata_ref, cfgs=cfgs)
@@ -287,7 +306,8 @@ def _fused_permute_gmm_inner(
             start_rows_unguarded(0, 0, 0, tile_m)
         else:
             start_rows(0, 0)
-        start_parity(0, 0)
+        if not packed_pool:
+            start_parity(0, 0)
 
     for slot in range(num_slots):
         # Dispatching on the parity makes every slot index inside the branch a
@@ -326,6 +346,7 @@ def kernel_main_fpg(
     num_slots: int,
     chunk: int,
     coissue: bool,
+    packed_pool: bool,
 ):
     num_k = pl.cdiv(cfgs.dims.size_k, cfgs.tiles.tile_k)
     num_n = pl.cdiv(cfgs.out_size_n, cfgs.tiles.tile_n)
@@ -346,12 +367,14 @@ def kernel_main_fpg(
         rhs_ref = FusedWeightsRef(gate=rhs_ref, up=rhs_up_ref)
         rhs_spec = FusedWeightsRef(gate=rhs_spec, up=rhs_spec)
 
-    lhs_pool = lhs_ref.bitcast(jnp.int32) if packing > 1 else lhs_ref
+    lhs_pool = (lhs_ref if packed_pool or packing == 1
+                else lhs_ref.bitcast(jnp.int32))
     body = functools.partial(_fused_permute_gmm_inner, cfgs=cfgs,
                              idx_smem=idx_smem, lhs_pool=lhs_pool,
                              parity_hbm=parity_hbm, packing=packing,
                              num_slots=num_slots, chunk=chunk,
-                             coissue=coissue)
+                             coissue=coissue,
+                             packed_pool=packed_pool)
 
     pipeline_fn = pltpu.emit_pipeline(body, grid=(num_n, num_gm, num_k),
                                       in_specs=(rhs_spec, ),
@@ -369,7 +392,7 @@ def kernel_main_fpg(
 @functools.partial(jax.jit, static_argnames=[
     "tile_info", "vmem_limit_bytes", "precision", "preferred_element_type",
     "acc_dtype", "maybe_quantize_lhs", "zero_initialize", "fuse_act",
-    "num_slots", "chunk", "coissue",
+    "num_slots", "chunk", "coissue", "packed_pool",
 ])
 def fused_permute_gmm(
     lhs: jax.Array,  # [size_src, size_k] un-permuted pool
@@ -391,12 +414,16 @@ def fused_permute_gmm(
     num_slots: int = 2,
     chunk: int = 16,
     coissue: bool = True,
+    packed_pool: bool = False,
 ) -> jax.Array:
     """Grouped matmul over `lhs[gather_indices]` without materialising it.
 
     Row `i` of the effective LHS is `lhs[gather_indices[i]]`; the output is
     [size_m, size_n] with size_m = gather_indices.shape[0].
     """
+    if packed_pool and lhs.dtype != jnp.int32:
+        raise ValueError("packed_pool expects an int32[size_src, size_k/2] "
+                         "pool; word (r,c) = bf16 (r,c) | (r,c+size_k/2)<<16")
     if lhs.dtype.itemsize not in (2, 4):
         raise NotImplementedError(
             f"pool dtype {lhs.dtype} unsupported: the row read is an int32 "
@@ -410,11 +437,17 @@ def fused_permute_gmm(
             f"{size_m} indices exceed the SMEM scalar-operand budget "
             f"({SMEM_INDEX_LIMIT_BYTES} B); use gmm_v2(gather_indices=)")
 
-    packing = 4 // lhs.dtype.itemsize
-    cfg_lhs = jax.ShapeDtypeStruct((size_m, lhs.shape[1]), lhs.dtype)
+    if packed_pool:
+        # lhs is int32[size_src, size_k/2]; the effective LHS is bf16.
+        packing = 2
+        cfg_lhs = jax.ShapeDtypeStruct((size_m, lhs.shape[1] * 2),
+                                       jnp.bfloat16)
+    else:
+        packing = 4 // lhs.dtype.itemsize
+        cfg_lhs = jax.ShapeDtypeStruct((size_m, lhs.shape[1]), lhs.dtype)
     if tile_info is None:
         tile_m = gather_tiling(size_m, group_sizes.shape[0])
-        tile_info = TileSizes(tile_m=tile_m, tile_k=lhs.shape[1],
+        tile_info = TileSizes(tile_m=tile_m, tile_k=cfg_lhs.shape[1],
                               tile_n=align_to(rhs.shape[-1] //
                                               (2 if fuse_act else 1), 128),
                               bucket_base=tile_m)
@@ -434,7 +467,7 @@ def fused_permute_gmm(
         group_offset = jnp.zeros((1, ), jnp.int32)
 
     pool = lhs
-    if packing > 1 and pool.shape[0] % packing:
+    if not packed_pool and packing > 1 and pool.shape[0] % packing:
         pool = jnp.pad(pool, ((0, packing - pool.shape[0] % packing), (0, 0)))
 
     # Pad the index table so a tile that runs past the last live row still
@@ -442,6 +475,8 @@ def fused_permute_gmm(
     pad_to = align_to(dims.size_m, tiles.tile_m) + tiles.tile_m
     idx = jnp.pad(gather_indices.astype(jnp.int32), (0, pad_to - size_m),
                   mode="edge")
+
+    parity = idx[:, None] if not packed_pool else jnp.zeros((1, 1), jnp.int32)
 
     rhs_scale_spec = rhs_bias_spec = None
     if rhs_scale is not None:
@@ -465,7 +500,8 @@ def fused_permute_gmm(
             gm_id_to_group_id=pltpu.SMEM((max_num_gm, ), jnp.int32),
             gm_id_to_m_offset=pltpu.SMEM((max_num_gm + 1, ), jnp.int32),
         ),
-        pltpu.VMEM((num_slots, tiles.tile_m, tiles.tile_k),
+        pltpu.VMEM((num_slots, tiles.tile_m,
+                    tiles.tile_k // 2 if packed_pool else tiles.tile_k),
                    jnp.int32 if packing > 1 else lhs.dtype),
         pltpu.SemaphoreType.DMA((num_slots, )),
         pltpu.VMEM((num_slots, tiles.tile_m, 1), jnp.int32),
@@ -488,7 +524,8 @@ def fused_permute_gmm(
     return pl.pallas_call(
         functools.partial(kernel_main_fpg, cfgs=cfgs, packing=packing,
                           num_slots=num_slots, chunk=chunk,
-                             coissue=coissue),
+                             coissue=coissue,
+                             packed_pool=packed_pool),
         out_shape=out_init,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=3,
@@ -508,5 +545,5 @@ def fused_permute_gmm(
         name=get_scope_name(cfgs) + "-fpg",
         cost_estimate=get_cost_estimate(cfgs),
         metadata=get_metadata(cfgs),
-    )(group_sizes, group_offset, idx, pool, idx[:, None],
-      rhs_weights)[:, :cfgs.out_size_n]
+    )(group_sizes, group_offset, idx, pool,
+      parity, rhs_weights)[:, :cfgs.out_size_n]
