@@ -376,6 +376,7 @@ def inner_kernel(
     metadata_ref: MetadataRef,
     *,
     cfgs: GmmConfigs,
+    issue_fn=None,
 ):
     """Inner kernel invoked by emit_pipeline to perform matmul.
 
@@ -395,6 +396,13 @@ def inner_kernel(
         acc_ref: Reference to the accumulator.
         metadata_ref: Reference to the metadata.
         cfgs: GmmConfigs.
+        issue_fn: Optional `(site, num_sites) -> None`, called once after each
+            matmul site of the quantized path. A caller that gathers its own
+            LHS uses it to emit the next tile's row DMAs from inside this
+            function, which is the only way they land in the same scheduling
+            region as the dots -- a VLIW bundle can only pair two ops from one
+            region, so an issue chain emitted around this call can never
+            co-issue with the MXU no matter how it is spelled.
     """
 
     gm_id = pl.program_id(1)
@@ -480,6 +488,9 @@ def inner_kernel(
             # result of [tile_m, mxu_size] becomes available at the end of every k
             # inner loop which can be used to pipeline subsequent VPU or VST ops with
             # MXU ops for the next [tile_m, mxu_size].
+            n_sites = len(range(0, rhs_tile_n, mxu_size)) * len(
+                range(0, cfgs.tiles.tile_k, q_block_size))
+            site = 0
             for start_n in range(0, rhs_tile_n, mxu_size):
                 end_n = min(rhs_tile_n, start_n + mxu_size)
                 col_size = end_n - start_n
@@ -532,6 +543,9 @@ def inner_kernel(
                         block_acc *= rhs_scale_replicated.astype(acc_ref.dtype)
 
                     acc_n += block_acc
+                    if issue_fn is not None:
+                        issue_fn(site, n_sites)
+                    site += 1
                 acc_list.append(acc_n)
         acc = jnp.concatenate(acc_list, axis=1)
 

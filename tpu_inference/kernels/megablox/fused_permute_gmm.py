@@ -104,6 +104,7 @@ def _fused_permute_gmm_inner(
     packing: int,
     num_slots: int,
     chunk: int,
+    coissue: bool,
 ):
     """Pipeline body. rhs/out stay pipelined; the LHS tile is gathered."""
     tile_m = cfgs.tiles.tile_m
@@ -204,9 +205,68 @@ def _fused_permute_gmm_inner(
         return jax.lax.bitcast_convert_type(bits, jnp.float32).astype(
             cfgs.lhs_cfgs.dtype)
 
+    def start_rows_unguarded(step, slot, lo, hi):
+        """Rows [lo, hi) of `step`'s tile, with NO predicate.
+
+        A predicate would put the issue chain in its own region, and a VLIW
+        bundle can only pair two ops from one region -- which is why the
+        guarded form measures 0% co-issue however few guards it has. Rows past
+        the tile's live count are harmless: the index table is edge-padded, so
+        they name a valid pool row, and inner_kernel masks them out of the
+        result. The price is `tile_m - live` wasted row reads, which is what
+        keeps `tile_m` pinned to the live-row count.
+        """
+        m_offset, _ = m_base(step)
+        k_base = lax.rem(step, num_k) * tile_k
+        copies = [
+            pltpu.make_async_copy(
+                lhs_pool.at[pl.ds(_row(m_offset + j), 1),
+                            pl.ds(k_base, tile_k)],
+                gather_buf.at[slot, pl.ds(j, 1)],
+                gather_sem.at[slot],
+            ) for j in range(lo, hi)
+        ]
+        for cp in copies:
+            cp.start()
+
+    def wait_rows_all(slot):
+        for _ in range(tile_m):
+            pltpu.make_async_copy(
+                lhs_pool.at[pl.ds(0, 1), pl.ds(0, tile_k)],
+                gather_buf.at[slot, pl.ds(0, 1)],
+                gather_sem.at[slot],
+            ).wait()
+
     def run(slot):
         """One grid step, with `slot` a PYTHON int."""
         nxt = (slot + 1) % num_slots
+
+        if coissue:
+            # The next tile's rows are issued from inside inner_kernel, spread
+            # over its matmul sites, so they share a region with the dots.
+            def issue_fn(site, n_sites, nxt=nxt):
+                per = -(-tile_m // n_sites)
+                lo = site * per
+                if lo >= tile_m:
+                    return
+
+                @pl.when(s + 1 < num_steps)
+                def _():
+                    start_rows_unguarded(s + 1, nxt, lo,
+                                         min(lo + per, tile_m))
+
+            wait_rows_all(slot)
+            if packing > 1:
+                wait_parity(slot)
+
+            @pl.when(s + 1 < num_steps)
+            def _():
+                start_parity(s + 1, nxt)
+
+            inner_kernel(extract(slot), tiled_rhs_ref, tiled_out_ref,
+                         partial_out_ref, acc_ref, metadata_ref, cfgs=cfgs,
+                         issue_fn=issue_fn)
+            return
 
         @pl.when(s + 1 < num_steps)
         def _():
@@ -223,7 +283,10 @@ def _fused_permute_gmm_inner(
 
     @pl.when(s == 0)
     def _():
-        start_rows(0, 0)
+        if coissue:
+            start_rows_unguarded(0, 0, 0, tile_m)
+        else:
+            start_rows(0, 0)
         start_parity(0, 0)
 
     for slot in range(num_slots):
@@ -262,6 +325,7 @@ def kernel_main_fpg(
     packing: int,
     num_slots: int,
     chunk: int,
+    coissue: bool,
 ):
     num_k = pl.cdiv(cfgs.dims.size_k, cfgs.tiles.tile_k)
     num_n = pl.cdiv(cfgs.out_size_n, cfgs.tiles.tile_n)
@@ -286,7 +350,8 @@ def kernel_main_fpg(
     body = functools.partial(_fused_permute_gmm_inner, cfgs=cfgs,
                              idx_smem=idx_smem, lhs_pool=lhs_pool,
                              parity_hbm=parity_hbm, packing=packing,
-                             num_slots=num_slots, chunk=chunk)
+                             num_slots=num_slots, chunk=chunk,
+                             coissue=coissue)
 
     pipeline_fn = pltpu.emit_pipeline(body, grid=(num_n, num_gm, num_k),
                                       in_specs=(rhs_spec, ),
@@ -304,7 +369,7 @@ def kernel_main_fpg(
 @functools.partial(jax.jit, static_argnames=[
     "tile_info", "vmem_limit_bytes", "precision", "preferred_element_type",
     "acc_dtype", "maybe_quantize_lhs", "zero_initialize", "fuse_act",
-    "num_slots", "chunk",
+    "num_slots", "chunk", "coissue",
 ])
 def fused_permute_gmm(
     lhs: jax.Array,  # [size_src, size_k] un-permuted pool
@@ -325,6 +390,7 @@ def fused_permute_gmm(
     fuse_act: str | None = None,
     num_slots: int = 2,
     chunk: int = 16,
+    coissue: bool = True,
 ) -> jax.Array:
     """Grouped matmul over `lhs[gather_indices]` without materialising it.
 
@@ -421,7 +487,8 @@ def fused_permute_gmm(
 
     return pl.pallas_call(
         functools.partial(kernel_main_fpg, cfgs=cfgs, packing=packing,
-                          num_slots=num_slots, chunk=chunk),
+                          num_slots=num_slots, chunk=chunk,
+                             coissue=coissue),
         out_shape=out_init,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=3,
