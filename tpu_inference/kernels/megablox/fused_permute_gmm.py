@@ -42,6 +42,7 @@ from jax.experimental.pallas import tpu as pltpu
 
 from tpu_inference.kernels.megablox.gmm_v2 import (
     FusedWeightsRef,
+    IndexMaps,
     GmmConfigs,
     MetadataRef,
     TileSizes,
@@ -83,6 +84,34 @@ def gather_tiling(size_m: int, size_group: int) -> int:
     return int(min(512, max(64, align_to(live, 64))))
 
 
+LANES = 128
+
+
+def _blocked_out_spec(metadata_ref, cfgs):
+    """gmm_v2's out BlockSpec with a trailing `LANES` minor dimension.
+
+    A 2-D bf16[M, N] ref is tiled (16,128) with (2,1) packing: two adjacent
+    ROWS share each 32-bit word, and rows are the axis the output DMA slices.
+    Splitting the last dim moves the packing to the second-minor axis, wholly
+    inside one M index, so the sliced axis becomes word-addressable.
+
+    Caveat at THIS geometry: bf16's tiled pair is (16,128), so the
+    second-minor dim is padded up to 16. With `out_size_n = 1024` that is
+    8 -> 16, which DOUBLES the output array; blockpack only pays for itself
+    when `aligned_n` is a multiple of 2048.
+    """
+    index_map = IndexMaps(metadata_ref, cfgs)
+    bounded = pl.BoundedSlice(cfgs.tiles.tile_m // cfgs.dims.size_lhs_sublane)
+
+    def out_index_map(n_id, gm_id, k_id):
+        rows, _, n = index_map.out_index_map(n_id, gm_id, k_id)
+        return (rows, 0, n, 0)
+
+    return pl.BlockSpec(
+        (bounded, cfgs.dims.size_lhs_sublane, cfgs.tiles.tile_n // LANES,
+         LANES), out_index_map)
+
+
 def _fused_permute_gmm_inner(
     # In (pipelined)
     tiled_rhs_ref,
@@ -107,6 +136,7 @@ def _fused_permute_gmm_inner(
     coissue: bool,
     packed_pool: bool,
     issue_spread: int,
+    out_blocked: int,
 ):
     """Pipeline body. rhs/out stay pipelined; the LHS tile is gathered."""
     tile_m = cfgs.tiles.tile_m
@@ -295,7 +325,7 @@ def _fused_permute_gmm_inner(
 
             inner_kernel(extract(slot), tiled_rhs_ref, tiled_out_ref,
                          partial_out_ref, acc_ref, metadata_ref, cfgs=cfgs,
-                         issue_fn=issue_fn)
+                         issue_fn=issue_fn, out_blocked=out_blocked)
             return
 
         @pl.when(s + 1 < num_steps)
@@ -310,7 +340,8 @@ def _fused_permute_gmm_inner(
         if packing > 1 and not packed_pool:
             wait_parity(slot)
         inner_kernel(extract(slot), tiled_rhs_ref, tiled_out_ref,
-                     partial_out_ref, acc_ref, metadata_ref, cfgs=cfgs)
+                     partial_out_ref, acc_ref, metadata_ref, cfgs=cfgs,
+                     out_blocked=out_blocked)
 
     @pl.when(s == 0)
     def _():
@@ -360,6 +391,7 @@ def kernel_main_fpg(
     coissue: bool,
     packed_pool: bool,
     issue_spread: int,
+    out_blocked: int,
 ):
     num_k = pl.cdiv(cfgs.dims.size_k, cfgs.tiles.tile_k)
     num_n = pl.cdiv(cfgs.out_size_n, cfgs.tiles.tile_n)
@@ -373,6 +405,8 @@ def kernel_main_fpg(
 
     (_, rhs_spec), out_spec = generate_block_specs(metadata_ref, cfgs,
                                                    rhs_buffer_count=2)
+    if out_blocked:
+        out_spec = _blocked_out_spec(metadata_ref, cfgs)
 
     if cfgs.fuse_act is not None:
         rhs_up_ref = jax.tree.map(lambda x: x.at[..., cfgs.out_size_n:],
@@ -388,13 +422,19 @@ def kernel_main_fpg(
                              num_slots=num_slots, chunk=chunk,
                              coissue=coissue,
                              packed_pool=packed_pool,
-                             issue_spread=issue_spread)
+                             issue_spread=issue_spread,
+                             out_blocked=out_blocked)
 
     pipeline_fn = pltpu.emit_pipeline(body, grid=(num_n, num_gm, num_k),
                                       in_specs=(rhs_spec, ),
                                       out_specs=out_spec)
 
-    out_in = out_ref.reshape(-1, cfgs.dims.size_lhs_sublane, out_ref.shape[-1])
+    if out_blocked:
+        out_in = out_ref.reshape(-1, cfgs.dims.size_lhs_sublane,
+                                 out_ref.shape[-2], out_ref.shape[-1])
+    else:
+        out_in = out_ref.reshape(-1, cfgs.dims.size_lhs_sublane,
+                                 out_ref.shape[-1])
     pipeline_fn(rhs_ref, out_in,
                 scratches=[partial_out_ref, acc_ref, metadata_ref, gather_buf,
                            gather_sem, parity_buf, parity_sem])
@@ -406,7 +446,7 @@ def kernel_main_fpg(
 @functools.partial(jax.jit, static_argnames=[
     "tile_info", "vmem_limit_bytes", "precision", "preferred_element_type",
     "acc_dtype", "maybe_quantize_lhs", "zero_initialize", "fuse_act",
-    "num_slots", "chunk", "coissue", "packed_pool", "issue_spread",
+    "num_slots", "chunk", "coissue", "packed_pool", "issue_spread", "out_blocked",
 ])
 def fused_permute_gmm(
     lhs: jax.Array,  # [size_src, size_k] un-permuted pool
@@ -430,6 +470,7 @@ def fused_permute_gmm(
     coissue: bool = True,
     packed_pool: bool = False,
     issue_spread: int = 1,
+    out_blocked: bool = False,
 ) -> jax.Array:
     """Grouped matmul over `lhs[gather_indices]` without materialising it.
 
@@ -509,6 +550,8 @@ def fused_permute_gmm(
     max_num_gm = dims.size_group + pl.cdiv(dims.size_m, tiles.tile_m) - 1
     acc_cols = 2 * tiles.tile_n if cfgs.fuse_act is not None else tiles.tile_n
     scratch_shapes = [
+        pltpu.VMEM((dims.size_lhs_sublane, tiles.tile_n // LANES, LANES),
+                   cfgs.out_dtype) if out_blocked else
         pltpu.VMEM((dims.size_lhs_sublane, tiles.tile_n), cfgs.out_dtype),
         pltpu.VMEM((tiles.tile_m, acc_cols), cfgs.acc_dtype),
         MetadataRef(
@@ -534,14 +577,18 @@ def fused_permute_gmm(
         scratch_shapes += [None, None]
 
     aligned_n = align_to(cfgs.out_size_n, num_lanes)
-    out_init = jax.ShapeDtypeStruct((dims.size_m, aligned_n), cfgs.out_dtype)
+    out_init = (jax.ShapeDtypeStruct(
+        (dims.size_m, aligned_n // LANES, LANES), cfgs.out_dtype)
+        if out_blocked else
+        jax.ShapeDtypeStruct((dims.size_m, aligned_n), cfgs.out_dtype))
 
-    return pl.pallas_call(
+    out = pl.pallas_call(
         functools.partial(kernel_main_fpg, cfgs=cfgs, packing=packing,
                           num_slots=num_slots, chunk=chunk,
                              coissue=coissue,
                              packed_pool=packed_pool,
-                             issue_spread=issue_spread),
+                             issue_spread=issue_spread,
+                             out_blocked=LANES if out_blocked else 0),
         out_shape=out_init,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=3,
@@ -562,4 +609,5 @@ def fused_permute_gmm(
         cost_estimate=get_cost_estimate(cfgs),
         metadata=get_metadata(cfgs),
     )(group_sizes, group_offset, idx, pool,
-      parity, rhs_weights)[:, :cfgs.out_size_n]
+      parity, rhs_weights)
+    return out if out_blocked else out[:, :cfgs.out_size_n]

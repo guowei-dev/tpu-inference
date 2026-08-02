@@ -377,6 +377,7 @@ def inner_kernel(
     *,
     cfgs: GmmConfigs,
     issue_fn=None,
+    out_blocked: int = 0,
 ):
     """Inner kernel invoked by emit_pipeline to perform matmul.
 
@@ -403,6 +404,10 @@ def inner_kernel(
             region as the dots -- a VLIW bundle can only pair two ops from one
             region, so an issue chain emitted around this call can never
             co-issue with the MXU no matter how it is spelled.
+        out_blocked: if non-zero, `tiled_out_ref` (and `partial_out_ref`) carry
+            a trailing lane dimension of this size, i.e. the output is declared
+            `[..., tile_n // lanes, lanes]` instead of `[..., tile_n]`. That
+            moves bf16's sub-word packing off the axis the output DMA slices.
     """
 
     gm_id = pl.program_id(1)
@@ -568,8 +573,15 @@ def inner_kernel(
             acc_masked = jnp.where(mask, acc, 0)
 
             # Write the final output to the output ref.
-            tiled_out_2d_ref = tiled_out_ref.reshape(-1, cfgs.tiles.tile_n)
-            tiled_out_2d_ref[:acc_m] = acc_masked.astype(tiled_out_ref.dtype)
+            if out_blocked:
+                nblk = cfgs.tiles.tile_n // out_blocked
+                tiled_out_2d_ref = tiled_out_ref.reshape(-1, nblk, out_blocked)
+                tiled_out_2d_ref[:acc_m] = acc_masked.reshape(
+                    acc_m, nblk, out_blocked).astype(tiled_out_ref.dtype)
+            else:
+                tiled_out_2d_ref = tiled_out_ref.reshape(-1, cfgs.tiles.tile_n)
+                tiled_out_2d_ref[:acc_m] = acc_masked.astype(
+                    tiled_out_ref.dtype)
 
             # If this is the first tile for grid[n_id, :, :], we initialize the
             # partial out to zeros. Otherwise, partial out from last tile of
