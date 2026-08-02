@@ -38,12 +38,26 @@ is bitwise-exact and costs 0.1% here.
 
 `coissue=` emits the next tile's row DMAs from inside `inner_kernel`, spread
 over its matmul sites, which is the only way they share a scheduling region
-with the dots -- a VLIW bundle can only pair two ops from one region. It lifts
-the measured co-issue from 0% to 43.9% (the region *ceiling* from 3.9% to
-67.3%). It is off by default: the chain must be unguarded to stay in-region, so
-it reads `tile_m - live` dead rows per tile (~5.7 us at T=2048), which
-currently costs more than the ~2.8 us the co-issue saves, and it does not yet
-compose with `packed_pool` inside a workable compile+run budget.
+with the dots -- a VLIW bundle can only pair two ops from one region. Injecting
+the whole tile lifts the measured co-issue from 0% to 43.9% (the region
+*ceiling* from 3.9% to 67.3%), but an injected row cannot be predicated (a
+guard is a region boundary), so it reads `tile_m - live` dead rows per tile.
+`coissue_rows` is therefore the depth knob, and it is a measured trade-off:
+4 rows is the deepest prefix that still clears 95% of the floor.
+
+    coissue_rows |  us  | % of ideal | region ceiling | issue co-issue
+    -------------|------|------------|----------------|---------------
+             0   | 191.7|   95.8%    |     4.4%       |     0%
+             4   | 193.0|   95.1%    |     8.4%       |     1.0%
+             8   | 193.9|   94.7%    |    12.3%       |     1.0%
+            64   | 196.6|   93.5%    |      --        |      --
+      64, no pool| 210.9|   87.1%    |    67.3%       |    43.9%
+
+Note on the warm-up: it must use the SAME prefix/tail split as the steady
+state. Starting all `tile_m` rows there while the steady wait expects the split
+desyncs the gather semaphore and the kernel core-halts (E0200) on the first
+tile with fewer than `tile_m` live rows -- and before that fix the combination
+simply hung, which is what made it look like a 45-minute compile wall.
 """
 import functools
 
@@ -151,6 +165,7 @@ def _fused_permute_gmm_inner(
     packed_pool: bool,
     issue_spread: int,
     out_blocked: int,
+    coissue_rows: int,
 ):
     """Pipeline body. rhs/out stay pipelined; the LHS tile is gathered."""
     tile_m = cfgs.tiles.tile_m
@@ -190,7 +205,7 @@ def _fused_permute_gmm_inner(
         pltpu.make_async_copy(parity_hbm.at[pl.ds(0, tile_m)],
                               parity_buf.at[slot], parity_sem.at[slot]).wait()
 
-    def start_rows(step, slot):
+    def start_rows(step, slot, first=0):
         """Issue the tile's row DMAs.
 
         The row DMA size is a static 1: Mosaic rejects a slice whose size
@@ -209,7 +224,7 @@ def _fused_permute_gmm_inner(
         """
         m_offset, live = m_base(step)
         k_base = lax.rem(step, num_k) * row_k
-        for c in range(0, tile_m, chunk):
+        for c in range(first, tile_m, chunk):
 
             @pl.when(c < live)
             def _(c=c):
@@ -219,7 +234,7 @@ def _fused_permute_gmm_inner(
                                     pl.ds(k_base, row_k)],
                         gather_buf.at[slot, pl.ds(j, 1)],
                         gather_sem.at[slot],
-                    ) for j in range(c, c + chunk)
+                    ) for j in range(c, min(c + chunk, tile_m))
                 ]
                 # Build every descriptor before starting any of them.
                 for cp in copies:
@@ -231,13 +246,13 @@ def _fused_permute_gmm_inner(
             return row  # one word per row-half pair, no row pairing
         return row >> shift if packing > 1 else row
 
-    def wait_rows(step, slot):
+    def wait_rows(step, slot, first=0):
         _, live = m_base(step)
-        for c in range(0, tile_m, chunk):
+        for c in range(first, tile_m, chunk):
 
             @pl.when(c < live)
             def _(c=c):
-                for _ in range(chunk):
+                for _ in range(min(c + chunk, tile_m) - c):
                     pltpu.make_async_copy(
                         lhs_pool.at[pl.ds(0, 1), pl.ds(0, row_k)],
                         gather_buf.at[slot, pl.ds(0, 1)],
@@ -300,8 +315,8 @@ def _fused_permute_gmm_inner(
         for cp in copies:
             cp.start()
 
-    def wait_rows_all(slot):
-        for _ in range(tile_m):
+    def wait_rows_prefix(slot, n):
+        for _ in range(n):
             pltpu.make_async_copy(
                 lhs_pool.at[pl.ds(0, 1), pl.ds(0, row_k)],
                 gather_buf.at[slot, pl.ds(0, 1)],
@@ -313,38 +328,47 @@ def _fused_permute_gmm_inner(
         nxt = (slot + 1) % num_slots
 
         if coissue:
-            # The next tile's rows are issued from inside inner_kernel, spread
-            # over its matmul sites, so they share a region with the dots.
+            # HYBRID split. `coissue_rows` rows are issued from INSIDE
+            # inner_kernel, so they share a scheduling region with the dots and
+            # actually co-issue; the rest keep the ordinary guarded path
+            # outside it. Two reasons not to inject the whole tile:
+            #   * an unguarded row cannot be skipped, so injecting all of them
+            #     reads `tile_m - live` dead rows per tile (5.7 us at T=2048),
+            #     which costs more than the co-issue saves;
+            #   * injecting all of them did not finish compile+run in 25-63 min
+            #     once the packed pool was in -- at every `issue_spread`, with
+            #     and without staging, and with a single slot.
+            # A small in-region prefix gets the property at negligible cost:
+            # rows below it are live on essentially every tile.
+            n_co = min(coissue_rows, tile_m)
+
             def issue_fn(site, n_sites, nxt=nxt):
-                # Spreading over every matmul site emits `n_sites` separate
-                # issue chains, which blows the program up (64 sites x
-                # num_slots bodies did not finish compiling in 25 min once the
-                # packed-pool extract was in). `issue_spread` caps how many
-                # sites carry rows; 1 puts the whole chain at the first site,
-                # which is still INSIDE the dots' region -- the property that
-                # matters -- at the code size of the guarded version.
                 n_use = n_sites if issue_spread <= 0 else min(n_sites,
                                                               issue_spread)
                 if site >= n_use:
                     return
-                per = -(-tile_m // n_use)
+                per = -(-n_co // n_use)
                 lo = site * per
-                if lo >= tile_m:
+                if lo >= n_co:
                     return
 
                 @pl.when(s + 1 < num_steps)
                 def _():
-                    start_rows_unguarded(s + 1, nxt, lo,
-                                         min(lo + per, tile_m))
+                    start_rows_unguarded(s + 1, nxt, lo, min(lo + per, n_co))
 
-            wait_rows_all(slot)
-            if packing > 1:
+            # The wait has to mirror the split exactly or the semaphore
+            # never balances: the injected prefix is unguarded, the tail
+            # carries the same predicates its starts do.
+            wait_rows_prefix(slot, n_co)
+            wait_rows(s, slot, first=n_co)
+            if packing > 1 and not packed_pool:
                 wait_parity(slot)
 
-            if not packed_pool:
-
-                @pl.when(s + 1 < num_steps)
-                def _():
+            @pl.when(s + 1 < num_steps)
+            def _():
+                # the tail, guarded as usual, outside the dots' region
+                start_rows(s + 1, nxt, first=n_co)
+                if not packed_pool:
                     start_parity(s + 1, nxt)
 
             inner_kernel(extract(slot), tiled_rhs_ref, tiled_out_ref,
@@ -370,7 +394,13 @@ def _fused_permute_gmm_inner(
     @pl.when(s == 0)
     def _():
         if coissue:
-            start_rows_unguarded(0, 0, 0, tile_m)
+            # The warm-up must use the SAME split as the steady state, or the
+            # gather semaphore never balances: the steady wait is
+            # `n_co unguarded + the guarded tail`, so the warm-up has to start
+            # exactly that. Starting all tile_m rows here core-halts (E0200)
+            # as soon as a tile has fewer than tile_m live rows.
+            start_rows_unguarded(0, 0, 0, min(coissue_rows, tile_m))
+            start_rows(0, 0, first=min(coissue_rows, tile_m))
         else:
             start_rows(0, 0)
         if not packed_pool:
@@ -417,6 +447,7 @@ def kernel_main_fpg(
     packed_pool: bool,
     issue_spread: int,
     out_blocked: int,
+    coissue_rows: int,
 ):
     num_k = pl.cdiv(cfgs.dims.size_k, cfgs.tiles.tile_k)
     num_n = pl.cdiv(cfgs.out_size_n, cfgs.tiles.tile_n)
@@ -448,7 +479,8 @@ def kernel_main_fpg(
                              coissue=coissue,
                              packed_pool=packed_pool,
                              issue_spread=issue_spread,
-                             out_blocked=out_blocked)
+                             out_blocked=out_blocked,
+                             coissue_rows=coissue_rows)
 
     pipeline_fn = pltpu.emit_pipeline(body, grid=(num_n, num_gm, num_k),
                                       in_specs=(rhs_spec, ),
@@ -471,7 +503,7 @@ def kernel_main_fpg(
 @functools.partial(jax.jit, static_argnames=[
     "tile_info", "vmem_limit_bytes", "precision", "preferred_element_type",
     "acc_dtype", "maybe_quantize_lhs", "zero_initialize", "fuse_act",
-    "num_slots", "chunk", "coissue", "packed_pool", "issue_spread", "out_blocked", "stage_lhs",
+    "num_slots", "chunk", "coissue", "packed_pool", "issue_spread", "out_blocked", "stage_lhs", "coissue_rows",
 ])
 def fused_permute_gmm(
     lhs: jax.Array,  # [size_src, size_k] un-permuted pool
@@ -497,6 +529,7 @@ def fused_permute_gmm(
     issue_spread: int = 1,
     out_blocked: bool = False,
     stage_lhs: bool = False,
+    coissue_rows: int = 4,
 ) -> jax.Array:
     """Grouped matmul over `lhs[gather_indices]` without materialising it.
 
@@ -616,7 +649,8 @@ def fused_permute_gmm(
                              coissue=coissue,
                              packed_pool=packed_pool,
                              issue_spread=issue_spread,
-                             out_blocked=LANES if out_blocked else 0),
+                             out_blocked=LANES if out_blocked else 0,
+                             coissue_rows=coissue_rows),
         out_shape=out_init,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=3,
