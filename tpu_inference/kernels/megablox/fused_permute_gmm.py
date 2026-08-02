@@ -2,35 +2,48 @@
 """Fused permute + grouped matmul.
 
 Reads the LHS per-row from an un-permuted pool inside the kernel, so the MoE
-dispatch permute never materialises. Same contract and bitwise-identical
-results to `gmm_v2(lhs[gather_indices], ...)` over the shard window.
+dispatch permute never materialises. Bitwise-identical to
+`gmm_v2(lhs[gather_indices], ...)` over the EP shard window.
 
-This is a rewrite of `gmm_v2`'s `gather_indices=` path around three
-measurements (`dev_nexus/project/moe-fuse-permute-gmm/artifact/fpg_lab`):
+A rewrite of `gmm_v2`'s `gather_indices=` path around four measurements
+(`dev_nexus/project/moe-fuse-permute-gmm/artifact/fpg_lab`); at the production
+regime (qwen397 EP8, T=2048) it moves the fused path from 73.9% of the pure-GMM
+floor to 95.7%.
 
-  * The tax is PER-GM-TILE, not per launch. `num_gm` == the shard's local
+  * **The tax is per-gm-tile, not per launch.** `num_gm` == the shard's local
     expert count (64) independently of T, and the tax fits
-    `num_gm * (0.707 us + 6.42 ns * live_rows_per_tile)` -- 71% of it fixed
-    per tile at the production point.
-  * `calculate_tiling` grows `tile_m` to fill VMEM, but the shard's rows are
-    spread over the expert groups, so a 512-row tile carries ~47 live rows at
-    T=2048 (9% fill) while the extract and the issue/wait sites are all sized
-    by `tile_m`. Matching `tile_m` to the live-row count is worth -39% of the
-    tax with no kernel change at all.
-  * The scalar/MXU co-issue is a CEILING problem here, not a scheduling one: a
-    DMA-issue bundle can only share a VLIW bundle with a `vmat*` in the same
-    region, and the old body put the issues in 32 `pl.when` regions and the
-    dots in a `lax.switch`/`lax.cond` nest -- 321 regions, so at most 0.96% of
-    the issues could ever co-issue. It realised 20.8% of that ceiling, i.e.
-    the scheduler was already doing as well as on a kernel that reaches 21.5%.
+    `num_gm * (0.707 us + 6.42 ns * live_rows_per_tile)` -- 71% of it fixed per
+    tile. So `tile_m` is chosen from the live-row count (`gather_tiling`,
+    ~`size_m / size_lhs_group`), not to fill VMEM: a 512-row tile carries ~47
+    live rows here, and the extract and the per-row issue/wait sites are all
+    sized by `tile_m` regardless. Worth -39% of the tax on its own.
+  * **The index table is a kernel-invariant SMEM operand**, not a DMA-streamed
+    window: no semaphore barrier in front of the address chain, and no
+    `tile_m + 128` window copy (which is also what made `tile_m=64` illegal in
+    the old path -- 192 is not a multiple of the 128-element lane tile).
+  * **The steady body is dispatched on `s % num_slots`** so every slot index is
+    a Python constant; a traced `s % nb` folds a runtime multiply/add into
+    every VMEM destination and semaphore address.
+  * **The pool is packed `int32[T, H/2]`** (`packed_pool=`), word `(r,c)` =
+    bf16 `(r,c) | (r,c+H/2)<<16`. A gathered row moves 8 KB instead of the
+    16 KB an int32 row-pair view costs, both halves are wanted so nothing is
+    discarded, the parity column and its `[M,1]` XLA materialisation disappear,
+    and `k` is the contracted axis so the unpack needs no weight permutation.
+    This is the lever that clears the 95% bar (-17 us). In production it is a
+    PRODUCER change -- 2 extra VPU ops, zero extra bytes -- never a repack pass.
 
-so this kernel keeps the body straight-line and the issue chain in it:
-`tile_m` is chosen from the live-row count (which makes the bucket switch
-single-branch), the index table is a kernel-invariant SMEM operand rather than
-a DMA-streamed window (no semaphore barrier in front of the address chain),
-and the steady body is dispatched on `s % num_slots` so every slot index is a
-Python constant (a traced `s % nb` hides the slots' disjointness from the
-scheduler, which then orders the whole issue chain ahead of the wait).
+`out_blocked=` declares the output `bf16[M, aligned_n//128, 128]` (the gdn-v3
+shape) so bf16's sub-word packing sits off the axis the output DMA slices; it
+is bitwise-exact and costs 0.1% here.
+
+`coissue=` emits the next tile's row DMAs from inside `inner_kernel`, spread
+over its matmul sites, which is the only way they share a scheduling region
+with the dots -- a VLIW bundle can only pair two ops from one region. It lifts
+the measured co-issue from 0% to 43.9% (the region *ceiling* from 3.9% to
+67.3%). It is off by default: the chain must be unguarded to stay in-region, so
+it reads `tile_m - live` dead rows per tile (~5.7 us at T=2048), which
+currently costs more than the ~2.8 us the co-issue saves, and it does not yet
+compose with `packed_pool` inside a workable compile+run budget.
 """
 import functools
 
@@ -125,6 +138,7 @@ def _fused_permute_gmm_inner(
     gather_sem,  # DMA[num_slots]
     parity_buf,  # [num_slots, tile_m, 1] int32
     parity_sem,  # DMA[num_slots]
+    lhs_buf,  # [num_slots, tile_m, tile_k] lhs dtype, or None
     *,
     cfgs: GmmConfigs,
     idx_smem,  # closed over: int32[padded_m] SMEM, kernel-invariant
@@ -234,16 +248,26 @@ def _fused_permute_gmm_inner(
         """u32 row -> the bf16 row the index selected."""
         if packed_pool:
             # Both halves are wanted, so there is no discarded read and no
-            # parity to look up. k is the CONTRACTED axis and the concat lands
-            # on a 128-multiple lane boundary, so it restores the original
-            # column order for free.
+            # parity to look up. k is the CONTRACTED axis, so the two halves
+            # only have to end up in the original column order.
             bits = gather_buf[slot]
             lo = jax.lax.bitcast_convert_type(
-                jnp.left_shift(bits, 16), jnp.float32)
+                jnp.left_shift(bits, 16), jnp.float32).astype(
+                    cfgs.lhs_cfgs.dtype)
             hi = jax.lax.bitcast_convert_type(
-                jnp.bitwise_and(bits, jnp.int32(-65536)), jnp.float32)
-            return jnp.concatenate(
-                [lo, hi], axis=1).astype(cfgs.lhs_cfgs.dtype)
+                jnp.bitwise_and(bits, jnp.int32(-65536)), jnp.float32).astype(
+                    cfgs.lhs_cfgs.dtype)
+            if lhs_buf is None:
+                # Concat form: lands on a 128-multiple lane boundary, so it is
+                # free -- but it keeps one [tile_m, tile_k] value live across
+                # everything downstream, which is fatal once the issue chain
+                # is injected into the matmul (co-issue + packed pool did not
+                # finish compile+run in 45 min in that form).
+                return jnp.concatenate([lo, hi], axis=1)
+            half = tile_k // 2
+            lhs_buf[slot, :, :half] = lo
+            lhs_buf[slot, :, half:] = hi
+            return lhs_buf[slot]
         if packing == 1:
             return gather_buf[slot]
         sh = 16 * (1 - jnp.bitwise_and(parity_buf[slot], 1))
@@ -381,6 +405,7 @@ def kernel_main_fpg(
     gather_sem,
     parity_buf,
     parity_sem,
+    lhs_buf,
     zero_ref,
     semaphore_ref,
     *,
@@ -437,7 +462,7 @@ def kernel_main_fpg(
                                  out_ref.shape[-1])
     pipeline_fn(rhs_ref, out_in,
                 scratches=[partial_out_ref, acc_ref, metadata_ref, gather_buf,
-                           gather_sem, parity_buf, parity_sem])
+                           gather_sem, parity_buf, parity_sem, lhs_buf])
 
     if cfgs.zero_init:
         zero_out_end(out_ref, semaphore_ref, zero_size, dims=cfgs.dims)
@@ -446,7 +471,7 @@ def kernel_main_fpg(
 @functools.partial(jax.jit, static_argnames=[
     "tile_info", "vmem_limit_bytes", "precision", "preferred_element_type",
     "acc_dtype", "maybe_quantize_lhs", "zero_initialize", "fuse_act",
-    "num_slots", "chunk", "coissue", "packed_pool", "issue_spread", "out_blocked",
+    "num_slots", "chunk", "coissue", "packed_pool", "issue_spread", "out_blocked", "stage_lhs",
 ])
 def fused_permute_gmm(
     lhs: jax.Array,  # [size_src, size_k] un-permuted pool
@@ -471,6 +496,7 @@ def fused_permute_gmm(
     packed_pool: bool = False,
     issue_spread: int = 1,
     out_blocked: bool = False,
+    stage_lhs: bool = False,
 ) -> jax.Array:
     """Grouped matmul over `lhs[gather_indices]` without materialising it.
 
@@ -564,6 +590,8 @@ def fused_permute_gmm(
         pltpu.SemaphoreType.DMA((num_slots, )),
         pltpu.VMEM((num_slots, tiles.tile_m, 1), jnp.int32),
         pltpu.SemaphoreType.DMA((num_slots, )),
+        pltpu.VMEM((num_slots, tiles.tile_m, tiles.tile_k), cfgs.lhs_cfgs.dtype)
+        if (packed_pool and stage_lhs) else None,
     ]
     if cfgs.zero_init:
         out_bytes = jnp.dtype(cfgs.out_dtype).itemsize

@@ -16,9 +16,12 @@ import collections
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from absl.testing import absltest, parameterized
 from jax._src import test_util as jtu
 
+from tpu_inference.kernels.megablox.fused_permute_gmm import (
+    fused_permute_gmm)
 from tpu_inference.kernels.megablox.gmm_v2 import (TileSizes, apply_act_fn,
                                                    gmm_v2, interleave_lane)
 
@@ -812,3 +815,87 @@ class GmmGatherTest(jtu.JaxTestCase):
         group_sizes = jnp.array([64, 0, 48, 0, 0, 32, 16, 0],
                                 dtype=jnp.int32)
         self._run(group_sizes, pool_rows=129, group_offset=2, odd_pool=True)
+
+
+def _pack_pool(pool):
+    """bf16[T, H] -> int32[T, H/2]: word (r,c) = bf16 (r,c) | (r,c+H/2)<<16."""
+    u = np.asarray(jax.device_get(pool)).view(np.uint16)
+    half = u.shape[1] // 2
+    return jnp.asarray(((u[:, half:].astype(np.uint32) << 16)
+                        | u[:, :half].astype(np.uint32)).view(np.int32))
+
+
+class FusedPermuteGmmTest(jtu.JaxTestCase):
+    """fused_permute_gmm vs the contiguous gmm_v2, bitwise over the shard."""
+
+    def _run(self, group_sizes, pool_rows, group_offset, odd_pool=False,
+             packed_pool=False, out_blocked=False, coissue=False,
+             stage_lhs=False):
+        num_groups = group_sizes.shape[0]
+        in_size, out_size = 512, 512
+        batch_size = int(group_sizes.sum())
+        num_local_groups = num_groups - group_offset
+        key = jax.random.key(0)
+
+        pool = jax.random.normal(key, (pool_rows, in_size),
+                                 dtype=jnp.bfloat16)
+        if odd_pool:
+            pool = pool[:pool_rows - 1]
+        indices = jax.random.randint(jax.random.key(1), (batch_size, ), 0,
+                                     pool.shape[0], dtype=jnp.int32)
+        rhs = jax.random.normal(key, (num_local_groups, in_size, out_size),
+                                dtype=jnp.bfloat16)
+        rhs_q, rhs_scale = quantize_tensor(rhs, jnp.float8_e4m3fn, axis=1,
+                                           block_size=in_size)
+        rhs_scale = jnp.expand_dims(rhs_scale, axis=2)
+        goff = jnp.array([group_offset], dtype=jnp.int32)
+        kwargs = dict(rhs_scale=rhs_scale, group_offset=goff, fuse_act="silu",
+                      preferred_element_type=jnp.bfloat16,
+                      zero_initialize=False)
+
+        fused = fused_permute_gmm(
+            _pack_pool(pool) if packed_pool else pool, rhs_q, group_sizes,
+            indices, packed_pool=packed_pool, out_blocked=out_blocked,
+            coissue=coissue, stage_lhs=stage_lhs, **kwargs)
+        if out_blocked:
+            # bf16[M, N//128, 128] -- the same bytes as bf16[M, N].
+            fused = fused.reshape(fused.shape[0], -1)[:, :out_size // 2]
+        contiguous = gmm_v2(pool[indices], rhs_q, group_sizes, **kwargs)
+
+        offsets = jnp.cumulative_sum(group_sizes, include_initial=True)
+        w0 = int(offsets[group_offset])
+        w1 = int(offsets[group_offset + num_local_groups])
+        # Rows outside the shard window are undefined in both paths
+        # (zero_initialize=False), exactly as in the production chain.
+        self.assertArraysEqual(fused[w0:w1], contiguous[w0:w1])
+
+    def test_matches_contiguous(self):
+        self._run(get_group_sizes(2560, 16), pool_rows=256, group_offset=4)
+
+    def test_window_base_regression(self):
+        # Adjacent gm tiles whose 128-aligned index-window bases differ -- the
+        # geometry that exposed the warm-up WAW race in the gmm_v2 path. This
+        # kernel has no index window, but the geometry stays covered.
+        group_sizes = jnp.array([68, 70, 40, 30, 50, 60, 25, 57],
+                                dtype=jnp.int32)
+        self._run(group_sizes, pool_rows=128, group_offset=1)
+
+    def test_empty_groups_and_odd_pool(self):
+        group_sizes = jnp.array([64, 0, 48, 0, 0, 32, 16, 0], dtype=jnp.int32)
+        self._run(group_sizes, pool_rows=129, group_offset=1, odd_pool=True)
+
+    def test_packed_pool(self):
+        self._run(get_group_sizes(2560, 16), pool_rows=256, group_offset=4,
+                  packed_pool=True)
+
+    def test_blocked_out(self):
+        self._run(get_group_sizes(2560, 16), pool_rows=256, group_offset=4,
+                  out_blocked=True)
+
+    def test_packed_pool_blocked_out_staged(self):
+        self._run(get_group_sizes(2560, 16), pool_rows=256, group_offset=4,
+                  packed_pool=True, out_blocked=True, stage_lhs=True)
+
+    def test_coissue(self):
+        self._run(get_group_sizes(2560, 16), pool_rows=256, group_offset=4,
+                  coissue=True)
