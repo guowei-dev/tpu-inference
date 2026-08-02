@@ -106,6 +106,7 @@ def _fused_permute_gmm_inner(
     chunk: int,
     coissue: bool,
     packed_pool: bool,
+    issue_spread: int,
 ):
     """Pipeline body. rhs/out stay pipelined; the LHS tile is gathered."""
     tile_m = cfgs.tiles.tile_m
@@ -261,7 +262,18 @@ def _fused_permute_gmm_inner(
             # The next tile's rows are issued from inside inner_kernel, spread
             # over its matmul sites, so they share a region with the dots.
             def issue_fn(site, n_sites, nxt=nxt):
-                per = -(-tile_m // n_sites)
+                # Spreading over every matmul site emits `n_sites` separate
+                # issue chains, which blows the program up (64 sites x
+                # num_slots bodies did not finish compiling in 25 min once the
+                # packed-pool extract was in). `issue_spread` caps how many
+                # sites carry rows; 1 puts the whole chain at the first site,
+                # which is still INSIDE the dots' region -- the property that
+                # matters -- at the code size of the guarded version.
+                n_use = n_sites if issue_spread <= 0 else min(n_sites,
+                                                              issue_spread)
+                if site >= n_use:
+                    return
+                per = -(-tile_m // n_use)
                 lo = site * per
                 if lo >= tile_m:
                     return
@@ -347,6 +359,7 @@ def kernel_main_fpg(
     chunk: int,
     coissue: bool,
     packed_pool: bool,
+    issue_spread: int,
 ):
     num_k = pl.cdiv(cfgs.dims.size_k, cfgs.tiles.tile_k)
     num_n = pl.cdiv(cfgs.out_size_n, cfgs.tiles.tile_n)
@@ -374,7 +387,8 @@ def kernel_main_fpg(
                              parity_hbm=parity_hbm, packing=packing,
                              num_slots=num_slots, chunk=chunk,
                              coissue=coissue,
-                             packed_pool=packed_pool)
+                             packed_pool=packed_pool,
+                             issue_spread=issue_spread)
 
     pipeline_fn = pltpu.emit_pipeline(body, grid=(num_n, num_gm, num_k),
                                       in_specs=(rhs_spec, ),
@@ -392,7 +406,7 @@ def kernel_main_fpg(
 @functools.partial(jax.jit, static_argnames=[
     "tile_info", "vmem_limit_bytes", "precision", "preferred_element_type",
     "acc_dtype", "maybe_quantize_lhs", "zero_initialize", "fuse_act",
-    "num_slots", "chunk", "coissue", "packed_pool",
+    "num_slots", "chunk", "coissue", "packed_pool", "issue_spread",
 ])
 def fused_permute_gmm(
     lhs: jax.Array,  # [size_src, size_k] un-permuted pool
@@ -415,6 +429,7 @@ def fused_permute_gmm(
     chunk: int = 16,
     coissue: bool = True,
     packed_pool: bool = False,
+    issue_spread: int = 1,
 ) -> jax.Array:
     """Grouped matmul over `lhs[gather_indices]` without materialising it.
 
@@ -525,7 +540,8 @@ def fused_permute_gmm(
         functools.partial(kernel_main_fpg, cfgs=cfgs, packing=packing,
                           num_slots=num_slots, chunk=chunk,
                              coissue=coissue,
-                             packed_pool=packed_pool),
+                             packed_pool=packed_pool,
+                             issue_spread=issue_spread),
         out_shape=out_init,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=3,
