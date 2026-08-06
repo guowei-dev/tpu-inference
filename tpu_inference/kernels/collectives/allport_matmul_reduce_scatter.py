@@ -717,7 +717,18 @@ def allport_matmul_reduce_scatter(
     # Small M (VMEM path): one weight sweep + whole-a residency + full-width
     # merges — the floor is MXU weight re-sweeps and DMA-op latency, not
     # bytes (measured @256: "compute" 82.6 us vs 11.4 us of matmul).
-    whole_a = (not use_hbm) and m_per <= 64
+    # whole-a's OWN footprint has to fit before it can be chosen: it holds all
+    # of a (not a 2-slot buffer), per-label acc slots in wire dtype rather than
+    # one fp32 accumulator, and full-width merges. `use_hbm` is decided from
+    # get_vmem_estimate_bytes, which models the CHUNKED shapes, so at large
+    # n_per*k it can clear the budget while whole-a does not — the kernel then
+    # picks a config it cannot compile (E1001). `fixed` below is that footprint
+    # (w + whole a + run/acc slots + recv), already needed for the prod choice,
+    # so gate on it and fall back to the chunked VMEM path.
+    isz = a.dtype.itemsize
+    fixed = (n_per_est * k * isz + m * n_per_est * isz +
+             2 * num_chips * m_per * k * isz + 2 * m_per * k * isz)
+    whole_a = (not use_hbm) and m_per <= 64 and fixed <= _VMEM_CAP_BYTES
     bk_merge = k if whole_a else bk
     use_prod = False
     if whole_a:
@@ -726,9 +737,6 @@ def allport_matmul_reduce_scatter(
         # the prod scratch — shrink bk until it fits; if nothing fits, fall
         # back to variant B (tile-major per-chunk dots against a stationary
         # w tile — no prod buffer, weights stay loaded across chunks).
-        isz = a.dtype.itemsize
-        fixed = (n_per_est * k * isz + m * n_per_est * isz +
-                 2 * num_chips * m_per * k * isz + 2 * m_per * k * isz)
         for c in (2048, 1024, 512, 256, 128):
             if k % c == 0 and (fixed + 2 * m * c * 4 + m * n_per_est * isz +
                                n_per_est * c * isz + 4 * 1024 * 1024
