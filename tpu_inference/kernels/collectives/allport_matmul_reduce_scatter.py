@@ -625,6 +625,39 @@ def get_vmem_estimate_bytes_hbm(m_per, n_per, k, bk, itemsize):
 _VMEM_CAP_BYTES = 67043328
 
 
+def _scratch_bytes(scratch_shapes):
+    """Bytes of the VMEM scratches a config declares — Mosaic must fit these,
+    so the limit is never allowed below it."""
+    return sum(
+        math.prod(s.shape) * jnp.dtype(s.dtype).itemsize
+        for s in scratch_shapes
+        if getattr(s, "memory_space", None) == pltpu.MemorySpace.VMEM)
+
+
+def _limit_covering(estimate, scratch_shapes):
+    """vmem_limit = estimate + 8 MiB, raised only if that fails to cover the
+    scratch actually declared.
+
+    The estimators predate the whole-a variants: they model neither the
+    per-label wire-dtype acc slots nor the one-sweep `prod` buffer, so on that
+    path `estimate + 8 MiB` can land BELOW the declaration and Mosaic E1001s a
+    shape that fits (v33: compiles iff limit >= declared scratch).
+
+    The raise is CONDITIONAL, not a `max`, and that is load-bearing: a limit
+    that already covers its declaration keeps its exact previous value, because
+    a too-HIGH limit is byte-identical but 9% slower at m_per=32 on this kernel
+    (STATUS 2026-07-29) and every recorded llama70b number was measured at the
+    old value. Verified by compiled-HLO fingerprint equality across the fix
+    (`probe_compile_only.py --tag pre/post`): an unconditional `max` moved
+    M=256/512/1024; this form moves nothing that already compiled.
+    """
+    limit = estimate + 8 * 1024 * 1024
+    declared = _scratch_bytes(scratch_shapes)
+    if limit < declared:
+        limit = declared + 8 * 1024 * 1024
+    return min(limit, _VMEM_CAP_BYTES)
+
+
 def allport_matmul_reduce_scatter(
     a,
     w,
@@ -664,10 +697,21 @@ def allport_matmul_reduce_scatter(
     # HBM mode: the staging/RMW buffers scale with bk and the wire messages
     # don't — pick the largest bk whose whole footprint still fits.
     if use_hbm:
-        bk = next(c for c in (2048, 1024, 512, 256, 128)
-                  if k % c == 0 and get_vmem_estimate_bytes_hbm(
-                      m_per, n_per_est, k, c, a.dtype.itemsize) +
-                  8 * 1024 * 1024 <= _VMEM_CAP_BYTES)
+        bk = next((c for c in (2048, 1024, 512, 256, 128)
+                   if k % c == 0 and get_vmem_estimate_bytes_hbm(
+                       m_per, n_per_est, k, c, a.dtype.itemsize) +
+                   8 * 1024 * 1024 <= _VMEM_CAP_BYTES), None)
+        if bk is None:
+            # The bk-independent terms alone (resident w, the a double buffer,
+            # the fp32 accumulator) exceed the budget, so no tiling saves it.
+            floor = get_vmem_estimate_bytes_hbm(m_per, n_per_est, k, 128,
+                                                a.dtype.itemsize)
+            raise ValueError(
+                f"allport MM-RS does not fit at m={m}, n_per={n_per_est}, "
+                f"k={k}: the smallest bk (128) still needs "
+                f"{floor / 2**20:.1f} MiB of VMEM, over the "
+                f"{(_VMEM_CAP_BYTES - 8 * 1024 * 1024) / 2**20:.1f} MiB "
+                "budget. Reduce m or n_per, or use the ring kernel.")
     else:
         bk = bk_v
     # Small M (VMEM path): one weight sweep + whole-a residency + full-width
@@ -721,10 +765,10 @@ def allport_matmul_reduce_scatter(
             )
             out_specs = (hbm, hbm, hbm, hbm)
             kernel_fn = _allport_kernel_hbm
-            vmem_limit = min(
+            vmem_limit = _limit_covering(
                 get_vmem_estimate_bytes_hbm(m_per, n_per, k, bk,
-                                            a_local.dtype.itemsize) +
-                8 * 1024 * 1024, _VMEM_CAP_BYTES)
+                                            a_local.dtype.itemsize),
+                scratch_shapes)
         else:
             a_shape = ((m, n_per) if whole_a else (2, m_per, n_per))
             # whole_a: per-label own slots (wire dtype, one extra rounding);
@@ -756,12 +800,17 @@ def allport_matmul_reduce_scatter(
             )
             out_specs = (hbm, hbm, hbm)
             kernel_fn = _allport_kernel
+            # The estimator predates the whole-a variants: it models neither the
+            # per-label bf16 acc slots nor the one-sweep prod buffer, so on that
+            # path it can land BELOW the scratch actually declared and Mosaic
+            # E1001s on a shape that fits. The limit must still cover the
+            # declaration, so take the larger of the two.
             a_bytes = (m if whole_a else 2 * m_per) * n_per
-            vmem_limit = min(
+            vmem_limit = _limit_covering(
                 get_vmem_estimate_bytes(m_per, n_per, k, bk, num_chips,
                                         recv_w, a_local.dtype.itemsize) +
-                (a_bytes - 2 * m_per * n_per) * a_local.dtype.itemsize +
-                8 * 1024 * 1024, _VMEM_CAP_BYTES)
+                (a_bytes - 2 * m_per * n_per) * a_local.dtype.itemsize,
+                scratch_shapes)
         grid_spec = pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=0,
             in_specs=[hbm, hbm],
