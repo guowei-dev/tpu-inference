@@ -70,6 +70,28 @@ class MatmulReduceScatterTest(jtu.JaxTestCase):
             expected = _xla_reference(mesh, axis_name, a, w)
             self.assertAllClose(output, expected, atol=1e-4, rtol=1e-4)
 
+    @parameterized.parameters(2592, 2784)
+    def test_matmul_reduce_scatter_unaligned_n_per(self, n_per):
+        # n // tp_size not a multiple of 128 (production MLP intermediate
+        # dims, e.g. D=20736 at tp=8): the kernel runs its VMEM operands at
+        # the lane-padded width with the pad region zeroed. fp32 + exact
+        # comparison verifies the pad contributes exactly nothing.
+        if jax.device_count() != 8:
+            self.skipTest('Not enough devices for test')
+
+        axis_name = 'x'
+        num_devices = jax.device_count()
+        mesh = utils.make_optimized_mesh((num_devices, ), (axis_name, ))
+        m, n, k = 1024, n_per * num_devices, 1024
+
+        for i in range(3):
+            a, w = _make_inputs(mesh, axis_name, m, n, k, jnp.float32,
+                                1234 + i)
+            output = matmul_reduce_scatter.matmul_reduce_scatter(
+                a, w, mesh, axis_name)
+            expected = _xla_reference(mesh, axis_name, a, w)
+            self.assertAllClose(output, expected, atol=1e-4, rtol=1e-4)
+
     def test_matmul_reduce_scatter_bf16_no_worse_than_xla(self):
         # bf16 rounds on every wire hop, and the kernel and the unfused path
         # round in different orders — compare both against an fp32 golden and
