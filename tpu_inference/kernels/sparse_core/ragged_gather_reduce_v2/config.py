@@ -26,6 +26,20 @@ def _align_to(a, b):
     return pl.cdiv(a, b) * b
 
 
+class _CostModelConstants:
+    # Limit on the number of outer loop pipeline iterations. Too many iterations
+    # cause high cumulative pipeline overhead (e.g., from frequent pipeline
+    # startup/teardown bubbles). We try to find partitioning that does not exceed
+    # this limit on iterations.
+    MAX_ITERATIONS: int = 40
+
+    # Upper cap on the column chunk size processed per inner pipeline step.
+    # While larger chunk sizes help utilize bandwidth better, excessively large
+    # chunk sizes cause large pipeline bubbles. We cap it here to balance
+    # efficiency and bubble sizes.
+    MAX_COL_CHUNK_SIZE: int = 1024
+
+
 @dataclasses.dataclass(frozen=True)
 class Config:
     input_size: int
@@ -50,11 +64,18 @@ class Config:
     def num_tot_cores(self) -> int:
         return self.sc_info.num_cores * self.sc_info.num_subcores
 
-    @property
-    def num_row_subchunks(self) -> int:
-        base_block_size = self.sc_info.num_lanes * self.num_row_partitions
+    def get_num_row_subchunks(self, num_row_partitions: int) -> int:
+        base_block_size = self.sc_info.num_lanes * num_row_partitions
         input_size_block = pl.cdiv(self.input_size, base_block_size)
         return max(1, min(4, input_size_block))
+
+    def get_row_chunk_size(self, num_row_partitions: int) -> int:
+        return (self.sc_info.num_lanes *
+                self.get_num_row_subchunks(num_row_partitions))
+
+    @property
+    def num_row_subchunks(self) -> int:
+        return self.get_num_row_subchunks(self.num_row_partitions)
 
     @property
     def output_size(self) -> int:
@@ -121,7 +142,7 @@ class Config:
     @property
     def row_chunk_size(self) -> int:
         """Number of rows handled per row-pipeline block."""
-        return self.sc_info.num_lanes * self.num_row_subchunks
+        return self.get_row_chunk_size(self.num_row_partitions)
 
     @property
     def num_col_chunks(self) -> int:
@@ -152,6 +173,7 @@ class Config:
         # partition's size can divide the hidden size.
         # Each column partition will do DMA pipelining on col_size.
         num_lanes = self.tpu_info.num_lanes
+        num_simd_lanes = self.sc_info.num_lanes
         preferred_num_stages = 4
         num_column_partitions = 1
         while (self.num_tot_cores % (num_column_partitions * 2) == 0
@@ -159,7 +181,26 @@ class Config:
                (num_lanes * num_column_partitions * 2) == 0
                and self.hidden_size // (num_column_partitions * 2 * num_lanes)
                >= preferred_num_stages):
-            num_column_partitions *= 2
+            next_candidate = num_column_partitions * 2
+            next_row_partitions = self.num_tot_cores // next_candidate
+
+            # Calculate exactly how many pipeline invocations (outer loop).
+            row_chunk_size = self.get_row_chunk_size(next_row_partitions)
+            num_iterations = self.input_size // (row_chunk_size *
+                                                 next_row_partitions)
+
+            # Too many row partitions for the SIMD lanes: split the columns
+            # further before weighing the iteration count.
+            if self.num_tot_cores // num_column_partitions > num_simd_lanes:
+                num_column_partitions = next_candidate
+                continue
+
+            # Too many iterations cause high cumulative pipeline overhead. Set
+            # the limit based on empirical data.
+            if num_iterations > _CostModelConstants.MAX_ITERATIONS:
+                break
+
+            num_column_partitions = next_candidate
         return num_column_partitions
 
     @property
@@ -193,9 +234,13 @@ class Config:
         num_simd_lanes = self.sc_info.num_lanes
         num_lanes = self.tpu_info.num_lanes
         bytes_per_col = num_simd_lanes * 4 * 2
-        max_safe_col = _align_to(target_bytes // bytes_per_col, num_lanes)
+        max_safe_col = (target_bytes // bytes_per_col // num_lanes) * num_lanes
 
-        start_col = _align_to(min(self.col_size, max_safe_col), num_lanes)
+        # Larger chunk sizes cause larger pipeline bubbles, so cap it.
+        max_safe_col = min(max_safe_col,
+                           _CostModelConstants.MAX_COL_CHUNK_SIZE)
+
+        start_col = (min(self.col_size, max_safe_col) // num_lanes) * num_lanes
         for chunk in range(start_col, num_lanes - 1, -num_lanes):
             if self.col_size % chunk == 0:
                 return chunk

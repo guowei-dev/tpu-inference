@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import dataclasses
 import functools
 import itertools
 import time
@@ -21,9 +22,12 @@ import jax.numpy as jnp
 import numpy as np
 from absl.testing import absltest, parameterized
 from jax._src import test_util as jtu
+from jax.experimental.pallas import tpu as pltpu
 
 from tpu_inference.kernels.sparse_core.ragged_gather_reduce import \
     ragged_gather_reduce as ragged_gather_reduce_v1
+from tpu_inference.kernels.sparse_core.ragged_gather_reduce_v2 import \
+    config as rgr_v2_config
 from tpu_inference.kernels.sparse_core.ragged_gather_reduce_v2 import \
     ragged_gather_reduce as ragged_gather_reduce_v2
 from tpu_inference.kernels.sparse_core.ragged_scatter import ragged_scatter
@@ -182,6 +186,51 @@ class ScatterTest(jtu.JaxTestCase):
             actual = ragged_gather_reduce_v2(x, indices, topk_weights,
                                              valid_rows_mask, rgs)
             np.testing.assert_allclose(actual, desired, atol=1e-2, rtol=1e-2)
+
+    def test_sc_ragged_gather_reduce_v2_tiling_cost_model(self):
+        """The tiling derivation applies its iteration limit, its chunk limit
+        and its round-down, on shapes and devices where each is observable.
+
+        None of the three is a property of the kernel: the iteration limit only
+        stops the column split growing, so a large enough input exceeds it
+        anyway, and the round-down is invisible wherever the chunk limit
+        already binds. Retiling leaves the kernel's output unchanged, so
+        nothing else in the suite observes any of them.
+        """
+        live = pltpu.get_tpu_info()
+        if live.sparse_core is None:
+            self.skipTest("no SparseCore on this TPU")
+
+        def tiling(input_size, hidden_size, generation, num_simd_lanes):
+            return rgr_v2_config.Config(
+                input_size=input_size,
+                hidden_size=hidden_size,
+                reduce_group_size=8,
+                in_dtype=jnp.bfloat16,
+                core_axis_name="core",
+                subcore_axis_name="subcore",
+                tpu_info=dataclasses.replace(live,
+                                             generation=generation,
+                                             num_lanes=128,
+                                             sparse_core=dataclasses.replace(
+                                                 live.sparse_core,
+                                                 num_cores=2,
+                                                 num_subcores=16,
+                                                 num_lanes=num_simd_lanes)),
+            )
+
+        # The limits are spelled out rather than read from _CostModelConstants,
+        # so a derivation that stops consulting them still fails here.
+        for input_size, hidden_size in ((20480, 4096), (32768, 4096)):
+            cfg = tiling(input_size, hidden_size, 7, 16)
+            self.assertLessEqual(
+                input_size // (cfg.row_chunk_size * cfg.num_row_partitions),
+                40)
+            self.assertLessEqual(cfg.col_chunk_size, 1024)
+
+        # This device makes the rounding observable: rounding the chunk's VMEM
+        # bound up instead of down picks 1024, over the budget it enforces.
+        self.assertEqual(tiling(32768, 4096, 6, 32).col_chunk_size, 512)
 
     # The first perf test case approximates the DeepSeekV3, 2k-batch-size, EP=16.
     # The second case approximates the Qwen3-Coder-480B, 2k-batch-size, EP=8.
