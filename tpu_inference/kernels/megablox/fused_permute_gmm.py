@@ -21,9 +21,20 @@ floor to 95.7%.
     window: no semaphore barrier in front of the address chain, and no
     `tile_m + 128` window copy (which is also what made `tile_m=64` illegal in
     the old path -- 192 is not a multiple of the 128-element lane tile).
-  * **The steady body is dispatched on `s % num_slots`** so every slot index is
-    a Python constant; a traced `s % nb` folds a runtime multiply/add into
-    every VMEM destination and semaphore address.
+  * **The steady body is emitted ONCE with a traced slot** (`traced_slots=`,
+    default on). The parity-dispatched form (every slot index a Python
+    constant) was this kernel's first answer and measured better on the
+    original chassis; on the migrated chassis (rhs_buffers=3) the halved
+    body wins -- traced+3-buffer is -3.5 us at T=2048 while constant slots
+    alone are -1.4 (ledger fpg-tslot; the parent project's round 14 found
+    the same inversion on its loop chassis). `traced_slots=False` keeps the
+    parity form.
+  * **The weight stream runs three deep** (`rhs_buffers=`, default 3 --
+    `generate_block_specs`' own default). The inherited gather path dropped
+    it to 2 to make room for a 16 MiB gather buffer at tile_m=512; with
+    live-row tiles and a packed pool the gather scratch is ~1 MB and the
+    third buffer pays, but ONLY together with the traced-slot body (alone it
+    is -0.5 us, together -3.5; ledger fpg-rhs3).
   * **The pool is packed `int32[T, H/2]`** (`packed_pool=`), word `(r,c)` =
     bf16 `(r,c) | (r,c+H/2)<<16`. A gathered row moves 8 KB instead of the
     16 KB an int32 row-pair view costs, both halves are wanted so nothing is
@@ -31,6 +42,12 @@ floor to 95.7%.
     and `k` is the contracted axis so the unpack needs no weight permutation.
     This is the lever that clears the 95% bar (-17 us). In production it is a
     PRODUCER change -- 2 extra VPU ops, zero extra bytes -- never a repack pass.
+    `pool_blocked=` accepts the alternative producer contract
+    `bf16[T, H//128, 128]` (the parent's round-10 input form): dim 0 sits off
+    the tiled pair so a plain bf16 per-row DMA is legal and there is no unpack
+    at all; the dot pays one value-level reshape relayout instead. Measured:
+    a small win only at small T with tile_m=32 (-0.4/-0.7 us @T=64), and
+    +1.6 us at T=2048 -- the packed pool remains the default form.
 
 `out_blocked=` declares the output `bf16[M, aligned_n//128, 128]` (the gdn-v3
 shape) so bf16's sub-word packing sits off the axis the output DMA slices; it
@@ -52,6 +69,12 @@ guard is a region boundary), so it reads `tile_m - live` dead rows per tile.
              8   | 193.9|   94.7%    |    12.3%       |     1.0%
             64   | 196.6|   93.5%    |      --        |      --
       64, no pool| 210.9|   87.1%    |    67.3%       |    43.9%
+
+    (Measured on the original chassis. On the migrated traced-slot +
+    3-buffer chassis every co-issue depth costs ~+5 us at T=2048 and is
+    ~neutral at T=64 -- the tighter body has less slack to absorb the
+    unguarded prefix's dead reads. The mechanism and the knob remain;
+    whether to pay for the property is per-deployment.)
 
 Note on the warm-up: it must use the SAME prefix/tail split as the steady
 state. Starting all `tile_m` rows there while the steady wait expects the split
@@ -108,7 +131,16 @@ def gather_tiling(size_m: int, size_group: int) -> int:
     aligned to tiles"). This kernel has no index window.
     """
     live = -(-size_m // max(size_group, 1))
-    return int(min(512, max(64, align_to(live, 64))))
+    # Headroom above the MEAN group size, because a gm tile smaller than a
+    # group SPLITS it and every split re-streams that group's whole weight
+    # block (~2.8 us here): measured at T=1024, tile_m=32 (mean 20, so
+    # groups of >32 rows split), num_gm went 64 -> 79 and the kernel lost
+    # 28.6 us -- far more than the small-tile saving. group_sizes is traced,
+    # so the largest group is unknowable at trace time; mean + 3*sqrt(mean)
+    # covers a balanced (multinomial) router's spread. A skewed router still
+    # splits its hot groups, which is correct, just not free.
+    live += 3 * int(live**0.5 + 0.999)  # + 3*ceil(sqrt(mean))
+    return int(min(512, max(32, align_to(live, 32))))
 
 
 LANES = 128
@@ -163,9 +195,11 @@ def _fused_permute_gmm_inner(
     chunk: int,
     coissue: bool,
     packed_pool: bool,
+    pool_blocked: bool,
     issue_spread: int,
     out_blocked: int,
     coissue_rows: int,
+    traced_slots: bool,
 ):
     """Pipeline body. rhs/out stay pipelined; the LHS tile is gathered."""
     tile_m = cfgs.tiles.tile_m
@@ -177,6 +211,11 @@ def _fused_permute_gmm_inner(
     # the 4H the u32 row-pair view costs, the row index needs no shift, and the
     # parity column disappears entirely.
     row_k = tile_k // 2 if packed_pool else tile_k
+    if pool_blocked:
+        # bf16[T, H//128, 128] pool: dim 0 is off the tiled pair, so a plain
+        # bf16 per-row DMA is legal and there is no unpack at all; the dot
+        # pays one value-level reshape relayout instead (see extract()).
+        row_k = tile_k // LANES
 
     num_gm = pl.num_programs(1)
     num_k = pl.num_programs(2)
@@ -242,8 +281,8 @@ def _fused_permute_gmm_inner(
 
     def _row(i):
         row = idx_smem[i]
-        if packed_pool:
-            return row  # one word per row-half pair, no row pairing
+        if packed_pool or pool_blocked:
+            return row  # one physical row per logical row, no pairing
         return row >> shift if packing > 1 else row
 
     def wait_rows(step, slot, first=0):
@@ -261,6 +300,12 @@ def _fused_permute_gmm_inner(
 
     def extract(slot):
         """u32 row -> the bf16 row the index selected."""
+        if pool_blocked:
+            # The row arrived as plain bf16 whole words -- there is nothing
+            # to unpack. The dot wants sublane=row, the blocked buffer has
+            # sublane=block, so this reshape is a relayout; it replaces the
+            # whole packed-pool unpack chain.
+            return gather_buf[slot].reshape(tile_m, tile_k)
         if packed_pool:
             # Both halves are wanted, so there is no discarded read and no
             # parity to look up. k is the CONTRACTED axis, so the two halves
@@ -368,7 +413,7 @@ def _fused_permute_gmm_inner(
             def _():
                 # the tail, guarded as usual, outside the dots' region
                 start_rows(s + 1, nxt, first=n_co)
-                if not packed_pool:
+                if packing > 1 and not packed_pool:
                     start_parity(s + 1, nxt)
 
             inner_kernel(extract(slot), tiled_rhs_ref, tiled_out_ref,
@@ -379,9 +424,12 @@ def _fused_permute_gmm_inner(
         @pl.when(s + 1 < num_steps)
         def _():
             # Issue-first: feed the engine for the next tile before this
-            # tile's data is touched.
+            # tile's data is touched. The parent project's post-dot order
+            # (round 14) was probed and measured +4.3..+8.2 us here -- on
+            # the emit_pipeline chassis issue-first gives the next tile's
+            # gather a full dot of cover (ledger fpg-postdot).
             start_rows(s + 1, nxt)
-            if not packed_pool:
+            if packing > 1 and not packed_pool:
                 start_parity(s + 1, nxt)
 
         wait_rows(s, slot)
@@ -403,17 +451,23 @@ def _fused_permute_gmm_inner(
             start_rows(0, 0, first=min(coissue_rows, tile_m))
         else:
             start_rows(0, 0)
-        if not packed_pool:
+        if packing > 1 and not packed_pool:
             start_parity(0, 0)
 
-    for slot in range(num_slots):
-        # Dispatching on the parity makes every slot index inside the branch a
-        # Python constant. A traced `s % num_slots` folds a runtime
-        # multiply/add into every VMEM destination and semaphore address, and
-        # hides the slots' disjointness from the scheduler.
-        @pl.when(lax.rem(s, num_slots) == slot)
-        def _(slot=slot):
-            run(slot)
+    if traced_slots:
+        # The parent's round-13/14 counter-structure: emit the body ONCE with
+        # a traced slot. Halves the program (and its region count) at the
+        # price of folding a runtime multiply/add into every VMEM destination
+        # and semaphore address; which side wins is chassis-dependent and is
+        # measured, not assumed.
+        run(lax.rem(s, num_slots))
+    else:
+        for slot in range(num_slots):
+            # Dispatching on the parity makes every slot index inside the
+            # branch a Python constant, so it folds into the descriptor.
+            @pl.when(lax.rem(s, num_slots) == slot)
+            def _(slot=slot):
+                run(slot)
 
 
 def kernel_main_fpg(
@@ -445,9 +499,12 @@ def kernel_main_fpg(
     chunk: int,
     coissue: bool,
     packed_pool: bool,
+    pool_blocked: bool,
     issue_spread: int,
     out_blocked: int,
     coissue_rows: int,
+    traced_slots: bool,
+    rhs_buffers: int,
 ):
     num_k = pl.cdiv(cfgs.dims.size_k, cfgs.tiles.tile_k)
     num_n = pl.cdiv(cfgs.out_size_n, cfgs.tiles.tile_n)
@@ -459,8 +516,8 @@ def kernel_main_fpg(
         zero_size = zero_out_start(out_ref, zero_ref, semaphore_ref,
                                    metadata_ref, num_gm, dims=cfgs.dims)
 
-    (_, rhs_spec), out_spec = generate_block_specs(metadata_ref, cfgs,
-                                                   rhs_buffer_count=2)
+    (_, rhs_spec), out_spec = generate_block_specs(
+        metadata_ref, cfgs, rhs_buffer_count=rhs_buffers)
     if out_blocked:
         out_spec = _blocked_out_spec(metadata_ref, cfgs)
 
@@ -470,7 +527,7 @@ def kernel_main_fpg(
         rhs_ref = FusedWeightsRef(gate=rhs_ref, up=rhs_up_ref)
         rhs_spec = FusedWeightsRef(gate=rhs_spec, up=rhs_spec)
 
-    lhs_pool = (lhs_ref if packed_pool or packing == 1
+    lhs_pool = (lhs_ref if packed_pool or pool_blocked or packing == 1
                 else lhs_ref.bitcast(jnp.int32))
     body = functools.partial(_fused_permute_gmm_inner, cfgs=cfgs,
                              idx_smem=idx_smem, lhs_pool=lhs_pool,
@@ -478,9 +535,11 @@ def kernel_main_fpg(
                              num_slots=num_slots, chunk=chunk,
                              coissue=coissue,
                              packed_pool=packed_pool,
+                             pool_blocked=pool_blocked,
                              issue_spread=issue_spread,
                              out_blocked=out_blocked,
-                             coissue_rows=coissue_rows)
+                             coissue_rows=coissue_rows,
+                             traced_slots=traced_slots)
 
     pipeline_fn = pltpu.emit_pipeline(body, grid=(num_n, num_gm, num_k),
                                       in_specs=(rhs_spec, ),
@@ -503,7 +562,9 @@ def kernel_main_fpg(
 @functools.partial(jax.jit, static_argnames=[
     "tile_info", "vmem_limit_bytes", "precision", "preferred_element_type",
     "acc_dtype", "maybe_quantize_lhs", "zero_initialize", "fuse_act",
-    "num_slots", "chunk", "coissue", "packed_pool", "issue_spread", "out_blocked", "stage_lhs", "coissue_rows",
+    "num_slots", "chunk", "coissue", "packed_pool", "issue_spread",
+    "out_blocked", "stage_lhs", "coissue_rows",
+    "traced_slots", "rhs_buffers", "pool_blocked",
 ])
 def fused_permute_gmm(
     lhs: jax.Array,  # [size_src, size_k] un-permuted pool
@@ -523,13 +584,16 @@ def fused_permute_gmm(
     zero_initialize: bool = True,
     fuse_act: str | None = None,
     num_slots: int = 2,
-    chunk: int = 16,
+    chunk: int | None = None,
     coissue: bool = True,
     packed_pool: bool = False,
     issue_spread: int = 1,
     out_blocked: bool = False,
     stage_lhs: bool = False,
     coissue_rows: int = 4,
+    traced_slots: bool = True,
+    rhs_buffers: int = 3,
+    pool_blocked: bool = False,
 ) -> jax.Array:
     """Grouped matmul over `lhs[gather_indices]` without materialising it.
 
@@ -539,6 +603,13 @@ def fused_permute_gmm(
     if packed_pool and lhs.dtype != jnp.int32:
         raise ValueError("packed_pool expects an int32[size_src, size_k/2] "
                          "pool; word (r,c) = bf16 (r,c) | (r,c+size_k/2)<<16")
+    if pool_blocked:
+        if packed_pool:
+            raise ValueError("pool_blocked and packed_pool are two forms of "
+                             "the same producer contract; pick one")
+        if lhs.ndim != 3 or lhs.shape[-1] != LANES:
+            raise ValueError("pool_blocked expects bf16[size_src, "
+                             "size_k//128, 128]")
     if lhs.dtype.itemsize not in (2, 4):
         raise NotImplementedError(
             f"pool dtype {lhs.dtype} unsupported: the row read is an int32 "
@@ -557,6 +628,12 @@ def fused_permute_gmm(
         packing = 2
         cfg_lhs = jax.ShapeDtypeStruct((size_m, lhs.shape[1] * 2),
                                        jnp.bfloat16)
+    elif pool_blocked:
+        # lhs is bf16[size_src, size_k//128, 128]; one physical row per
+        # logical row, whole 32-bit words, nothing to unpack.
+        packing = 1
+        cfg_lhs = jax.ShapeDtypeStruct((size_m, lhs.shape[1] * lhs.shape[2]),
+                                       lhs.dtype)
     else:
         packing = 4 // lhs.dtype.itemsize
         cfg_lhs = jax.ShapeDtypeStruct((size_m, lhs.shape[1]), lhs.dtype)
@@ -578,11 +655,16 @@ def fused_permute_gmm(
         zero_initialize=zero_initialize, fuse_act=fuse_act)
 
     dims, tiles = cfgs.dims, cfgs.tiles
+    if chunk is None:
+        # Measured at T=64 (live ~10 rows/tile): chunk=8 saves 1.9 us of
+        # dead-row reads on a 32-row tile; 16 is right once tiles are 64+.
+        chunk = 8 if tiles.tile_m <= 32 else 16
     if group_offset is None:
         group_offset = jnp.zeros((1, ), jnp.int32)
 
     pool = lhs
-    if not packed_pool and packing > 1 and pool.shape[0] % packing:
+    if not (packed_pool or pool_blocked) and packing > 1 \
+            and pool.shape[0] % packing:
         pool = jnp.pad(pool, ((0, packing - pool.shape[0] % packing), (0, 0)))
 
     # Pad the index table so a tile that runs past the last live row still
@@ -591,7 +673,8 @@ def fused_permute_gmm(
     idx = jnp.pad(gather_indices.astype(jnp.int32), (0, pad_to - size_m),
                   mode="edge")
 
-    parity = idx[:, None] if not packed_pool else jnp.zeros((1, 1), jnp.int32)
+    parity = (idx[:, None] if packing > 1 and not packed_pool
+              else jnp.zeros((1, 1), jnp.int32))
 
     rhs_scale_spec = rhs_bias_spec = None
     if rhs_scale is not None:
@@ -617,6 +700,8 @@ def fused_permute_gmm(
             gm_id_to_group_id=pltpu.SMEM((max_num_gm, ), jnp.int32),
             gm_id_to_m_offset=pltpu.SMEM((max_num_gm + 1, ), jnp.int32),
         ),
+        pltpu.VMEM((num_slots, tiles.tile_m, tiles.tile_k // LANES, LANES),
+                   lhs.dtype) if pool_blocked else
         pltpu.VMEM((num_slots, tiles.tile_m,
                     tiles.tile_k // 2 if packed_pool else tiles.tile_k),
                    jnp.int32 if packing > 1 else lhs.dtype),
@@ -650,7 +735,10 @@ def fused_permute_gmm(
                              packed_pool=packed_pool,
                              issue_spread=issue_spread,
                              out_blocked=LANES if out_blocked else 0,
-                             coissue_rows=coissue_rows),
+                             coissue_rows=coissue_rows,
+                             traced_slots=traced_slots,
+                             rhs_buffers=rhs_buffers,
+                             pool_blocked=pool_blocked),
         out_shape=out_init,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=3,

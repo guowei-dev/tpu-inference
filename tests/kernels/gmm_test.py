@@ -830,7 +830,7 @@ class FusedPermuteGmmTest(jtu.JaxTestCase):
 
     def _run(self, group_sizes, pool_rows, group_offset, odd_pool=False,
              packed_pool=False, out_blocked=False, coissue=False,
-             stage_lhs=False):
+             stage_lhs=False, pool_blocked=False, **fpg_kw):
         num_groups = group_sizes.shape[0]
         in_size, out_size = 512, 512
         batch_size = int(group_sizes.sum())
@@ -853,10 +853,14 @@ class FusedPermuteGmmTest(jtu.JaxTestCase):
                       preferred_element_type=jnp.bfloat16,
                       zero_initialize=False)
 
+        fpg_pool = _pack_pool(pool) if packed_pool else pool
+        if pool_blocked:
+            fpg_pool = pool.reshape(pool.shape[0], -1, 128)
         fused = fused_permute_gmm(
-            _pack_pool(pool) if packed_pool else pool, rhs_q, group_sizes,
+            fpg_pool, rhs_q, group_sizes,
             indices, packed_pool=packed_pool, out_blocked=out_blocked,
-            coissue=coissue, stage_lhs=stage_lhs, **kwargs)
+            coissue=coissue, stage_lhs=stage_lhs, pool_blocked=pool_blocked,
+            **fpg_kw, **kwargs)
         if out_blocked:
             # bf16[M, N//128, 128] -- the same bytes as bf16[M, N].
             fused = fused.reshape(fused.shape[0], -1)[:, :out_size // 2]
@@ -899,3 +903,15 @@ class FusedPermuteGmmTest(jtu.JaxTestCase):
     def test_coissue(self):
         self._run(get_group_sizes(2560, 16), pool_rows=256, group_offset=4,
                   coissue=True)
+
+    def test_pool_blocked(self):
+        # bf16[rows, k//128, 128]: dim 0 off the tiled pair, no unpack.
+        self._run(get_group_sizes(2560, 16), pool_rows=256, group_offset=4,
+                  pool_blocked=True, out_blocked=True)
+
+    def test_parity_chassis(self):
+        # The pre-migration chassis (parity-dispatched slots, two rhs
+        # buffers) stays covered after the defaults moved.
+        self._run(get_group_sizes(2560, 16), pool_rows=256, group_offset=4,
+                  packed_pool=True, out_blocked=True, coissue=True,
+                  traced_slots=False, rhs_buffers=2)
