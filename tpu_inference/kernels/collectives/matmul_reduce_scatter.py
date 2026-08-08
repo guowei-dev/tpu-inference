@@ -35,7 +35,7 @@ P = jax.sharding.PartitionSpec
 
 def _matmul_reduce_scatter_kernel(
     # Inputs
-    a_hbm_ref,  # [m, n_pad]  (all m rows of this device's columns, lane-padded)
+    a_hbm_ref,  # [m, n_per]  (all m rows of this device's n_per columns)
     w_hbm_ref,  # [n_per, k_out]
     # Outputs
     o_hbm_ref,  # [m_per, k_out]
@@ -57,6 +57,11 @@ def _matmul_reduce_scatter_kernel(
     bk_out: int,
     bnc: int,
     n_actual: int,
+    # Present only when n_actual is not a multiple of 128: the last
+    # n_actual % 128 columns of a, zero-padded to 128 by the wrapper
+    # ([m, 128] in HBM). Body and tail DMA into the two 128-aligned column
+    # windows of a_vmem, so the dot itself is the ordinary full-width one.
+    a_tail_hbm_ref=None,
 ):
     num_devices = pl.num_programs(0)
     grid_m = pl.num_programs(1)
@@ -68,8 +73,9 @@ def _matmul_reduce_scatter_kernel(
     my_id = lax.axis_index(axis_name)
     left_neighbor = lax.rem(my_id + num_devices - 1, jnp.int32(num_devices))
     right_neighbor = lax.rem(my_id + 1, jnp.int32(num_devices))
-    m_per_device, n_pad = a_vmem_ref.shape
-    padded = n_pad != n_actual
+    m_per_device, _ = a_vmem_ref.shape
+    padded = a_tail_hbm_ref is not None
+    n_pad = w_vmem_ref.shape[0]
     m_ppd = m_per_device // 2
     gm_half = grid_m // 2
     # chunk whose rows this outer step works on, per travel direction
@@ -89,20 +95,42 @@ def _matmul_reduce_scatter_kernel(
 
     def _do_a_local_copy(wait: bool = False):
         # vmem row r == within-chunk row r: left half rows come from
-        # chunk_left, right half rows from chunk_right.
+        # chunk_left, right half rows from chunk_right. When padded, the
+        # aligned body streams straight from the unpadded HBM a (windows on
+        # an untiled ref are legal at any width) and the lane-padded tail
+        # ref fills the last 128-column window — both VMEM dst windows are
+        # 128-aligned, and the dot stays the ordinary full-width one.
+        body = n_pad - 128 if padded else None
+        body_cols = pl.ds(0, body) if padded else slice(None)
         left_op = pltpu.make_async_copy(
-            src_ref=a_hbm_ref.at[pl.ds(chunk_left * m_per_device, m_ppd), :],
-            dst_ref=a_vmem_ref.at[:m_ppd, :],
+            src_ref=a_hbm_ref.at[pl.ds(chunk_left * m_per_device, m_ppd),
+                                 body_cols],
+            dst_ref=a_vmem_ref.at[:m_ppd, body_cols],
             sem=a_copy_sem,
         )
         right_op = pltpu.make_async_copy(
             src_ref=a_hbm_ref.at[
-                pl.ds(chunk_right * m_per_device + m_ppd, m_ppd), :],
-            dst_ref=a_vmem_ref.at[m_ppd:, :],
+                pl.ds(chunk_right * m_per_device + m_ppd, m_ppd), body_cols],
+            dst_ref=a_vmem_ref.at[m_ppd:, body_cols],
             sem=a_copy_sem,
         )
         _start_or_wait(left_op, wait)
         _start_or_wait(right_op, wait)
+        if padded:
+            tail_left = pltpu.make_async_copy(
+                src_ref=a_tail_hbm_ref.at[
+                    pl.ds(chunk_left * m_per_device, m_ppd), :],
+                dst_ref=a_vmem_ref.at[:m_ppd, pl.ds(body, 128)],
+                sem=a_copy_sem,
+            )
+            tail_right = pltpu.make_async_copy(
+                src_ref=a_tail_hbm_ref.at[
+                    pl.ds(chunk_right * m_per_device + m_ppd, m_ppd), :],
+                dst_ref=a_vmem_ref.at[m_ppd:, pl.ds(body, 128)],
+                sem=a_copy_sem,
+            )
+            _start_or_wait(tail_left, wait)
+            _start_or_wait(tail_right, wait)
 
     def _do_w_local_copy(wait: bool = False):
         if padded:
@@ -315,10 +343,16 @@ def matmul_reduce_scatter(
     n_per_device = n // tp_size
     m_per_device = m // tp_size
     m_ppd = m_per_device // 2
-    # Mosaic requires the a operand's lane width and lane-dim block offsets
-    # to be multiples of 128; an unaligned n_per_device runs at the padded
-    # width with the VMEM pad region zeroed (HBM stays unpadded).
+    # Mosaic requires every lane-dim VMEM window (vector load AND DMA dst)
+    # to be a multiple of 128 wide; an unaligned n_per_device is split at
+    # its last 128 boundary — the kernel reads the aligned body straight
+    # from the unpadded a (windows on the untiled HBM ref are legal at any
+    # width) and the ragged tail travels as a small lane-padded side
+    # operand. w stays unpadded in HBM (its contraction dim sits on
+    # sublanes, where a ragged window is legal); its VMEM pad rows are
+    # zeroed in-kernel.
     n_pad = -(-n_per_device // 128) * 128
+    body = n_per_device // 128 * 128
     if bm is None:
         bm = min(m_ppd, 256)
     if bk_out is None:
@@ -334,6 +368,9 @@ def matmul_reduce_scatter(
             f"bnc ({bnc}) must equal the lane-padded contraction width "
             f"({n_pad}) when n // tp_size ({n_per_device}) is not a multiple "
             f"of 128.")
+    if n_pad != n_per_device and body == 0:
+        raise ValueError(
+            f"n // tp_size ({n_per_device}) < 128 is not supported.")
     if n_pad % bnc != 0:
         raise ValueError(
             f"bnc ({bnc}) must divide n // tp_size ({n_per_device}).")
@@ -346,29 +383,34 @@ def matmul_reduce_scatter(
         jax.ShapeDtypeStruct((tp_size - 1, m_per_device, k_out),
                              a.dtype),  # per-step landing slots
     ]
+    padded = n_pad != n_per_device
+    in_specs = [
+        pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
+        pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
+    ]
+    if padded:
+        in_specs.insert(1, pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM))
+    scratch_shapes = (
+        pltpu.SemaphoreType.DMA,  # a_copy_sem
+        pltpu.SemaphoreType.DMA,  # w_copy_sem
+        pltpu.SemaphoreType.DMA,  # wire_copy_sem
+        pltpu.SemaphoreType.DMA,  # o_copy_sem
+        pltpu.SemaphoreType.DMA((grid_m, grid_ko)),  # send_sems
+        pltpu.SemaphoreType.DMA((grid_m, grid_ko)),  # recv_sems
+        pltpu.VMEM((m_per_device, n_pad), a.dtype),  # a rows
+        pltpu.VMEM((n_pad, k_out), w.dtype),  # w resident
+        pltpu.VMEM((bm, bk_out), a.dtype),  # wire stage
+        pltpu.VMEM((m_per_device, k_out), a.dtype),  # step payload
+        pltpu.VMEM((bm, bk_out), jnp.float32),  # local partial acc
+    )
     grid_spec = pltpu.PrefetchScalarGridSpec(
         num_scalar_prefetch=0,
-        in_specs=[
-            pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
-            pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
-        ],
+        in_specs=in_specs,
         out_specs=[
             pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
             pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
         ],
-        scratch_shapes=(
-            pltpu.SemaphoreType.DMA,  # a_copy_sem
-            pltpu.SemaphoreType.DMA,  # w_copy_sem
-            pltpu.SemaphoreType.DMA,  # wire_copy_sem
-            pltpu.SemaphoreType.DMA,  # o_copy_sem
-            pltpu.SemaphoreType.DMA((grid_m, grid_ko)),  # send_sems
-            pltpu.SemaphoreType.DMA((grid_m, grid_ko)),  # recv_sems
-            pltpu.VMEM((m_per_device, n_pad), a.dtype),  # a rows
-            pltpu.VMEM((n_pad, k_out), w.dtype),  # w resident
-            pltpu.VMEM((bm, bk_out), a.dtype),  # wire stage
-            pltpu.VMEM((m_per_device, k_out), a.dtype),  # step payload
-            pltpu.VMEM((bm, bk_out), jnp.float32),  # local partial acc
-        ),
+        scratch_shapes=scratch_shapes,
         grid=(tp_size, grid_m, grid_ko, grid_nc),
     )
     flops = 2 * m * n_per_device * k_out
@@ -385,21 +427,30 @@ def matmul_reduce_scatter(
 
     @jax.jit(static_argnames=["bm", "bk_out", "bnc"])
     def _matmul_reduce_scatter_call(a, w, bm, bk_out, bnc):
-        if n_pad != n_per_device:
-            # A ragged lane window is not a legal Mosaic DMA dst, so the
-            # kernel takes `a` lane-padded with zeros; w stays unpadded (its
-            # contraction dim sits on sublanes, where a ragged window is
-            # legal) and the kernel zeroes its VMEM pad rows instead.
-            a = jnp.pad(a, ((0, 0), (0, n_pad - n_per_device)))
+        kernel = functools.partial(
+            _matmul_reduce_scatter_kernel,
+            axis_name=axis_name,
+            bm=bm,
+            bk_out=bk_out,
+            bnc=bnc,
+            n_actual=n_per_device,
+        )
+        args = (a, w)
+        if padded:
+            # Only the ragged tail columns are copied/lane-padded ([m, 128]
+            # however large a is); the kernel reads the aligned body from
+            # the unpadded a in place.
+            a_tail = jnp.pad(a[:, body:],
+                             ((0, 0), (0, n_pad - n_per_device)))
+            args = (a, a_tail, w)
+            core = kernel
+
+            def kernel(a_ref, a_tail_ref, w_ref, o_ref, recv_ref, *scratch):
+                return core(a_ref, w_ref, o_ref, recv_ref, *scratch,
+                            a_tail_hbm_ref=a_tail_ref)
+
         return pl.pallas_call(
-            functools.partial(
-                _matmul_reduce_scatter_kernel,
-                axis_name=axis_name,
-                bm=bm,
-                bk_out=bk_out,
-                bnc=bnc,
-                n_actual=n_per_device,
-            ),
+            kernel,
             out_shape=out_shape,
             grid_spec=grid_spec,
             compiler_params=pltpu.CompilerParams(
@@ -409,7 +460,7 @@ def matmul_reduce_scatter(
             cost_estimate=cost_estimate,
             name=f"matmul_reduce_scatter_kernel_bm_{bm}_bko_{bk_out}"
             f"_bnc_{bnc}",
-        )(a, w)[0]
+        )(*args)[0]
 
     shard_map_kernel = jax.jit(
         jax.shard_map(
