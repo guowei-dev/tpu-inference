@@ -15,13 +15,13 @@
 import functools
 
 import jax
+import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
-import jax.numpy as jnp
 
-from tpu_inference.kernels.sparse_core.ragged_gather_reduce_v2 import config
-from tpu_inference.kernels.sparse_core.ragged_gather_reduce_v2 import memory_ref
+from tpu_inference.kernels.sparse_core.ragged_gather_reduce_v2 import (
+    config, memory_ref)
 
 
 def call_kernel_pipeline(

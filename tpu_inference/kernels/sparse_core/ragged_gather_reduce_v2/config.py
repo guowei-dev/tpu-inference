@@ -16,9 +16,9 @@ import dataclasses
 from typing import Any
 
 import jax
+import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
-import jax.numpy as jnp
 
 
 # ceil up to the nearest multiple of b.

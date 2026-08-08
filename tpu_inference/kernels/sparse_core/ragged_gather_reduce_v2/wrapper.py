@@ -15,15 +15,14 @@
 import functools
 
 import jax
+import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
-import jax.numpy as jnp
 
 from tpu_inference.kernels.sparse_core import core_map_helper
-from tpu_inference.kernels.sparse_core.ragged_gather_reduce_v2 import config
-from tpu_inference.kernels.sparse_core.ragged_gather_reduce_v2 import kernel
-from tpu_inference.kernels.sparse_core.ragged_gather_reduce_v2 import memory_ref
+from tpu_inference.kernels.sparse_core.ragged_gather_reduce_v2 import (
+    config, kernel, memory_ref)
 
 
 def _fallback_implementation(

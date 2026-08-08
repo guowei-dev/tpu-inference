@@ -16,8 +16,8 @@ import dataclasses
 from typing import Any
 
 import jax
-from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
+from jax.experimental.pallas import tpu as pltpu
 
 from tpu_inference.kernels.sparse_core.ragged_gather_reduce_v2 import config
 
