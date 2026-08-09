@@ -442,12 +442,13 @@ def matmul_reduce_scatter(
     # steps' chunk partials into a f32 stage; the per-step wire add / send /
     # recv protocol is unchanged. fold == 1 keeps the original schedule.
     # Folding pays only where the starved compute outweighs the fold's own
-    # cost (stage traffic + the exposed chain): measured off below
-    # n_pad * k = 2816 * 4096, and at m_per_device = 128 (bm = 64, only
-    # ~1.8x starved) it additionally needs the contraction-heavy side
-    # (n_pad >= 2048) to win against the k-proportional wire.
+    # cost (stage traffic + the exposed chain): measured winning down to
+    # n_pad * k = 1280 * 8192 and losing at 1408 * 4096, and at
+    # m_per_device = 128 (bm = 64, only ~1.8x starved) it additionally needs
+    # the contraction-heavy side (n_pad >= 2048) to win against the
+    # k-proportional wire.
     fold = 1 if m_per_device >= 256 else 256 // m_per_device
-    if n_pad * k_out < 2816 * 4096:
+    if n_pad * k_out < 1280 * 8192:
         fold = 1
     if m_per_device == 128 and n_pad < 2048:
         fold = 1
