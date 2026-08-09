@@ -16,7 +16,6 @@ import dataclasses
 from typing import Any
 
 import jax
-import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
@@ -44,15 +43,12 @@ class _CostModelConstants:
 class Config:
     input_size: int
     hidden_size: int
+    source_rows: int
     reduce_group_size: int
     in_dtype: Any
     core_axis_name: str
     subcore_axis_name: str
     tpu_info: pltpu.TpuInfo
-
-    def __post_init__(self):
-        # Only supports either bf16 or fp32 for now.
-        assert self.in_dtype in (jnp.bfloat16, jnp.float32)
 
     @property
     def sc_info(self):
@@ -97,9 +93,9 @@ class Config:
         if self.tpu_info.sparse_core is None:
             return True
         vmem_capacity_threshold = self.tpu_info.vmem_capacity_bytes * 0.6
-        input_size = self.input_size * self.hidden_size * self.in_dtype_bytes
+        source_size = self.source_rows * self.hidden_size * self.in_dtype_bytes
         # TODO(kyuyeunk): Improve fallback calculation logic.
-        return input_size * 2 < vmem_capacity_threshold
+        return source_size * 2 < vmem_capacity_threshold
 
     @property
     def row_partition_size(self) -> int:
@@ -161,8 +157,14 @@ class Config:
     @property
     def num_row_partitions(self) -> int:
         """Calculates the number of row partitions."""
-        num_lanes = self.sc_info.num_lanes
-        return min(self.num_tot_cores // self.num_column_partitions, num_lanes)
+        # Asserted rather than clamped: the kernel maps a core to a partition as
+        # core_id // num_column_partitions, so a clamp leaves the cores past it
+        # matching no partition and idling.
+        num_simd_lanes = self.sc_info.num_lanes
+        num_row_partitions = self.num_tot_cores // self.num_column_partitions
+        assert (num_row_partitions <= num_simd_lanes
+                ), f"{num_row_partitions=} must be <= {num_simd_lanes=}"
+        return num_row_partitions
 
     @property
     def num_column_partitions(self) -> int:

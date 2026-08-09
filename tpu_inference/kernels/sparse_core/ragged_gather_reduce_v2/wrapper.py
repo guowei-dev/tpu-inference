@@ -156,6 +156,7 @@ def ragged_gather_reduce_v2(
     cfg = config.Config(
         input_size=indices.size,
         hidden_size=x.shape[-1],
+        source_rows=x.shape[0],
         reduce_group_size=reduce_group_size,
         in_dtype=x.dtype,
         core_axis_name="core",
@@ -163,10 +164,13 @@ def ragged_gather_reduce_v2(
         tpu_info=pltpu.get_tpu_info(),
     )
 
-    # Step 2: Fallback to compiler version if needed.
+    # Step 2: Fallback to compiler version if needed. The fallback is
+    # dtype-agnostic, so check what the kernel supports only past this point.
     if cfg.should_fallback:
         return _fallback_implementation(x, indices, topk_weights,
                                         valid_rows_mask, reduce_group_size)
+    assert x.dtype in (jnp.bfloat16, jnp.float32), (
+        "SparseCore ragged gather-reduce only supports bfloat16 and float32.")
 
     # Step 3: Pre-process inputs (weights, padding, sort by validity).
     # Simplify topk gather by using fp32 and ensure data is always word aligned.

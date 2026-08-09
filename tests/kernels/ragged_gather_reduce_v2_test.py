@@ -187,6 +187,83 @@ class ScatterTest(jtu.JaxTestCase):
                                              valid_rows_mask, rgs)
             np.testing.assert_allclose(actual, desired, atol=1e-2, rtol=1e-2)
 
+    def test_sc_ragged_gather_reduce_v2_fallback_keys_on_the_source(self):
+        """The TensorCore fallback is chosen by the size of the gather source,
+        not by how many rows are gathered out of it.
+
+        A caller gathering a chunk of indices out of a larger source has
+        source_rows != input_size, which no other case in this file does, and
+        the two paths do not even return the same dtype.
+        """
+        live = pltpu.get_tpu_info()
+        if live.sparse_core is None:
+            self.skipTest("no SparseCore on this TPU")
+        info = dataclasses.replace(live, vmem_capacity_bytes=64 * 1024 * 1024)
+
+        def falls_back(source_rows, input_size):
+            return rgr_v2_config.Config(
+                input_size=input_size,
+                hidden_size=4096,
+                source_rows=source_rows,
+                reduce_group_size=8,
+                in_dtype=jnp.float32,
+                core_axis_name="core",
+                subcore_axis_name="subcore",
+                tpu_info=info,
+            ).should_fallback
+
+        # 16384 source rows is far past the threshold however few are gathered;
+        # keying on input_size would fall back for the chunked case.
+        self.assertFalse(falls_back(source_rows=16384, input_size=16384))
+        self.assertFalse(falls_back(source_rows=16384, input_size=1024))
+        self.assertTrue(falls_back(source_rows=1024, input_size=1024))
+
+    def test_sc_ragged_gather_reduce_v2_chunk_of_a_larger_source(self):
+        """Gathering fewer indices than the source has rows runs the kernel.
+
+        Every other case here gathers a permutation of the whole source, so
+        x.shape[0], x.shape[-1] and indices.size are indistinguishable as the
+        key. Here all three differ, and the hidden size is below the threshold
+        in rows so that only the source keeps the kernel selected. Dispatch is
+        observable through the dtype: the fallback returns bfloat16, the kernel
+        the input dtype.
+        """
+        info = pltpu.get_tpu_info()
+        if info.sparse_core is None:
+            self.skipTest("no SparseCore on this TPU")
+        hidden, input_size, rgs = 2048, 1024, 8
+        # Twice the source the threshold asks for, so the premise below holds
+        # whatever this TPU's VMEM capacity is.
+        source_rows = 2 * int(info.vmem_capacity_bytes * 0.6 /
+                              (2 * hidden * 4))
+        cfg = rgr_v2_config.Config(
+            input_size=input_size,
+            hidden_size=hidden,
+            source_rows=source_rows,
+            reduce_group_size=rgs,
+            in_dtype=jnp.float32,
+            core_axis_name="core",
+            subcore_axis_name="subcore",
+            tpu_info=info,
+        )
+        self.assertFalse(cfg.should_fallback)
+        if (cfg.num_tot_cores // cfg.num_column_partitions
+                > cfg.sc_info.num_lanes):
+            self.skipTest("hidden size unsupported on this TPU")
+
+        key = jax.random.key(0)
+        x = jax.random.normal(key, (source_rows, hidden), jnp.float32)
+        indices = jax.random.permutation(key, source_rows)[:input_size]
+        topk_weights = jax.random.normal(key, (input_size, ), jnp.bfloat16)
+        valid_rows_mask = jnp.ones((input_size, ), jnp.bool_)
+
+        actual = ragged_gather_reduce_v2(x, indices, topk_weights,
+                                         valid_rows_mask, rgs)
+        self.assertEqual(actual.dtype, jnp.float32)
+        desired = reference_ragged_gather_reduce(x, indices, topk_weights,
+                                                 valid_rows_mask, rgs)
+        np.testing.assert_allclose(actual, desired, atol=1e-2, rtol=1e-2)
+
     def test_sc_ragged_gather_reduce_v2_tiling_cost_model(self):
         """The tiling derivation applies its iteration limit, its chunk limit
         and its round-down, on shapes and devices where each is observable.
@@ -205,6 +282,7 @@ class ScatterTest(jtu.JaxTestCase):
             return rgr_v2_config.Config(
                 input_size=input_size,
                 hidden_size=hidden_size,
+                source_rows=input_size,
                 reduce_group_size=8,
                 in_dtype=jnp.bfloat16,
                 core_axis_name="core",
