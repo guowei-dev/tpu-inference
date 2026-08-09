@@ -92,6 +92,29 @@ class MatmulReduceScatterTest(jtu.JaxTestCase):
             expected = _xla_reference(mesh, axis_name, a, w)
             self.assertAllClose(output, expected, atol=1e-4, rtol=1e-4)
 
+    @parameterized.parameters((512, 2816), (512, 2784), (1024, 2816))
+    def test_matmul_reduce_scatter_folded_small_m(self, m, n_per):
+        # m // tp_size < 256 with a heavy contraction takes the folded
+        # schedule (full-height dots into the f32 stage instead of per-step
+        # sub-128-row dots); n_per = 2784 also exercises fold x lane-pad.
+        # fp32 + exact comparison — the folded dots accumulate in the same
+        # order, so the stage must change nothing.
+        if jax.device_count() != 8:
+            self.skipTest('Not enough devices for test')
+
+        axis_name = 'x'
+        num_devices = jax.device_count()
+        mesh = utils.make_optimized_mesh((num_devices, ), (axis_name, ))
+        n, k = n_per * num_devices, 4096
+
+        for i in range(3):
+            a, w = _make_inputs(mesh, axis_name, m, n, k, jnp.float32,
+                                4321 + i)
+            output = matmul_reduce_scatter.matmul_reduce_scatter(
+                a, w, mesh, axis_name)
+            expected = _xla_reference(mesh, axis_name, a, w)
+            self.assertAllClose(output, expected, atol=1e-4, rtol=1e-4)
+
     def test_matmul_reduce_scatter_bf16_no_worse_than_xla(self):
         # bf16 rounds on every wire hop, and the kernel and the unfused path
         # round in different orders — compare both against an fp32 golden and

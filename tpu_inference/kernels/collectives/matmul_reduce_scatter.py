@@ -52,11 +52,14 @@ def _matmul_reduce_scatter_kernel(
     wire_vmem_ref,  # [bm, bk_out]  incoming accumulator stage
     out_vmem_ref,  # [m_per, k_out]  outgoing step payload (disjoint blocks)
     acc_vmem_ref,  # [bm, bk_out]  f32 local partial
+    stage_vmem_ref=None,  # [fold * m_per, k_out] f32 folded partials (fold > 1)
+    *,
     axis_name: str,
     bm: int,
     bk_out: int,
     bnc: int,
     n_actual: int,
+    fold: int,
     # Present only when n_actual is not a multiple of 128: the last
     # n_actual % 128 columns of a, zero-padded to 128 by the wrapper
     # ([m, 128] in HBM). Body and tail DMA into the two 128-aligned column
@@ -73,7 +76,7 @@ def _matmul_reduce_scatter_kernel(
     my_id = lax.axis_index(axis_name)
     left_neighbor = lax.rem(my_id + num_devices - 1, jnp.int32(num_devices))
     right_neighbor = lax.rem(my_id + 1, jnp.int32(num_devices))
-    m_per_device, _ = a_vmem_ref.shape
+    m_per_device = o_hbm_ref.shape[0]
     padded = a_tail_hbm_ref is not None
     n_pad = w_vmem_ref.shape[0]
     m_ppd = m_per_device // 2
@@ -131,6 +134,40 @@ def _matmul_reduce_scatter_kernel(
             )
             _start_or_wait(tail_left, wait)
             _start_or_wait(tail_right, wait)
+
+    def _do_a_fold_copy(wait: bool = False):
+        # fold > 1: at a super-step boundary, load the a rows for the next
+        # `fold` outer steps' chunk pairs — left halves stacked in
+        # [0, fold * m_ppd), right halves in [fold * m_ppd, 2 * fold * m_ppd)
+        # — so one [fold * m_per, bnc] dot per (nc, ko) tile computes every
+        # partial the group needs at full MXU row occupancy.
+        body = n_pad - 128 if padded else None
+        body_cols = pl.ds(0, body) if padded else slice(None)
+        for j in range(fold):
+            c_l = lax.rem(my_id + outer + j + 1, jnp.int32(num_devices))
+            c_r = lax.rem(my_id - outer - j - 1 + 2 * num_devices,
+                          jnp.int32(num_devices))
+            dst_l = pl.ds(j * m_ppd, m_ppd)
+            dst_r = pl.ds((fold + j) * m_ppd, m_ppd)
+            ops = [
+                (a_hbm_ref.at[pl.ds(c_l * m_per_device, m_ppd), body_cols],
+                 a_vmem_ref.at[dst_l, body_cols]),
+                (a_hbm_ref.at[pl.ds(c_r * m_per_device + m_ppd, m_ppd),
+                              body_cols],
+                 a_vmem_ref.at[dst_r, body_cols]),
+            ]
+            if padded:
+                ops += [
+                    (a_tail_hbm_ref.at[pl.ds(c_l * m_per_device, m_ppd), :],
+                     a_vmem_ref.at[dst_l, pl.ds(body, 128)]),
+                    (a_tail_hbm_ref.at[
+                        pl.ds(c_r * m_per_device + m_ppd, m_ppd), :],
+                     a_vmem_ref.at[dst_r, pl.ds(body, 128)]),
+                ]
+            for src, dst in ops:
+                _start_or_wait(
+                    pltpu.make_async_copy(src_ref=src, dst_ref=dst,
+                                          sem=a_copy_sem), wait)
 
     def _do_w_local_copy(wait: bool = False):
         if padded:
@@ -204,14 +241,21 @@ def _matmul_reduce_scatter_kernel(
     def _start_w_local_copy():
         _do_w_local_copy(wait=False)
 
-    # a rows for this outer's two chunks: once per outer.
+    # a rows for this outer's two chunks: once per outer (fold == 1), or the
+    # next fold outers' chunk pairs at each super-step boundary (fold > 1).
     a_copy_cond = jnp.logical_and(bm_i == 0,
                                   jnp.logical_and(bko_i == 0, nc_i == 0))
+    if fold > 1:
+        a_copy_cond = jnp.logical_and(a_copy_cond,
+                                      lax.rem(outer, fold) == 0)
+        _do_a_copy = _do_a_fold_copy
+    else:
+        _do_a_copy = _do_a_local_copy
 
     @pl.when(a_copy_cond)
     @jax.named_scope("_start_a_local_copy")
     def _start_a_local_copy():
-        _do_a_local_copy(wait=False)
+        _do_a_copy(wait=False)
 
     @pl.when(jnp.logical_and(outer == 0, bm_i == 0))
     @jax.named_scope("_wait_w_local_copy")
@@ -221,7 +265,7 @@ def _matmul_reduce_scatter_kernel(
     @pl.when(a_copy_cond)
     @jax.named_scope("_wait_a_local_copy")
     def _wait_a_local_copy():
-        _do_a_local_copy(wait=True)
+        _do_a_copy(wait=True)
 
     # Incoming accumulator for this block: wait the copy the neighbor issued
     # at its previous outer (also consumes this device's matching send signal,
@@ -232,26 +276,65 @@ def _matmul_reduce_scatter_kernel(
         _remote_copy_op(outer - 1).wait()
         _do_wire_local_copy(wait=False)
 
-    @jax.named_scope("_mxu")
-    def _mxu():
-        block = jnp.dot(
-            a_vmem_ref.at[bm_rows, nc_slice][...],
-            w_vmem_ref.at[nc_slice, ko_slice][...],
-            preferred_element_type=jnp.float32,
-        )
-        if grid_nc == 1:
-            acc_vmem_ref[...] = block
-        else:
+    if fold > 1:
+        # One full-height dot per (nc, ko) tile at the super-step boundary
+        # computes the whole group's partials; the per-step dots (which would
+        # be bm = m_ppd < 128 rows and starve the MXU at ~bm/128 row
+        # occupancy) disappear.
+        @pl.when(jnp.logical_and(lax.rem(outer, fold) == 0, bm_i == 0))
+        @jax.named_scope("_mxu")
+        def _mxu():
+            block = jnp.dot(
+                a_vmem_ref.at[:, nc_slice][...],
+                w_vmem_ref.at[nc_slice, ko_slice][...],
+                preferred_element_type=jnp.float32,
+            )
+            if grid_nc == 1:
+                stage_vmem_ref.at[:, ko_slice][...] = block
+            else:
 
-            @pl.when(nc_i == 0)
-            def _set():
+                @pl.when(nc_i == 0)
+                def _set():
+                    stage_vmem_ref.at[:, ko_slice][...] = block
+
+                @pl.when(nc_i > 0)
+                def _accumulate():
+                    stage_vmem_ref.at[:, ko_slice][...] += block
+    else:
+
+        @jax.named_scope("_mxu")
+        def _mxu():
+            block = jnp.dot(
+                a_vmem_ref.at[bm_rows, nc_slice][...],
+                w_vmem_ref.at[nc_slice, ko_slice][...],
+                preferred_element_type=jnp.float32,
+            )
+            if grid_nc == 1:
                 acc_vmem_ref[...] = block
+            else:
 
-            @pl.when(nc_i > 0)
-            def _accumulate():
-                acc_vmem_ref[...] += block
+                @pl.when(nc_i == 0)
+                def _set():
+                    acc_vmem_ref[...] = block
 
-    _mxu()
+                @pl.when(nc_i > 0)
+                def _accumulate():
+                    acc_vmem_ref[...] += block
+
+        _mxu()
+
+    if fold > 1:
+        _super_j = lax.rem(outer, fold)
+        _stage_off = jnp.where(
+            is_left_block, _super_j * m_ppd + bm_i * bm,
+            (fold + _super_j) * m_ppd + (bm_i - gm_half) * bm)
+
+        def _partial():
+            return stage_vmem_ref.at[pl.ds(_stage_off, bm), ko_slice][...]
+    else:
+
+        def _partial():
+            return acc_vmem_ref[...]
 
     # Block complete: add the wire, write the payload region, forward or emit.
     @pl.when(nc_i == grid_nc - 1)
@@ -260,14 +343,14 @@ def _matmul_reduce_scatter_kernel(
 
         @pl.when(outer == 0)
         def _no_wire():
-            out_vmem_ref.at[bm_rows, ko_slice][...] = acc_vmem_ref[...].astype(
+            out_vmem_ref.at[bm_rows, ko_slice][...] = _partial().astype(
                 out_vmem_ref.dtype)
 
         @pl.when(outer > 0)
         def _with_wire():
             _do_wire_local_copy(wait=True)
             out_vmem_ref.at[bm_rows, ko_slice][...] = (
-                acc_vmem_ref[...] +
+                _partial() +
                 wire_vmem_ref[...].astype(jnp.float32)).astype(
                     out_vmem_ref.dtype)
 
@@ -353,10 +436,34 @@ def matmul_reduce_scatter(
     # zeroed in-kernel.
     n_pad = -(-n_per_device // 128) * 128
     body = n_per_device // 128 * 128
+    # Sub-128-row dots starve the MXU at ~rows/128 occupancy. Below
+    # m_per_device = 256 the compute is folded: at every fold-th ring step one
+    # [fold * m_per_device, bnc] dot per (nc, ko) tile computes the next fold
+    # steps' chunk partials into a f32 stage; the per-step wire add / send /
+    # recv protocol is unchanged. fold == 1 keeps the original schedule.
+    # Folding pays only where the starved compute outweighs the fold's own
+    # cost (stage traffic + the exposed chain): measured off below
+    # n_pad * k = 2816 * 4096, and at m_per_device = 128 (bm = 64, only
+    # ~1.8x starved) it additionally needs the contraction-heavy side
+    # (n_pad >= 2048) to win against the k-proportional wire.
+    fold = 1 if m_per_device >= 256 else 256 // m_per_device
+    if n_pad * k_out < 2816 * 4096:
+        fold = 1
+    if m_per_device == 128 and n_pad < 2048:
+        fold = 1
+    while tp_size % fold:
+        fold //= 2
     if bm is None:
         bm = min(m_ppd, 256)
     if bk_out is None:
-        bk_out = min(k_out, 2048)
+        # With the per-step dots folded away, the wire chain dominates: the
+        # per-(bm, ko)-block fixed cost (wait + add + write + send issue)
+        # argues for few blocks, per-hop transfer pipelining for small ones.
+        # Two ko blocks per step (bk = k/2) is the measured balance at every
+        # folded shape; more blocks only pay per-block cost, one block loses
+        # the overlap.
+        bk_out = (max(min(k_out, 2048), k_out // 2)
+                  if fold > 1 else min(k_out, 2048))
     if bnc is None:
         bnc = n_pad
     if m_ppd % bm != 0:
@@ -397,12 +504,16 @@ def matmul_reduce_scatter(
         pltpu.SemaphoreType.DMA,  # o_copy_sem
         pltpu.SemaphoreType.DMA((grid_m, grid_ko)),  # send_sems
         pltpu.SemaphoreType.DMA((grid_m, grid_ko)),  # recv_sems
-        pltpu.VMEM((m_per_device, n_pad), a.dtype),  # a rows
+        pltpu.VMEM((fold * m_per_device, n_pad), a.dtype),  # a rows
         pltpu.VMEM((n_pad, k_out), w.dtype),  # w resident
         pltpu.VMEM((bm, bk_out), a.dtype),  # wire stage
         pltpu.VMEM((m_per_device, k_out), a.dtype),  # step payload
         pltpu.VMEM((bm, bk_out), jnp.float32),  # local partial acc
     )
+    if fold > 1:
+        scratch_shapes += (
+            pltpu.VMEM((fold * m_per_device, k_out), jnp.float32),  # stage
+        )
     grid_spec = pltpu.PrefetchScalarGridSpec(
         num_scalar_prefetch=0,
         in_specs=in_specs,
@@ -420,10 +531,11 @@ def matmul_reduce_scatter(
     cost_estimate = pl.CostEstimate(flops=flops,
                                     bytes_accessed=bytes_accessed,
                                     transcendentals=0)
-    vmem_bytes = (m_per_device * n_pad * a.dtype.itemsize +
+    vmem_bytes = (fold * m_per_device * n_pad * a.dtype.itemsize +
                   n_pad * k_out * w.dtype.itemsize +
                   m_per_device * k_out * a.dtype.itemsize +
-                  bm * bk_out * a.dtype.itemsize + 4 * bm * bk_out)
+                  bm * bk_out * a.dtype.itemsize + 4 * bm * bk_out +
+                  (4 * fold * m_per_device * k_out if fold > 1 else 0))
 
     @jax.jit(static_argnames=["bm", "bk_out", "bnc"])
     def _matmul_reduce_scatter_call(a, w, bm, bk_out, bnc):
@@ -434,6 +546,7 @@ def matmul_reduce_scatter(
             bk_out=bk_out,
             bnc=bnc,
             n_actual=n_per_device,
+            fold=fold,
         )
         args = (a, w)
         if padded:
@@ -449,17 +562,23 @@ def matmul_reduce_scatter(
                 return core(a_ref, w_ref, o_ref, recv_ref, *scratch,
                             a_tail_hbm_ref=a_tail_ref)
 
+        vmem_limit = vmem_bytes + 8 * 1024 * 1024
+        if fold > 1:
+            # Same measured scoped ceiling as allport_matmul_reduce_scatter;
+            # only the folded stage can push the request past it. fold == 1
+            # keeps the original limit expression bit-for-bit.
+            vmem_limit = min(vmem_limit, 67043328)
         return pl.pallas_call(
             kernel,
             out_shape=out_shape,
             grid_spec=grid_spec,
             compiler_params=pltpu.CompilerParams(
                 collective_id=collective_id,
-                vmem_limit_bytes=vmem_bytes + 8 * 1024 * 1024,
+                vmem_limit_bytes=vmem_limit,
             ),
             cost_estimate=cost_estimate,
             name=f"matmul_reduce_scatter_kernel_bm_{bm}_bko_{bk_out}"
-            f"_bnc_{bnc}",
+            f"_bnc_{bnc}" + (f"_fold_{fold}" if fold > 1 else ""),
         )(*args)[0]
 
     shard_map_kernel = jax.jit(
