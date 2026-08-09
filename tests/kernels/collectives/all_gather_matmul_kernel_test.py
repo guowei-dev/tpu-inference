@@ -64,6 +64,51 @@ class AllGatherMatmulTest(jtu.JaxTestCase):
             expected_output = jnp.dot(sharded_x, y_for_dot)
             self.assertAllClose(output, expected_output, atol=1e-2, rtol=1e-2)
 
+    @parameterized.parameters(
+        (128, 1, False),  # fold=8, one group
+        (256, 1, False),  # fold=8
+        (256, 2, False),  # fold x grid_k
+        (512, 1, True),   # fold=4 x rhs_transpose
+        (512, 2, False),  # fold=4 x grid_k
+    )
+    def test_all_gather_matmul_folded_small_m(self, m, grid_k,
+                                              rhs_transpose):
+        # m_per_device < 128 folds the per-chunk dots into full-height
+        # super-step dots; grid_n == 2 exercises the per-unit export path.
+        if jax.device_count() != 8:
+            self.skipTest('Not enough devices for test')
+
+        axis_name = 'x'
+        num_devices = jax.device_count()
+        mesh = utils.make_optimized_mesh((num_devices, ), (axis_name, ))
+        bk, bn = 1024, 1024
+        k, n = bk * grid_k, bn * 2 * num_devices
+
+        for i in range(3):
+            k0, k1 = jax.random.split(jax.random.key(7 + i), 2)
+            x = jax.random.normal(k0, (m, k), dtype=jnp.bfloat16)
+            y_shape = (n, k) if rhs_transpose else (k, n)
+            y_sharding = P(axis_name, None) if rhs_transpose else P(
+                None, axis_name)
+            sharded_x = jax.device_put(
+                x, jax.sharding.NamedSharding(mesh, P(axis_name, None)))
+            sharded_y = jax.device_put(
+                jax.random.normal(k1, y_shape, dtype=jnp.bfloat16),
+                jax.sharding.NamedSharding(mesh, y_sharding))
+
+            output = all_gather_matmul.all_gather_matmul(
+                sharded_x,
+                sharded_y,
+                mesh,
+                axis_name,
+                bk=bk,
+                bn=bn,
+                rhs_transpose=rhs_transpose,
+            )
+            y_for_dot = sharded_y.T if rhs_transpose else sharded_y
+            expected_output = jnp.dot(sharded_x, y_for_dot)
+            self.assertAllClose(output, expected_output, atol=1e-2, rtol=1e-2)
+
     @parameterized.product(rhs_transpose=[True, False])
     def test_all_gather_matmul_unrolled_matches_grid(self, rhs_transpose):
         # The unrolled-ring variant must be interchangeable with the grid

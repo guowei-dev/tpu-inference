@@ -50,6 +50,7 @@ def _all_gather_kernel(
     bn: int,
     bk: int,
     bm: int,
+    fold: int = 1,
     debug_mode=False,
     rhs_transpose: bool = False,
 ):
@@ -105,6 +106,20 @@ def _all_gather_kernel(
     o_receiving_slot = lax.rem((global_step_id + grid_k - 1) // grid_k, 2)
     o_working_slot = 1 - o_receiving_slot
     bm_rows = pl.ds(bm_i * bm, bm)
+    if fold > 1:
+        # Compute-fold (small m_per_device): chunk c (0 = local, c >= 1 =
+        # arrival slot c - 1) is copied at outer step c into row
+        # (c % fold) * m_per_device of group buffer (c // fold) % 2, and ONE
+        # [fold * m_per_device, bk] dot per (bn, bk) tile at each
+        # fold-boundary outer computes the whole group's products at full MXU
+        # row occupancy — a sub-128-row per-chunk dot starves the MXU at
+        # ~rows/128. The ring hops, the travel halves and the o row mapping
+        # are unchanged; per-row contraction order is preserved, so the
+        # output is bitwise-equal to the per-chunk schedule.
+        group_receiving_slot = lax.rem(outer_step // fold, 2)
+        group_working_slot = lax.rem(outer_step // fold + 1, 2)
+        fold_rows = pl.ds(lax.rem(outer_step, fold) * m_per_device,
+                          m_per_device)
 
     def debug_print(msg, *args):
         if debug_mode:
@@ -132,9 +147,14 @@ def _all_gather_kernel(
         )
         k_slice = pl.ds(bk_i * bk, bk)
         src_rows = bm_rows if grid_m > 1 else slice(None)
+        if fold > 1:
+            dst = x_vmem_scratch_ref.at[group_receiving_slot, fold_rows,
+                                        k_slice]
+        else:
+            dst = x_vmem_scratch_ref.at[x_vmem_receiving_slot, :, k_slice]
         x_local_copy_op = pltpu.make_async_copy(
             src_ref=x_hbm_ref.at[src_rows, k_slice],
-            dst_ref=x_vmem_scratch_ref.at[x_vmem_receiving_slot, :, k_slice],
+            dst_ref=dst,
             sem=x_local_copy_sem,
         )
         _start_or_wait_copy(x_local_copy_op, wait)
@@ -189,7 +209,17 @@ def _all_gather_kernel(
         _start_or_wait_copy(x_local_copy_op, wait)
 
     def _do_subsequent_x_local_copy(wait: bool = False):
-        if grid_m > 1:
+        if fold > 1:
+            # chunk c = outer_step, one contiguous copy into its group row.
+            x_local_copy_op = pltpu.make_async_copy(
+                src_ref=x_hbm_scratch_ref.at[x_hbm_working_slot, :,
+                                             pl.ds(bk_i * bk, bk)],
+                dst_ref=x_vmem_scratch_ref.at[group_receiving_slot, fold_rows,
+                                              pl.ds(bk_i * bk, bk)],
+                sem=x_local_copy_sem,
+            )
+            _start_or_wait_copy(x_local_copy_op, wait)
+        elif grid_m > 1:
             # one bm block lies entirely on one side of the left/right split
             # (bm divides m_per_device_per_direction), so a single row-sliced
             # copy replaces the left/right pair.
@@ -452,6 +482,64 @@ def _all_gather_kernel(
         _start_or_wait_copy(o_left_local_copy_op, wait)
         _start_or_wait_copy(o_right_local_copy_op, wait)
 
+    def _do_mxu_folded():
+        # One [fold * m_per_device, bk] dot per (bn, bk) tile over group
+        # buffer (outer_step // fold - 1) % 2; same per-row contraction order
+        # as the per-chunk dots.
+        k_slice = pl.ds(bk_i * bk, bk)
+        n_slice = pl.ds(bn_i * bn, bn)
+        unit = (outer_step // fold - 1) * grid_n + bn_i
+        oslot = lax.rem(unit, 2)
+        lhs = x_vmem_scratch_ref.at[group_working_slot, :, k_slice][...]
+        if rhs_transpose:
+            block = lax.dot_general(
+                lhs,
+                y_vmem_scratch_ref.at[n_slice, k_slice][...],
+                dimension_numbers=(((1, ), (1, )), ((), ())),
+                preferred_element_type=jnp.float32,
+            )
+        else:
+            block = jnp.dot(
+                lhs,
+                y_vmem_scratch_ref.at[k_slice, n_slice][...],
+                preferred_element_type=jnp.float32,
+            )
+        if grid_k == 1:
+            o_vmem_scratch_ref.at[oslot][...] = block.astype(
+                x_vmem_scratch_ref.dtype)
+        else:
+            acc_vmem_scratch_ref[...] += block
+
+            @pl.when(bk_i == grid_k - 1)
+            def _update():
+                o_vmem_scratch_ref.at[oslot][...] = acc_vmem_scratch_ref[
+                    ...].astype(x_vmem_scratch_ref.dtype)
+                acc_vmem_scratch_ref[...] = jnp.zeros_like(
+                    acc_vmem_scratch_ref)
+
+    def _do_o_export_folded(g_u, bn_u, wait: bool = False):
+        # Export unit (g_u, bn_u): 2 * fold half-chunk DMAs; chunk
+        # c = g_u * fold + j keeps the per-chunk o row mapping (offset = c).
+        n_slice = pl.ds(bn_u * bn, bn)
+        slot = lax.rem(g_u * grid_n + bn_u, 2)
+        half = m_per_device_per_direction
+        for j in range(fold):
+            c = g_u * fold + j
+            left_o_idx = lax.rem(my_id + c, jnp.int32(num_devices)) * 2
+            right_o_idx = lax.rem(my_id - c + jnp.int32(2 * num_devices),
+                                  jnp.int32(num_devices)) * 2 + 1
+            for row0, o_idx in (
+                (j * m_per_device, left_o_idx),
+                (j * m_per_device + half, right_o_idx),
+            ):
+                op = pltpu.make_async_copy(
+                    src_ref=o_vmem_scratch_ref.at[slot,
+                                                  pl.ds(row0, half), :],
+                    dst_ref=o_hbm_ref.at[pl.ds(o_idx * half, half), n_slice],
+                    sem=o_local_copy_sem,
+                )
+                _start_or_wait_copy(op, wait)
+
     ### ------- Kernel start ------- ###
     # TODO(chengjiyao): explore a fine-grained way to do the waits and signal
 
@@ -505,48 +593,91 @@ def _all_gather_kernel(
     def _start_y_local_copy():
         _do_y_local_copy(wait=False)
 
-    def _get_start_o_local_copy_cond():
-        if grid_k == 1:
-            return jnp.logical_and(global_step_id >= 2, global_step_id
-                                   < mxu_total_steps + 2)
-        else:
-            return jnp.logical_and(
-                jnp.logical_and(
-                    global_step_id >= grid_k + 1,
-                    global_step_id < mxu_total_steps + grid_k + 1,
-                ),
-                global_step_id % grid_k == 1,
-            )
+    if fold > 1:
+        boundary = jnp.logical_and(
+            lax.rem(outer_step, fold) == 0,
+            jnp.logical_and(outer_step > 0, outer_step <= num_devices))
+        g_cur = outer_step // fold - 1
+        g_trail = (outer_step - 1) // fold - 1
+        # unit (g, bn_i - 1) exports inside its boundary outer; a group's
+        # last unit exports on the following outer step.
+        exp_in = jnp.logical_and(boundary, bn_i > 0)
+        exp_trail = jnp.logical_and(
+            jnp.logical_and(lax.rem(outer_step, fold) == 1,
+                            outer_step > fold),
+            outer_step <= num_devices + 1)
 
-    @pl.when(_get_start_o_local_copy_cond())
-    @jax.named_scope("_start_o_local_copy")
-    def _start_o_local_copy():
-        _do_o_local_copy(wait=False)
+        @pl.when(jnp.logical_and(exp_in, bk_i == 0))
+        @jax.named_scope("_start_o_export")
+        def _start_o_export_in():
+            _do_o_export_folded(g_cur, bn_i - 1, wait=False)
 
-    @pl.when(
-        jnp.logical_and(global_step_id >= 1, global_step_id
-                        < 1 + mxu_total_steps))
-    @jax.named_scope("_mxu")
-    def _mxu():
-        _do_mxu()
+        @pl.when(jnp.logical_and(exp_trail,
+                                 jnp.logical_and(bn_i == 0, bk_i == 0)))
+        @jax.named_scope("_start_o_export_trail")
+        def _start_o_export_trail():
+            _do_o_export_folded(g_trail, grid_n - 1, wait=False)
 
-    def _get_wait_o_local_copy_cond():
-        if grid_k == 1:
-            return jnp.logical_and(global_step_id >= 2, global_step_id
-                                   < mxu_total_steps + 2)
-        else:
-            return jnp.logical_and(
-                jnp.logical_and(
-                    global_step_id >= grid_k + 1,
-                    global_step_id < mxu_total_steps + grid_k + 1,
-                ),
-                global_step_id % grid_k == 0,
-            )
+        @pl.when(boundary)
+        @jax.named_scope("_mxu")
+        def _mxu_folded():
+            _do_mxu_folded()
 
-    @pl.when(_get_wait_o_local_copy_cond())
-    @jax.named_scope("_wait_o_local_copy")
-    def _wait_o_local_copy():
-        _do_o_local_copy(wait=True)
+        @pl.when(jnp.logical_and(exp_in, bk_i == grid_k - 1))
+        @jax.named_scope("_wait_o_export")
+        def _wait_o_export_in():
+            _do_o_export_folded(g_cur, bn_i - 1, wait=True)
+
+        @pl.when(jnp.logical_and(exp_trail,
+                                 jnp.logical_and(bn_i == grid_n - 1,
+                                                 bk_i == grid_k - 1)))
+        @jax.named_scope("_wait_o_export_trail")
+        def _wait_o_export_trail():
+            _do_o_export_folded(g_trail, grid_n - 1, wait=True)
+    else:
+
+        def _get_start_o_local_copy_cond():
+            if grid_k == 1:
+                return jnp.logical_and(global_step_id >= 2, global_step_id
+                                       < mxu_total_steps + 2)
+            else:
+                return jnp.logical_and(
+                    jnp.logical_and(
+                        global_step_id >= grid_k + 1,
+                        global_step_id < mxu_total_steps + grid_k + 1,
+                    ),
+                    global_step_id % grid_k == 1,
+                )
+
+        @pl.when(_get_start_o_local_copy_cond())
+        @jax.named_scope("_start_o_local_copy")
+        def _start_o_local_copy():
+            _do_o_local_copy(wait=False)
+
+        @pl.when(
+            jnp.logical_and(global_step_id >= 1, global_step_id
+                            < 1 + mxu_total_steps))
+        @jax.named_scope("_mxu")
+        def _mxu():
+            _do_mxu()
+
+        def _get_wait_o_local_copy_cond():
+            if grid_k == 1:
+                return jnp.logical_and(global_step_id >= 2, global_step_id
+                                       < mxu_total_steps + 2)
+            else:
+                return jnp.logical_and(
+                    jnp.logical_and(
+                        global_step_id >= grid_k + 1,
+                        global_step_id < mxu_total_steps + grid_k + 1,
+                    ),
+                    global_step_id % grid_k == 0,
+                )
+
+        @pl.when(_get_wait_o_local_copy_cond())
+        @jax.named_scope("_wait_o_local_copy")
+        def _wait_o_local_copy():
+            _do_o_local_copy(wait=True)
 
     @pl.when(y_copy_cond)
     @jax.named_scope("_wait_y_local_copy")
@@ -726,6 +857,10 @@ def _all_gather_kernel_unrolled(
             _o_export(step, wait=True)
 
 
+# Measured scoped-VMEM ceiling (memory_space_assignment clamps requests here).
+_VMEM_CAP_BYTES = 67043328
+
+
 # FIXME(chengjiyao): make it accurate for the cases of quantization
 def get_vmem_estimate_bytes(
     m,
@@ -738,6 +873,7 @@ def get_vmem_estimate_bytes(
     y_dtype,
     out_dtype,
     bm=None,
+    fold=1,
 ):
     """Returns the total vmem bytes used by the kernel."""
     m_per_device = m // tp_size
@@ -746,10 +882,10 @@ def get_vmem_estimate_bytes(
         bm = m_per_device
     y_vmem_bytes = (n_per_device * k * dtypes.itemsize_bits(y_dtype) // 8)
     total_bytes = (
-        2 * bm * k * dtypes.itemsize_bits(x_dtype) // 8
+        2 * fold * bm * k * dtypes.itemsize_bits(x_dtype) // 8
         # x_vmem_scratch_ref
         + y_vmem_bytes  # y_vmem_scratch_ref
-        + 2 * bm * bn * dtypes.itemsize_bits(out_dtype) // 8
+        + 2 * fold * bm * bn * dtypes.itemsize_bits(out_dtype) // 8
         # o_vmem_scratch_ref
         + acc_bytes  # acc_vmem_scratch_ref, jnp.float32
     )
@@ -876,7 +1012,25 @@ def all_gather_matmul(
     # the proven grid path stays the default; the unrolled form is kept as the
     # simpler single-block schedule and the base for future ring variants.
     use_unroll = bool(unroll)
-    acc_shape = (bm, bn)
+    # Compute-fold: a per-chunk dot below 128 rows starves the MXU at
+    # ~rows/128 occupancy, so at m_per_device < 128 the kernel stacks `fold`
+    # chunks per group buffer and dots them full-height at fold-boundary
+    # outer steps (256-row target). Halved until it divides tp_size and the
+    # VMEM estimate fits the scoped ceiling; fold == 1 keeps the original
+    # schedule byte-for-byte.
+    fold = 1
+    if bm == m_per_device and m_per_device < 128 and not use_unroll:
+        fold = 256 // m_per_device
+        while tp_size % fold:
+            fold //= 2
+        while fold > 1:
+            acc_b = (fold * bm * bn * 4) if grid_k > 1 else 8 * 128 * 4
+            if get_vmem_estimate_bytes(m, n, k, bn, acc_b, tp_size, x.dtype,
+                                       y.dtype, x.dtype, bm=bm,
+                                       fold=fold) <= _VMEM_CAP_BYTES:
+                break
+            fold //= 2
+    acc_shape = (fold * bm, bn)
     # NOTE(chengjiyao): acc buffer is not used in the grid_k == 1 case.
     if grid_k == 1:
         acc_shape = (8, 128)
@@ -894,6 +1048,7 @@ def all_gather_matmul(
         y.dtype,
         x.dtype,
         bm=bm,
+        fold=fold,
     )
     out_shape = [
         jax.ShapeDtypeStruct((m, n_per_device), x.dtype),  # output
@@ -920,9 +1075,9 @@ def all_gather_matmul(
                 2,
                 tp_size - 1,
             )),  # left and right recv semaphores
-            pltpu.VMEM((2, bm, k), x.dtype),  # x vmem scratch
+            pltpu.VMEM((2, fold * bm, k), x.dtype),  # x vmem scratch
             pltpu.VMEM(y_vmem_shape, y.dtype),  # y vmem scratch
-            pltpu.VMEM((2, bm, bn), x.dtype),  # output vmem scratch
+            pltpu.VMEM((2, fold * bm, bn), x.dtype),  # output vmem scratch
             pltpu.VMEM(acc_shape, jnp.float32),  # acc vmem scratch
         ),
         grid=((1, ) if use_unroll else
@@ -948,12 +1103,15 @@ def all_gather_matmul(
             bn=bn,
             bk=bk,
             bm=bm,
+            fold=fold,
             axis_name=axis_name,
             rhs_transpose=rhs_transpose,
         )
     kernel_name = get_kernel_name(bn, bk, bm, rhs_transpose)
     if use_unroll:
         kernel_name += "_unrolled"
+    if fold > 1:
+        kernel_name += f"_fold_{fold}"
 
     @jax.jit(static_argnames=["bn", "bk", "bm", "rhs_transpose"])
     def _all_gather_matmul_call(x, y, bn, bk, bm, rhs_transpose):
@@ -963,7 +1121,11 @@ def all_gather_matmul(
             grid_spec=grid_spec,
             compiler_params=pltpu.CompilerParams(
                 collective_id=collective_id,
-                vmem_limit_bytes=estimated_vmem_bytes + 8 * 1024 * 1024,
+                # fold == 1 keeps the exact historical limit; only the folded
+                # stage can push the request past the scoped ceiling.
+                vmem_limit_bytes=(min(estimated_vmem_bytes + 8 * 1024 * 1024,
+                                      _VMEM_CAP_BYTES) if fold > 1 else
+                                  estimated_vmem_bytes + 8 * 1024 * 1024),
             ),
             cost_estimate=cost_estimate,
             name=kernel_name,
