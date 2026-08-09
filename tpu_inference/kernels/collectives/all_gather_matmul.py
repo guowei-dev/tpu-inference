@@ -941,6 +941,7 @@ def all_gather_matmul(
     bm: int | None = None,
     rhs_transpose: bool = False,
     unroll: bool | None = None,
+    fold: int | None = None,
 ):
     """Performs all-gather on the input tensor and then a matmul.
 
@@ -1015,21 +1016,27 @@ def all_gather_matmul(
     # Compute-fold: a per-chunk dot below 128 rows starves the MXU at
     # ~rows/128 occupancy, so at m_per_device < 128 the kernel stacks `fold`
     # chunks per group buffer and dots them full-height at fold-boundary
-    # outer steps (256-row target). Halved until it divides tp_size and the
-    # VMEM estimate fits the scoped ceiling; fold == 1 keeps the original
-    # schedule byte-for-byte.
-    fold = 1
-    if bm == m_per_device and m_per_device < 128 and not use_unroll:
-        fold = 256 // m_per_device
-        while tp_size % fold:
-            fold //= 2
-        while fold > 1:
-            acc_b = (fold * bm * bn * 4) if grid_k > 1 else 8 * 128 * 4
-            if get_vmem_estimate_bytes(m, n, k, bn, acc_b, tp_size, x.dtype,
-                                       y.dtype, x.dtype, bm=bm,
-                                       fold=fold) <= _VMEM_CAP_BYTES:
-                break
-            fold //= 2
+    # outer steps. 128-row target — 256 concentrates compute into fewer
+    # outers for no rate gain and loses 8-15% (fold sweep, v7x tp16).
+    # Halved until it divides tp_size and the VMEM estimate fits the scoped
+    # ceiling; fold == 1 keeps the original schedule byte-for-byte.
+    if fold is None:
+        fold = 1
+        if bm == m_per_device and m_per_device < 128 and not use_unroll:
+            fold = 128 // m_per_device
+            while tp_size % fold:
+                fold //= 2
+            while fold > 1:
+                acc_b = (fold * bm * bn * 4) if grid_k > 1 else 8 * 128 * 4
+                if get_vmem_estimate_bytes(m, n, k, bn, acc_b, tp_size,
+                                           x.dtype, y.dtype, x.dtype, bm=bm,
+                                           fold=fold) <= _VMEM_CAP_BYTES:
+                    break
+                fold //= 2
+    elif fold > 1 and (bm != m_per_device or tp_size % fold or use_unroll):
+        raise ValueError(
+            f"fold ({fold}) requires bm == m // tp_size ({m_per_device}), "
+            f"fold | tp_size ({tp_size}) and the grid kernel.")
     acc_shape = (fold * bm, bn)
     # NOTE(chengjiyao): acc buffer is not used in the grid_k == 1 case.
     if grid_k == 1:
