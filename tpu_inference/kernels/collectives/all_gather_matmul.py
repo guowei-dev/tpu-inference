@@ -121,6 +121,16 @@ def _all_gather_kernel(
         fold_rows = pl.ds(lax.rem(outer_step, fold) * m_per_device,
                           m_per_device)
 
+    def _n_window(idx):
+        """The n window for block `idx`, or the whole extent at grid_n == 1.
+
+        A traced `idx * bn` offset is what requires `128 | bn`: Mosaic must
+        prove the tiled-dim index of the memref_slice is tile-aligned. At
+        grid_n == 1 the offset is structurally zero, so emitting the whole
+        extent instead makes an unaligned n // tp_size legal.
+        """
+        return slice(None) if grid_n == 1 else pl.ds(idx * bn, bn)
+
     def debug_print(msg, *args):
         if debug_mode:
 
@@ -243,7 +253,7 @@ def _all_gather_kernel(
             bn_i,
         )
         k_slice = pl.ds(bk_i * bk, bk)
-        n_slice = pl.ds(bn_i * bn, bn)
+        n_slice = _n_window(bn_i)
         if rhs_transpose:
             y_local_copy_op = pltpu.make_async_copy(
                 src_ref=y_hbm_ref.at[n_slice, k_slice],
@@ -349,7 +359,7 @@ def _all_gather_kernel(
             working_bn_i,
         )
         k_slice = pl.ds(working_bk_i * bk, bk)
-        n_slice = pl.ds(working_bn_i * bn, bn)
+        n_slice = _n_window(working_bn_i)
 
         if grid_k == 1:
             if rhs_transpose:
@@ -417,7 +427,7 @@ def _all_gather_kernel(
     def _do_o_local_copy(wait: bool = False):
         working_global_step_id = global_step_id - grid_k - 1
         working_bn_i = (working_global_step_id % gn_by_gk) // grid_k
-        n_slice = pl.ds(working_bn_i * bn, bn)
+        n_slice = _n_window(working_bn_i)
         if grid_m > 1:
             # one bm block targets a single destination row range: chunk base
             # by travel direction (left half of the chunk = even m_ppd block,
@@ -487,7 +497,7 @@ def _all_gather_kernel(
         # buffer (outer_step // fold - 1) % 2; same per-row contraction order
         # as the per-chunk dots.
         k_slice = pl.ds(bk_i * bk, bk)
-        n_slice = pl.ds(bn_i * bn, bn)
+        n_slice = _n_window(bn_i)
         unit = (outer_step // fold - 1) * grid_n + bn_i
         oslot = lax.rem(unit, 2)
         lhs = x_vmem_scratch_ref.at[group_working_slot, :, k_slice][...]
@@ -520,7 +530,7 @@ def _all_gather_kernel(
     def _do_o_export_folded(g_u, bn_u, wait: bool = False):
         # Export unit (g_u, bn_u): 2 * fold half-chunk DMAs; chunk
         # c = g_u * fold + j keeps the per-chunk o row mapping (offset = c).
-        n_slice = pl.ds(bn_u * bn, bn)
+        n_slice = _n_window(bn_u)
         slot = lax.rem(g_u * grid_n + bn_u, 2)
         half = m_per_device_per_direction
         for j in range(fold):
@@ -1003,6 +1013,12 @@ def all_gather_matmul(
     grid_m = m_per_device // bm
     grid_n = _cdiv(n_per_device, bn)
     grid_k = _cdiv(k, bk)
+    if grid_n > 1 and (bn % 128 or n_per_device % bn):
+        raise ValueError(
+            f"bn ({bn}) must be a multiple of 128 and divide n // tp_size "
+            f"({n_per_device}) when it blocks the n dimension: the block "
+            "offset has to be tile-aligned and a ragged tail block reads and "
+            "writes out of bounds. bn == n // tp_size has no such constraint.")
     single_block = grid_m == grid_n == grid_k == 1
     if unroll and not single_block:
         raise ValueError(

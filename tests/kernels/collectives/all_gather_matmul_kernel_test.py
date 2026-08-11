@@ -109,6 +109,65 @@ class AllGatherMatmulTest(jtu.JaxTestCase):
             expected_output = jnp.dot(sharded_x, y_for_dot)
             self.assertAllClose(output, expected_output, atol=1e-2, rtol=1e-2)
 
+    @parameterized.parameters(
+        (1024, 2592, False),
+        (1024, 2592, True),
+        (1024, 2784, False),
+        (256, 2592, False),   # fold x unaligned n_per
+        (512, 2784, True),    # fold x rhs_transpose x unaligned n_per
+    )
+    def test_all_gather_matmul_unaligned_n_per(self, m, n_per, rhs_transpose):
+        # n // tp_size not a multiple of 128 (production MLP intermediate
+        # dims, e.g. D=20736 at tp=8). bn defaults to n_per, so the kernel
+        # emits the whole n extent and no block offset needs proving.
+        if jax.device_count() != 8:
+            self.skipTest('Not enough devices for test')
+
+        axis_name = 'x'
+        num_devices = jax.device_count()
+        mesh = utils.make_optimized_mesh((num_devices, ), (axis_name, ))
+        k, n = 1024, n_per * num_devices
+
+        for i in range(3):
+            k0, k1 = jax.random.split(jax.random.key(99 + i), 2)
+            x = jax.random.normal(k0, (m, k), dtype=jnp.bfloat16)
+            y_shape = (n, k) if rhs_transpose else (k, n)
+            y_sharding = P(axis_name, None) if rhs_transpose else P(
+                None, axis_name)
+            sharded_x = jax.device_put(
+                x, jax.sharding.NamedSharding(mesh, P(axis_name, None)))
+            sharded_y = jax.device_put(
+                jax.random.normal(k1, y_shape, dtype=jnp.bfloat16),
+                jax.sharding.NamedSharding(mesh, y_sharding))
+
+            output = all_gather_matmul.all_gather_matmul(
+                sharded_x,
+                sharded_y,
+                mesh,
+                axis_name,
+                rhs_transpose=rhs_transpose,
+            )
+            y_for_dot = sharded_y.T if rhs_transpose else sharded_y
+            expected_output = jnp.dot(sharded_x, y_for_dot)
+            self.assertAllClose(output, expected_output, atol=1e-2, rtol=1e-2)
+
+    def test_all_gather_matmul_rejects_ragged_bn(self):
+        # A bn that blocks n must tile it exactly and lane-aligned; a ragged
+        # tail block reads and writes out of bounds, which cost a slice.
+        if jax.device_count() != 8:
+            self.skipTest('Not enough devices for test')
+
+        axis_name = 'x'
+        num_devices = jax.device_count()
+        mesh = utils.make_optimized_mesh((num_devices, ), (axis_name, ))
+        m, k, n = 1024, 1024, 2592 * num_devices
+        x = jax.ShapeDtypeStruct((m, k), jnp.bfloat16)
+        y = jax.ShapeDtypeStruct((k, n), jnp.bfloat16)
+        with self.assertRaisesRegex(ValueError, 'multiple of 128'):
+            jax.eval_shape(
+                lambda a, b: all_gather_matmul.all_gather_matmul(
+                    a, b, mesh, axis_name, bn=2560), x, y)
+
     @parameterized.product(rhs_transpose=[True, False])
     def test_all_gather_matmul_unrolled_matches_grid(self, rhs_transpose):
         # The unrolled-ring variant must be interchangeable with the grid
