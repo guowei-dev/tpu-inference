@@ -603,6 +603,17 @@ def _all_gather_kernel(
     def _start_y_local_copy():
         _do_y_local_copy(wait=False)
 
+    # Nothing before the first dot reads y, so the wait belongs at that dot —
+    # `fold` outer steps in, or the next grid step when fold == 1 — not in the
+    # step that issues the transfer, where it costs a hop for nothing.
+    y_wait_cond = (outer_step == fold if fold > 1 else jnp.logical_and(
+        global_step_id >= 1, global_step_id <= gn_by_gk))
+
+    @pl.when(y_wait_cond)
+    @jax.named_scope("_wait_y_local_copy")
+    def _wait_y_local_copy():
+        _do_y_local_copy(wait=True)
+
     if fold > 1:
         boundary = jnp.logical_and(
             lax.rem(outer_step, fold) == 0,
@@ -688,11 +699,6 @@ def _all_gather_kernel(
         @jax.named_scope("_wait_o_local_copy")
         def _wait_o_local_copy():
             _do_o_local_copy(wait=True)
-
-    @pl.when(y_copy_cond)
-    @jax.named_scope("_wait_y_local_copy")
-    def _wait_y_local_copy():
-        _do_y_local_copy(wait=True)
 
     @pl.when(jnp.logical_and(outer_step == 0, bn_i == 0))
     @jax.named_scope("_wait_first_x_local_copy")
@@ -843,7 +849,6 @@ def _all_gather_kernel_unrolled(
             _hop(0, wait=False)
             _x_local(0, wait=False)
             _y_local(wait=False)
-            _y_local(wait=True)
             _x_local(0, wait=True)
             _hop(0, wait=True)
         elif step < num_devices:
@@ -852,6 +857,9 @@ def _all_gather_kernel_unrolled(
             _x_local(step, wait=False)
             if step >= 2:
                 _o_export(step, wait=False)
+            if step == 1:
+                # First reader of y — see the grid kernel's `y_wait_cond`.
+                _y_local(wait=True)
             _mxu(step)
             if step >= 2:
                 _o_export(step, wait=True)
@@ -957,7 +965,11 @@ def all_gather_matmul(
 
   Args:
     x: LHS of the matmul before all-gather.
-    y: RHS of the matmul.
+    y: RHS of the matmul. When n // tp_size is not a multiple of 128, store it
+      with the row-major device layout (`jax.experimental.layout.Layout(
+      major_to_minor=(0, 1))`): XLA's default for such a shape is column-major,
+      which this kernel cannot take, so it relayouts the whole weight on every
+      call — 1.45x at m = 256.
     mesh: JAX mesh.
     axis_name: Name of the axis to all-gather over.
     collective_id: An integer used for barrier semaphore allocation.
