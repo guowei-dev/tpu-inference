@@ -235,6 +235,60 @@ def allport_schedule(num_dims):
     return sched
 
 
+def allport_ag_ladder(num_dims, num_bands=None):
+    """Relative-label ladder for the all-port (concurrent-dims) ALL-GATHER.
+
+    Not a reversal of allport_schedule — the reduce-scatter and the all-gather
+    are duals in volume but not in structure, and two differences decide the
+    kernel:
+
+      * **The twin (D2D) exchange goes LAST.** Each core disseminates only its
+        OWN parity plane over ICI (7P per core, not 14P) and forwards every
+        arrival to its twin, so a chip imports each of the 14 remote chunks
+        exactly once. 14P over the 3 chip ICI ports is 4.67P per port — the
+        information-theoretic floor for this topology. A ring cycle touches
+        only 2 of the 3 ports and carries 7.5P on each; that 1.6x is the whole
+        prize, and it is a property of the port count, not of the schedule's
+        cleverness.
+      * **Bands split the chunk's ROWS**, not the contraction, so every
+        arriving [rows, k] slice is a complete sub-chunk that dots the moment
+        it lands. Band b trades dim (b + s) % num_dims at round s, so all
+        num_bands ports are busy every round; with fewer bands than dims
+        (m_per too small to split), the rotation still covers every dim, the
+        per-port load just stops being balanced.
+
+    Everything is in RELATIVE chip labels l = q XOR my_chip, so every device
+    emits the same static sequence of starts and waits — the deadlock-freedom
+    argument of allport_schedule applies verbatim.
+
+    Returns a dict with:
+      order[b][p]:      band b's label at ladder position p (bit i of p is the
+                        label's bit at dim (b + i) % num_dims), so the labels
+                        held after round s are exactly positions [0, 2^s).
+      sends[(s, b, j)]: label sent at round s, band b, message j < 2^s.
+      recvs[(s, b, j)]: label that lands from it (== order[b][j + 2^s]).
+      dims[(b, s)]:     the dim traded, (b + s) % num_dims.
+    """
+    d = num_dims
+    nb = d if num_bands is None else num_bands
+    if not 1 <= nb <= d:
+        raise ValueError(f"num_bands {nb} not in [1, {d}]")
+    dims = {(b, s): (b + s) % d for b in range(nb) for s in range(d)}
+    order = [[
+        sum(((p >> i) & 1) << dims[(b, i)] for i in range(d))
+        for p in range(1 << d)
+    ] for b in range(nb)]
+    sends, recvs = {}, {}
+    for s in range(d):
+        for b in range(nb):
+            for j in range(1 << s):
+                sends[(s, b, j)] = order[b][j]
+                recvs[(s, b, j)] = order[b][j] | (1 << dims[(b, s)])
+                assert recvs[(s, b, j)] == order[b][j + (1 << s)]
+    return dict(num_dims=d, num_bands=nb, order=order, sends=sends,
+                recvs=recvs, dims=dims)
+
+
 def allport_program(num_dims):
     """The all-port kernel's static emission order (one program, all devices).
 
