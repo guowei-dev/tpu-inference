@@ -121,16 +121,6 @@ def _all_gather_kernel(
         fold_rows = pl.ds(lax.rem(outer_step, fold) * m_per_device,
                           m_per_device)
 
-    def _n_window(idx):
-        """The n window for block `idx`, or the whole extent at grid_n == 1.
-
-        A traced `idx * bn` offset is what requires `128 | bn`: Mosaic must
-        prove the tiled-dim index of the memref_slice is tile-aligned. At
-        grid_n == 1 the offset is structurally zero, so emitting the whole
-        extent instead makes an unaligned n // tp_size legal.
-        """
-        return slice(None) if grid_n == 1 else pl.ds(idx * bn, bn)
-
     def debug_print(msg, *args):
         if debug_mode:
 
@@ -253,7 +243,7 @@ def _all_gather_kernel(
             bn_i,
         )
         k_slice = pl.ds(bk_i * bk, bk)
-        n_slice = _n_window(bn_i)
+        n_slice = pl.ds(bn_i * bn, bn)
         if rhs_transpose:
             y_local_copy_op = pltpu.make_async_copy(
                 src_ref=y_hbm_ref.at[n_slice, k_slice],
@@ -359,7 +349,7 @@ def _all_gather_kernel(
             working_bn_i,
         )
         k_slice = pl.ds(working_bk_i * bk, bk)
-        n_slice = _n_window(working_bn_i)
+        n_slice = pl.ds(working_bn_i * bn, bn)
 
         if grid_k == 1:
             if rhs_transpose:
@@ -427,7 +417,7 @@ def _all_gather_kernel(
     def _do_o_local_copy(wait: bool = False):
         working_global_step_id = global_step_id - grid_k - 1
         working_bn_i = (working_global_step_id % gn_by_gk) // grid_k
-        n_slice = _n_window(working_bn_i)
+        n_slice = pl.ds(working_bn_i * bn, bn)
         if grid_m > 1:
             # one bm block targets a single destination row range: chunk base
             # by travel direction (left half of the chunk = even m_ppd block,
@@ -497,7 +487,7 @@ def _all_gather_kernel(
         # buffer (outer_step // fold - 1) % 2; same per-row contraction order
         # as the per-chunk dots.
         k_slice = pl.ds(bk_i * bk, bk)
-        n_slice = _n_window(bn_i)
+        n_slice = pl.ds(bn_i * bn, bn)
         unit = (outer_step // fold - 1) * grid_n + bn_i
         oslot = lax.rem(unit, 2)
         lhs = x_vmem_scratch_ref.at[group_working_slot, :, k_slice][...]
@@ -530,7 +520,7 @@ def _all_gather_kernel(
     def _do_o_export_folded(g_u, bn_u, wait: bool = False):
         # Export unit (g_u, bn_u): 2 * fold half-chunk DMAs; chunk
         # c = g_u * fold + j keeps the per-chunk o row mapping (offset = c).
-        n_slice = _n_window(bn_u)
+        n_slice = pl.ds(bn_u * bn, bn)
         slot = lax.rem(g_u * grid_n + bn_u, 2)
         half = m_per_device_per_direction
         for j in range(fold):
@@ -985,15 +975,19 @@ def all_gather_matmul(
         y_in_spec = P(None, axis_name)
     m_per_device = m // tp_size
     n_per_device = n // tp_size
+    # A ragged lane width makes the one-time y HBM->VMEM load ~3x slower
+    # (measured 1.45 us per MiB of y, independent of m), so the kernel runs at
+    # the lane-aligned width and the zero columns are dropped from the result.
+    n_pad = _cdiv(n_per_device, 128) * 128
     tuned_bn, tuned_bk = (
         all_gather_matmul_tuned_block_sizes.get_tuned_block_sizes(
             m, n, k,
             jnp.dtype(x.dtype).name, tp_size))
     if bn is None:
-        bn = tuned_bn if tuned_bn is not None else n_per_device
+        bn = tuned_bn if tuned_bn is not None else n_pad
     if bk is None:
         bk = tuned_bk if tuned_bk is not None else k
-    if bn > n_per_device:
+    if bn > n_pad:
         raise ValueError(
             f"bn ({bn}) must be <= n // tp_size ({n_per_device}): the kernel "
             "slices its per-device [k, n // tp_size] y block by bn, so a "
@@ -1011,9 +1005,9 @@ def all_gather_matmul(
                 f"({m_per_device // 2}) so a row block stays on one side of "
                 "the bidirectional split.")
     grid_m = m_per_device // bm
-    grid_n = _cdiv(n_per_device, bn)
+    grid_n = _cdiv(n_pad, bn)
     grid_k = _cdiv(k, bk)
-    if grid_n > 1 and (bn % 128 or n_per_device % bn):
+    if grid_n > 1 and (bn % 128 or n_pad % bn):
         raise ValueError(
             f"bn ({bn}) must be a multiple of 128 and divide n // tp_size "
             f"({n_per_device}) when it blocks the n dimension: the block "
@@ -1059,7 +1053,7 @@ def all_gather_matmul(
         acc_shape = (8, 128)
     acc_bytes = (acc_shape[0] * acc_shape[1] *
                  dtypes.itemsize_bits(jnp.float32)) // 8
-    y_vmem_shape = (n_per_device, k) if rhs_transpose else (k, n_per_device)
+    y_vmem_shape = (n_pad, k) if rhs_transpose else (k, n_pad)
     estimated_vmem_bytes = get_vmem_estimate_bytes(
         m,
         n,
@@ -1074,7 +1068,7 @@ def all_gather_matmul(
         fold=fold,
     )
     out_shape = [
-        jax.ShapeDtypeStruct((m, n_per_device), x.dtype),  # output
+        jax.ShapeDtypeStruct((m, n_pad), x.dtype),  # output
         jax.ShapeDtypeStruct((tp_size - 1, m_per_device, k),
                              x.dtype),  # x HBM scratch
     ]
@@ -1138,7 +1132,11 @@ def all_gather_matmul(
 
     @jax.jit(static_argnames=["bn", "bk", "bm", "rhs_transpose"])
     def _all_gather_matmul_call(x, y, bn, bk, bm, rhs_transpose):
-        return pl.pallas_call(
+        if n_pad != n_per_device:
+            width = n_pad - n_per_device
+            y = jnp.pad(y, ((0, width), (0, 0)) if rhs_transpose else
+                        ((0, 0), (0, width)))
+        out = pl.pallas_call(
             kernel_body,
             out_shape=out_shape,
             grid_spec=grid_spec,
@@ -1153,6 +1151,7 @@ def all_gather_matmul(
             cost_estimate=cost_estimate,
             name=kernel_name,
         )(x, y)[0]
+        return out if n_pad == n_per_device else out[:, :n_per_device]
 
     shard_map_kernel = jax.jit(
         jax.shard_map(
