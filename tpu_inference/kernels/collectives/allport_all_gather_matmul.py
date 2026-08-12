@@ -113,8 +113,8 @@ def _plan(num_dims, m_per):
     return ladder, pieces, groups, loc
 
 
-def _batches(pieces, lo, hi, bm, split_at):
-    """Row segments of at most bm rows covering pieces[lo:hi].
+def _batches(pieces, bm, split_at):
+    """Row segments of at most bm rows covering every piece, in arrival order.
 
     A batch is a list of (piece index, offset in that piece, rows); pieces are
     contiguous in the gather buffer, so a batch is one contiguous read. No
@@ -122,7 +122,7 @@ def _batches(pieces, lo, hi, bm, split_at):
     `x` input rather than from the gather buffer, and a DMA has one source.
     """
     out, cur, filled = [], [], 0
-    for i in range(lo, hi):
+    for i in range(len(pieces)):
         left, off = pieces[i]["rows"], 0
         while left:
             take = min(left, bm - filled)
@@ -298,9 +298,11 @@ def _allport_ag_kernel(
         """Software-pipelined dot loop.
 
         `arm(i)` runs before batch i's staging load is issued and is where the
-        arrival waits live: the load for batch i + depth is issued AFTER batch
-        i's dot, so a blocking arrival wait never sits between two dots whose
-        data is already in VMEM.
+        arrival waits live; the load for batch i + depth is issued AFTER batch
+        i's dot, so a blocking arrival wait sits behind as much already-staged
+        compute as the pipeline is deep. It does not remove the stall: a static
+        program's wait halts everything behind it, and the full kernel measures
+        1.30-1.33x max(compute-only, wire-only) — the largest term still open.
         """
         if ablate == 2:  # wire only: arrivals still drain, no dot, no staging
             for i in range(len(batch_list)):
@@ -327,10 +329,10 @@ def _allport_ag_kernel(
 
     # Per-piece unlock actions. An arrival is not just a dot's operand: it is
     # also the payload of the NEXT round's message on that band and of the D2D
-    # forward to the twin, so both are issued the instant it lands. Doing this
-    # per PIECE rather than per round is what stops the ladder's last round —
-    # half the data — from serialising behind the wire: the group-granular
-    # form measures W + C/2, this one max(W, C).
+    # forward to the twin, so both are issued the instant it lands. Per PIECE
+    # rather than per round, because the ladder delivers HALF its data in the
+    # last round and a round-granular wait serialises that half behind the
+    # wire.
     actions = {}
 
     def act(i, fn):
@@ -399,7 +401,7 @@ def _allport_ag_kernel(
     # so a per-round `run` only drained the staging pipeline at every round
     # boundary — and with half the data arriving in the last round that is
     # where the overlap has to hold.
-    bl = _batches(pieces, 0, len(pieces), bm, m_per)
+    bl = _batches(pieces, bm, m_per)
     run(bl, 0, arm=None if ablate == 1 else arm_for(0, bl))
 
     for nb in range(1, len(n_blocks)):
@@ -407,7 +409,7 @@ def _allport_ag_kernel(
             break
         y_load(nb).start()
         y_load(nb).wait()
-        run(_batches(pieces, 0, len(pieces), bm, m_per), nb)
+        run(_batches(pieces, bm, m_per), nb)
 
 
 def _pick_config(m, m_per, n_per, k, itemsize):
