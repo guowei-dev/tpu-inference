@@ -196,6 +196,15 @@ class TileSizes:
     tile_k: int
     tile_n: int
     bucket_base: int
+    # Optional explicit bucket rung menu (ascending, last == tile_m). Empty =
+    # the arithmetic menu bucket_base*(i+1). A GEOMETRIC menu (32, 64, 128,
+    # 256, 512) bounds the partial-tile overshoot to <=2x at every scale with
+    # only O(log) branches -- an arithmetic menu needs a small base for the
+    # same bottom rung, and that many branches of windowed extract blow
+    # scoped VMEM (measured: base=32 at tile_m=512 is 2.7x on a fat-group
+    # geometry while the 5-rung geometric menu's branch scratch sums smaller
+    # than base=64's).
+    bucket_menu: tuple = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -621,8 +630,7 @@ def inner_kernel(
         else:
             acc_ref[:acc_m] = acc
 
-    def run_matmul_step(bucket_idx: int):
-        bucket_m = cfgs.tiles.bucket_base * (bucket_idx + 1)
+    def run_matmul_step(bucket_m: int):
 
         @jax.named_scope(f"bm{bucket_m}_first_last")
         def matmul_first_last():
@@ -664,11 +672,21 @@ def inner_kernel(
             # partial m is only invoked at last matmul.
             lax.cond(is_first_k_step, matmul_first_last, matmul_last)
 
-    branches = []
-    for bucket_idx in range(cfgs.tiles.tile_m // cfgs.tiles.bucket_base):
-        branches.append(
-            functools.partial(run_matmul_step, bucket_idx=bucket_idx))
-    bucket_idx = m_end_local // cfgs.tiles.bucket_base
+    menu = cfgs.tiles.bucket_menu
+    if menu:
+        assert tuple(sorted(menu)) == tuple(menu) and menu[-1] == \
+            cfgs.tiles.tile_m, menu
+        branches = [functools.partial(run_matmul_step, bucket_m=b)
+                    for b in menu]
+        # index of the smallest rung >= the live extent
+        bucket_idx = sum((m_end_local > b).astype(jnp.int32)
+                         for b in menu[:-1])
+    else:
+        branches = []
+        for i in range(cfgs.tiles.tile_m // cfgs.tiles.bucket_base):
+            branches.append(functools.partial(
+                run_matmul_step, bucket_m=cfgs.tiles.bucket_base * (i + 1)))
+        bucket_idx = m_end_local // cfgs.tiles.bucket_base
     lax.switch(bucket_idx, branches)
 
 

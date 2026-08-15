@@ -915,3 +915,29 @@ class FusedPermuteGmmTest(jtu.JaxTestCase):
         self._run(get_group_sizes(2560, 16), pool_rows=256, group_offset=4,
                   packed_pool=True, out_blocked=True, coissue=True,
                   traced_slots=False, rhs_buffers=2)
+
+    def test_capacity_windowed_extract(self):
+        # Capacity tiling: tile_m is a static capacity, a fat group spans
+        # several gm tiles (the pipeline's same-window skip makes the split
+        # free), and the unpack is windowed to the live bucket. The geometry
+        # exercises a >tile_m group (split + partial tail bucket), an empty
+        # group and sub-bucket thin groups.
+        group_sizes = jnp.array([20, 700, 44, 0, 300, 96, 12, 108],
+                                dtype=jnp.int32)
+        # tile_n is in OUT units (out_size_n = 256 after silu halves n) and
+        # the blocked out spec needs tile_n to fit it exactly.
+        self._run(group_sizes, pool_rows=256, group_offset=1,
+                  packed_pool=True, out_blocked=True,
+                  tile_info=TileSizes(512, 512, 256, 128),
+                  windowed_extract=True)
+
+    def test_bucket_menu(self):
+        # Geometric bucket rung menu on the same fat-group geometry, on the
+        # blocked-pool chassis (windowed extract's reshape path).
+        group_sizes = jnp.array([20, 700, 44, 0, 300, 96, 12, 108],
+                                dtype=jnp.int32)
+        self._run(group_sizes, pool_rows=256, group_offset=1,
+                  pool_blocked=True, out_blocked=True,
+                  tile_info=TileSizes(512, 512, 256, 64,
+                                      bucket_menu=(32, 64, 128, 256, 512)),
+                  windowed_extract=True)

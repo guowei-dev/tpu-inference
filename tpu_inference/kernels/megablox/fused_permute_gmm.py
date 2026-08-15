@@ -201,6 +201,7 @@ def _fused_permute_gmm_inner(
     coissue_rows: int,
     traced_slots: bool,
     windowed_extract: bool,
+    dyn_issue: bool,
 ):
     """Pipeline body. rhs/out stay pipelined; the LHS tile is gathered."""
     tile_m = cfgs.tiles.tile_m
@@ -279,6 +280,45 @@ def _fused_permute_gmm_inner(
                 # Build every descriptor before starting any of them.
                 for cp in copies:
                     cp.start()
+
+    def start_rows_dyn(step, slot, first=0):
+        """`start_rows` with the chunk loop bounded by the LIVE count (a
+        traced fori) instead of tile_m static predicates. Kills the
+        ceil(tile_m/chunk) dead-predicate scaffolding that a capacity tile
+        would otherwise pay on thin tiles (solve tile-trilemma P4). The
+        semaphore account mirrors start_rows exactly: cdiv(max(live-first,0),
+        chunk) full chunks."""
+        m_offset, live = m_base(step)
+        k_base = lax.rem(step, num_k) * row_k
+        n_chunks = lax.div(jnp.maximum(live - first, 0) + (chunk - 1), chunk)
+
+        def _one(i, _):
+            c = first + i * chunk
+            for jj in range(chunk):
+                pltpu.make_async_copy(
+                    lhs_pool.at[pl.ds(_row(m_offset + c + jj), 1),
+                                pl.ds(k_base, row_k)],
+                    gather_buf.at[slot, pl.ds(c + jj, 1)],
+                    gather_sem.at[slot],
+                ).start()
+            return 0
+
+        lax.fori_loop(0, n_chunks, _one, 0)
+
+    def wait_rows_dyn(step, slot, first=0):
+        _, live = m_base(step)
+        n_chunks = lax.div(jnp.maximum(live - first, 0) + (chunk - 1), chunk)
+
+        def _one(i, _):
+            for _ in range(chunk):
+                pltpu.make_async_copy(
+                    lhs_pool.at[pl.ds(0, 1), pl.ds(0, row_k)],
+                    gather_buf.at[slot, pl.ds(0, 1)],
+                    gather_sem.at[slot],
+                ).wait()
+            return 0
+
+        lax.fori_loop(0, n_chunks, _one, 0)
 
     def _row(i):
         row = idx_smem[i]
@@ -457,11 +497,11 @@ def _fused_permute_gmm_inner(
             # (round 14) was probed and measured +4.3..+8.2 us here -- on
             # the emit_pipeline chassis issue-first gives the next tile's
             # gather a full dot of cover (ledger fpg-postdot).
-            start_rows(s + 1, nxt)
+            (start_rows_dyn if dyn_issue else start_rows)(s + 1, nxt)
             if packing > 1 and not packed_pool:
                 start_parity(s + 1, nxt)
 
-        wait_rows(s, slot)
+        (wait_rows_dyn if dyn_issue else wait_rows)(s, slot)
         if packing > 1 and not packed_pool:
             wait_parity(slot)
         inner_kernel(None if windowed_extract else extract(slot),
@@ -481,8 +521,9 @@ def _fused_permute_gmm_inner(
             # as soon as a tile has fewer than tile_m live rows.
             start_rows_unguarded(0, 0, 0, min(coissue_rows, tile_m))
             start_rows(0, 0, first=min(coissue_rows, tile_m))
+            # (coissue keeps the static form end to end)
         else:
-            start_rows(0, 0)
+            (start_rows_dyn if dyn_issue else start_rows)(0, 0)
         if packing > 1 and not packed_pool:
             start_parity(0, 0)
 
@@ -538,6 +579,7 @@ def kernel_main_fpg(
     traced_slots: bool,
     rhs_buffers: int,
     windowed_extract: bool,
+    dyn_issue: bool,
 ):
     num_k = pl.cdiv(cfgs.dims.size_k, cfgs.tiles.tile_k)
     num_n = pl.cdiv(cfgs.out_size_n, cfgs.tiles.tile_n)
@@ -573,7 +615,8 @@ def kernel_main_fpg(
                              out_blocked=out_blocked,
                              coissue_rows=coissue_rows,
                              traced_slots=traced_slots,
-                             windowed_extract=windowed_extract)
+                             windowed_extract=windowed_extract,
+                             dyn_issue=dyn_issue)
 
     pipeline_fn = pltpu.emit_pipeline(body, grid=(num_n, num_gm, num_k),
                                       in_specs=(rhs_spec, ),
@@ -599,6 +642,7 @@ def kernel_main_fpg(
     "num_slots", "chunk", "coissue", "packed_pool", "issue_spread",
     "out_blocked", "stage_lhs", "coissue_rows",
     "traced_slots", "rhs_buffers", "pool_blocked", "windowed_extract",
+    "dyn_issue",
 ])
 def fused_permute_gmm(
     lhs: jax.Array,  # [size_src, size_k] un-permuted pool
@@ -629,6 +673,7 @@ def fused_permute_gmm(
     rhs_buffers: int = 3,
     pool_blocked: bool = False,
     windowed_extract: bool = False,
+    dyn_issue: bool = False,
 ) -> jax.Array:
     """Grouped matmul over `lhs[gather_indices]` without materialising it.
 
@@ -774,7 +819,8 @@ def fused_permute_gmm(
                              traced_slots=traced_slots,
                              rhs_buffers=rhs_buffers,
                              pool_blocked=pool_blocked,
-                             windowed_extract=windowed_extract),
+                             windowed_extract=windowed_extract,
+                             dyn_issue=dyn_issue),
         out_shape=out_init,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=3,
