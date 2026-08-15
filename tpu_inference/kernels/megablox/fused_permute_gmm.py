@@ -68,6 +68,17 @@ guard is a region boundary), so it reads `tile_m - live` dead rows per tile.
              4   | 193.0|   95.1%    |     8.4%       |     1.0%
              8   | 193.9|   94.7%    |    12.3%       |     1.0%
             64   | 196.6|   93.5%    |      --        |      --
+
+`coissue_depths=` stages the injection depth per bucket branch (a Python int
+inside each branch), the bucket-adaptive form of the same split -- REFUTED as
+a speed lever (solve b2-coissue, 2026-08-15): on the capacity chassis every
+injected depth loses on every routing structure, roughly linearly in depth
+(vs co-off: prefix-4 +1.5~5%, depth-128 +4~16%, full-depth +5~56%; all
+bitwise). In-region pairing moves the issue chain INTO the dot's instruction
+stream instead of ahead of it, so the region stretches by ~the chain length
+and the MXU waits on its own issue slots; the issue-first placement outside
+the region is the measured optimum of this chassis. Kept as a measurable
+knob; never default it on.
       64, no pool| 210.9|   87.1%    |    67.3%       |    43.9%
 
     (Measured on the original chassis. On the migrated traced-slot +
@@ -199,6 +210,7 @@ def _fused_permute_gmm_inner(
     issue_spread: int,
     out_blocked: int,
     coissue_rows: int,
+    coissue_depths: tuple,
     traced_slots: bool,
     windowed_extract: bool,
     dyn_issue: bool,
@@ -434,9 +446,106 @@ def _fused_permute_gmm_inner(
                 gather_sem.at[slot],
             ).wait()
 
+    if coissue_depths:
+        # Bucket-adaptive injection (solve b2-coissue): the depth issued from
+        # inside a step's bucket branch is `coissue_depths[branch]`, a Python
+        # int there. Outside the switch the SAME depth is reconstructed from
+        # metadata as a traced select chain that mirrors inner_kernel's
+        # dispatch exactly (menu: smallest rung >= live; arithmetic:
+        # live // bucket_base).
+        _menu = cfgs.tiles.bucket_menu or tuple(
+            cfgs.tiles.bucket_base * (i + 1)
+            for i in range(tile_m // cfgs.tiles.bucket_base))
+        if cfgs.tiles.bucket_menu:
+            _thresholds = tuple(_menu[:-1])
+        else:
+            _thresholds = tuple(cfgs.tiles.bucket_base * i - 1
+                                for i in range(1, len(_menu)))
+
+        def depth_of(step):
+            _, live = m_base(step)
+            d = jnp.int32(coissue_depths[0])
+            for thr, dep in zip(_thresholds, coissue_depths[1:]):
+                d = jnp.where(live > thr, jnp.int32(dep), d)
+            return d
+
+    def start_rows_after(step, slot, d):
+        """The guarded tail of a bucket-adaptive split: the chunks the
+        in-region injection (depth `d`, traced here) did not cover. The
+        semaphore account per tile is `max(d, ceil_chunk(live))` -- `d`
+        unguarded rows plus these chunks -- which wait_rows_bucket mirrors."""
+        m_offset, live = m_base(step)
+        k_base = lax.rem(step, num_k) * row_k
+        for c in range(0, tile_m, chunk):
+
+            @pl.when((c >= d) & (c < live))
+            def _(c=c):
+                copies = [
+                    pltpu.make_async_copy(
+                        lhs_pool.at[pl.ds(_row(m_offset + j), 1),
+                                    pl.ds(k_base, row_k)],
+                        gather_buf.at[slot, pl.ds(j, 1)],
+                        gather_sem.at[slot],
+                    ) for j in range(c, min(c + chunk, tile_m))
+                ]
+                for cp in copies:
+                    cp.start()
+
+    def wait_rows_bucket(step, slot, d_prev):
+        _, live = m_base(step)
+        for c in range(0, tile_m, chunk):
+
+            @pl.when((c < d_prev) | (c < live))
+            def _(c=c):
+                for _ in range(min(c + chunk, tile_m) - c):
+                    pltpu.make_async_copy(
+                        lhs_pool.at[pl.ds(0, 1), pl.ds(0, row_k)],
+                        gather_buf.at[slot, pl.ds(0, 1)],
+                        gather_sem.at[slot],
+                    ).wait()
+
     def run(slot):
         """One grid step, with `slot` a PYTHON int."""
         nxt = (slot + 1) % num_slots
+
+        if coissue and coissue_depths:
+            # Bucket-adaptive HYBRID split: the injected prefix of the NEXT
+            # tile is `coissue_depths[branch]` rows, decided by the CURRENT
+            # tile's bucket branch (a Python int inside it) -- a fat dot has
+            # a long MXU stream to hide a deep chain under, a thin dot gets a
+            # shallow one. The guarded tail and the waits reconstruct the
+            # depth from metadata (traced), so both sides count
+            # max(d, ceil_chunk(live)) and the semaphore balances.
+            def issue_fn(site, n_sites, bucket_m, nxt=nxt):
+                d_inj = coissue_depths[_menu.index(bucket_m)]
+                n_use = n_sites if issue_spread <= 0 else min(n_sites,
+                                                              issue_spread)
+                if site >= n_use:
+                    return
+                per = -(-d_inj // n_use) if d_inj else 0
+                lo = site * per
+                if lo >= d_inj:
+                    return
+
+                @pl.when(s + 1 < num_steps)
+                def _():
+                    start_rows_unguarded(s + 1, nxt, lo, min(lo + per, d_inj))
+
+            d_prev = jnp.where(s == 0, jnp.int32(coissue_depths[0]),
+                               depth_of(jnp.maximum(s - 1, 0)))
+            wait_rows_bucket(s, slot, d_prev)
+
+            @pl.when(s + 1 < num_steps)
+            def _():
+                start_rows_after(s + 1, nxt, depth_of(s))
+
+            inner_kernel(None if windowed_extract else extract(slot),
+                         tiled_rhs_ref, tiled_out_ref,
+                         partial_out_ref, acc_ref, metadata_ref, cfgs=cfgs,
+                         issue_fn=issue_fn, out_blocked=out_blocked,
+                         lhs_fn=functools.partial(extract_window, slot)
+                         if windowed_extract else None)
+            return
 
         if coissue:
             # HYBRID split. `coissue_rows` rows are issued from INSIDE
@@ -451,9 +560,13 @@ def _fused_permute_gmm_inner(
             #     and without staging, and with a single slot.
             # A small in-region prefix gets the property at negligible cost:
             # rows below it are live on essentially every tile.
+            # (`coissue_depths` supersedes both caveats on the capacity
+            # chassis: the depth rides the bucket branch, so a full-depth
+            # branch only exists where the dot is tall enough to pay for it.)
             n_co = min(coissue_rows, tile_m)
 
-            def issue_fn(site, n_sites, nxt=nxt):
+            def issue_fn(site, n_sites, bucket_m, nxt=nxt):
+                del bucket_m  # static depth: same prefix in every branch
                 n_use = n_sites if issue_spread <= 0 else min(n_sites,
                                                               issue_spread)
                 if site >= n_use:
@@ -519,8 +632,13 @@ def _fused_permute_gmm_inner(
             # `n_co unguarded + the guarded tail`, so the warm-up has to start
             # exactly that. Starting all tile_m rows here core-halts (E0200)
             # as soon as a tile has fewer than tile_m live rows.
-            start_rows_unguarded(0, 0, 0, min(coissue_rows, tile_m))
-            start_rows(0, 0, first=min(coissue_rows, tile_m))
+            # Bucket-adaptive form: tile 0 has no issuer, so its "injected"
+            # prefix is a STATIC coissue_depths[0] (the wait side's d_prev at
+            # s == 0 is pinned to the same value).
+            n0 = (coissue_depths[0] if coissue_depths
+                  else min(coissue_rows, tile_m))
+            start_rows_unguarded(0, 0, 0, n0)
+            start_rows(0, 0, first=n0)
             # (coissue keeps the static form end to end)
         else:
             (start_rows_dyn if dyn_issue else start_rows)(0, 0)
@@ -576,6 +694,7 @@ def kernel_main_fpg(
     issue_spread: int,
     out_blocked: int,
     coissue_rows: int,
+    coissue_depths: tuple,
     traced_slots: bool,
     rhs_buffers: int,
     windowed_extract: bool,
@@ -614,6 +733,7 @@ def kernel_main_fpg(
                              issue_spread=issue_spread,
                              out_blocked=out_blocked,
                              coissue_rows=coissue_rows,
+                             coissue_depths=coissue_depths,
                              traced_slots=traced_slots,
                              windowed_extract=windowed_extract,
                              dyn_issue=dyn_issue)
@@ -640,7 +760,7 @@ def kernel_main_fpg(
     "tile_info", "vmem_limit_bytes", "precision", "preferred_element_type",
     "acc_dtype", "maybe_quantize_lhs", "zero_initialize", "fuse_act",
     "num_slots", "chunk", "coissue", "packed_pool", "issue_spread",
-    "out_blocked", "stage_lhs", "coissue_rows",
+    "out_blocked", "stage_lhs", "coissue_rows", "coissue_depths",
     "traced_slots", "rhs_buffers", "pool_blocked", "windowed_extract",
     "dyn_issue",
 ])
@@ -669,6 +789,7 @@ def fused_permute_gmm(
     out_blocked: bool = False,
     stage_lhs: bool = False,
     coissue_rows: int = 4,
+    coissue_depths: tuple = (),
     traced_slots: bool = True,
     rhs_buffers: int = 3,
     pool_blocked: bool = False,
@@ -739,6 +860,28 @@ def fused_permute_gmm(
         # Measured at T=64 (live ~10 rows/tile): chunk=8 saves 1.9 us of
         # dead-row reads on a 32-row tile; 16 is right once tiles are 64+.
         chunk = 8 if tiles.tile_m <= 32 else 16
+    if coissue_depths:
+        if not coissue:
+            raise ValueError("coissue_depths requires coissue=True")
+        if not (packed_pool or pool_blocked):
+            raise ValueError("coissue_depths is not implemented on the "
+                             "parity (plain-pool) path")
+        if not cfgs.lhs_cfgs.should_quantize:
+            raise ValueError("coissue_depths needs the quantized matmul path "
+                             "(the injection sites live there)")
+        menu_eff = tiles.bucket_menu or tuple(
+            tiles.bucket_base * (i + 1)
+            for i in range(tiles.tile_m // tiles.bucket_base))
+        if len(coissue_depths) != len(menu_eff):
+            raise ValueError(
+                f"coissue_depths must pair the bucket menu {menu_eff}; got "
+                f"{coissue_depths}")
+        for d in coissue_depths:
+            if d % chunk or not 0 <= d <= tiles.tile_m:
+                raise ValueError(
+                    f"each injection depth must be a multiple of "
+                    f"chunk={chunk} in [0, {tiles.tile_m}]; got "
+                    f"{coissue_depths}")
     if group_offset is None:
         group_offset = jnp.zeros((1, ), jnp.int32)
 
@@ -816,6 +959,7 @@ def fused_permute_gmm(
                              issue_spread=issue_spread,
                              out_blocked=LANES if out_blocked else 0,
                              coissue_rows=coissue_rows,
+                             coissue_depths=coissue_depths,
                              traced_slots=traced_slots,
                              rhs_buffers=rhs_buffers,
                              pool_blocked=pool_blocked,

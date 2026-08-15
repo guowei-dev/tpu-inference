@@ -941,3 +941,18 @@ class FusedPermuteGmmTest(jtu.JaxTestCase):
                   tile_info=TileSizes(512, 512, 256, 64,
                                       bucket_menu=(32, 64, 128, 256, 512)),
                   windowed_extract=True)
+
+    def test_coissue_depths(self):
+        # Bucket-adaptive injection: the semaphore account is
+        # max(d(prev branch), ceil_chunk(live)) on both sides, with the
+        # depth reconstructed from metadata on the wait side. The fat group
+        # makes consecutive tiles change buckets (512 -> 256-tail -> thin),
+        # which is exactly where a mis-mirrored depth would unbalance.
+        group_sizes = jnp.array([20, 700, 44, 0, 300, 96, 12, 108],
+                                dtype=jnp.int32)
+        self._run(group_sizes, pool_rows=256, group_offset=1,
+                  packed_pool=True, out_blocked=True,
+                  tile_info=TileSizes(512, 512, 256, 64,
+                                      bucket_menu=(32, 64, 128, 256, 512)),
+                  windowed_extract=True, coissue=True,
+                  coissue_depths=(32, 64, 128, 256, 512), issue_spread=0)

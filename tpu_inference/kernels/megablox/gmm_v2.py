@@ -407,13 +407,15 @@ def inner_kernel(
         acc_ref: Reference to the accumulator.
         metadata_ref: Reference to the metadata.
         cfgs: GmmConfigs.
-        issue_fn: Optional `(site, num_sites) -> None`, called once after each
-            matmul site of the quantized path. A caller that gathers its own
-            LHS uses it to emit the next tile's row DMAs from inside this
-            function, which is the only way they land in the same scheduling
-            region as the dots -- a VLIW bundle can only pair two ops from one
-            region, so an issue chain emitted around this call can never
-            co-issue with the MXU no matter how it is spelled.
+        issue_fn: Optional `(site, num_sites, bucket_m) -> None`, called once
+            after each matmul site of the quantized path. A caller that
+            gathers its own LHS uses it to emit the next tile's row DMAs from
+            inside this function, which is the only way they land in the same
+            scheduling region as the dots -- a VLIW bundle can only pair two
+            ops from one region, so an issue chain emitted around this call
+            can never co-issue with the MXU no matter how it is spelled.
+            `bucket_m` is the enclosing bucket branch's Python int, so the
+            caller can stage its injection depth to the dot's cover length.
         out_blocked: if non-zero, `tiled_out_ref` (and `partial_out_ref`) carry
             a trailing lane dimension of this size, i.e. the output is declared
             `[..., tile_n // lanes, lanes]` instead of `[..., tile_n]`. That
@@ -568,7 +570,7 @@ def inner_kernel(
 
                     acc_n += block_acc
                     if issue_fn is not None:
-                        issue_fn(site, n_sites)
+                        issue_fn(site, n_sites, bucket_m)
                     site += 1
                 acc_list.append(acc_n)
         acc = jnp.concatenate(acc_list, axis=1)
