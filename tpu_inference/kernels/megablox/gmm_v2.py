@@ -378,6 +378,7 @@ def inner_kernel(
     cfgs: GmmConfigs,
     issue_fn=None,
     out_blocked: int = 0,
+    lhs_fn=None,
 ):
     """Inner kernel invoked by emit_pipeline to perform matmul.
 
@@ -408,6 +409,12 @@ def inner_kernel(
             a trailing lane dimension of this size, i.e. the output is declared
             `[..., tile_n // lanes, lanes]` instead of `[..., tile_n]`. That
             moves bf16's sub-word packing off the axis the output DMA slices.
+        lhs_fn: Optional `(bucket_m) -> bf16[bucket_m, tile_k]`, called inside
+            each bucket branch INSTEAD of slicing `tiled_lhs_ref`. `bucket_m`
+            is a Python int there, so a caller whose LHS needs per-row
+            post-processing (the fused gather's unpack/reshape) can bill that
+            work by the bucket instead of by tile_m -- which is what lets
+            tile_m be a static CAPACITY rather than a cost.
     """
 
     gm_id = pl.program_id(1)
@@ -423,7 +430,10 @@ def inner_kernel(
         mxu_size = tpu_info.mxu_column_size
 
         # Step 1: Input pre-processing.
-        tiled_lhs = tiled_lhs_ref.reshape(-1, cfgs.tiles.tile_k)[:bucket_m]
+        if lhs_fn is not None:
+            tiled_lhs = lhs_fn(bucket_m)
+        else:
+            tiled_lhs = tiled_lhs_ref.reshape(-1, cfgs.tiles.tile_k)[:bucket_m]
         tiled_rhs = tiled_rhs_ref.get_weight()
 
         # This should only be taken in the case where we don't requantize

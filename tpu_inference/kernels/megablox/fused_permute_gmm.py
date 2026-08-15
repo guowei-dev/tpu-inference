@@ -200,6 +200,7 @@ def _fused_permute_gmm_inner(
     out_blocked: int,
     coissue_rows: int,
     traced_slots: bool,
+    windowed_extract: bool,
 ):
     """Pipeline body. rhs/out stay pipelined; the LHS tile is gathered."""
     tile_m = cfgs.tiles.tile_m
@@ -336,6 +337,31 @@ def _fused_permute_gmm_inner(
         return jax.lax.bitcast_convert_type(bits, jnp.float32).astype(
             cfgs.lhs_cfgs.dtype)
 
+    def extract_window(slot, rows):
+        """`extract`, but only rows [0:rows) -- `rows` is a PYTHON int (a
+        bucket size, called from inside inner_kernel's bucket branches via
+        `lhs_fn`), so the unpack/reshape bills the BUCKET, not tile_m. This
+        is what lets tile_m be a static CAPACITY instead of a price
+        (solve tile-trilemma)."""
+        if pool_blocked:
+            return gather_buf[slot, :rows].reshape(rows, tile_k)
+        if packed_pool:
+            bits = gather_buf[slot, :rows]
+            lo_ = jax.lax.bitcast_convert_type(
+                jnp.left_shift(bits, 16), jnp.float32).astype(
+                    cfgs.lhs_cfgs.dtype)
+            hi_ = jax.lax.bitcast_convert_type(
+                jnp.bitwise_and(bits, jnp.int32(-65536)), jnp.float32).astype(
+                    cfgs.lhs_cfgs.dtype)
+            return jnp.concatenate([lo_, hi_], axis=1)
+        if packing == 1:
+            return gather_buf[slot, :rows]
+        sh = 16 * (1 - jnp.bitwise_and(parity_buf[slot, :rows], 1))
+        bits = jnp.bitwise_and(jnp.left_shift(gather_buf[slot, :rows], sh),
+                               jnp.int32(-65536))
+        return jax.lax.bitcast_convert_type(bits, jnp.float32).astype(
+            cfgs.lhs_cfgs.dtype)
+
     def start_rows_unguarded(step, slot, lo, hi):
         """Rows [lo, hi) of `step`'s tile, with NO predicate.
 
@@ -416,9 +442,12 @@ def _fused_permute_gmm_inner(
                 if packing > 1 and not packed_pool:
                     start_parity(s + 1, nxt)
 
-            inner_kernel(extract(slot), tiled_rhs_ref, tiled_out_ref,
+            inner_kernel(None if windowed_extract else extract(slot),
+                         tiled_rhs_ref, tiled_out_ref,
                          partial_out_ref, acc_ref, metadata_ref, cfgs=cfgs,
-                         issue_fn=issue_fn, out_blocked=out_blocked)
+                         issue_fn=issue_fn, out_blocked=out_blocked,
+                         lhs_fn=functools.partial(extract_window, slot)
+                         if windowed_extract else None)
             return
 
         @pl.when(s + 1 < num_steps)
@@ -435,9 +464,12 @@ def _fused_permute_gmm_inner(
         wait_rows(s, slot)
         if packing > 1 and not packed_pool:
             wait_parity(slot)
-        inner_kernel(extract(slot), tiled_rhs_ref, tiled_out_ref,
+        inner_kernel(None if windowed_extract else extract(slot),
+                     tiled_rhs_ref, tiled_out_ref,
                      partial_out_ref, acc_ref, metadata_ref, cfgs=cfgs,
-                     out_blocked=out_blocked)
+                     out_blocked=out_blocked,
+                     lhs_fn=functools.partial(extract_window, slot)
+                     if windowed_extract else None)
 
     @pl.when(s == 0)
     def _():
@@ -505,6 +537,7 @@ def kernel_main_fpg(
     coissue_rows: int,
     traced_slots: bool,
     rhs_buffers: int,
+    windowed_extract: bool,
 ):
     num_k = pl.cdiv(cfgs.dims.size_k, cfgs.tiles.tile_k)
     num_n = pl.cdiv(cfgs.out_size_n, cfgs.tiles.tile_n)
@@ -539,7 +572,8 @@ def kernel_main_fpg(
                              issue_spread=issue_spread,
                              out_blocked=out_blocked,
                              coissue_rows=coissue_rows,
-                             traced_slots=traced_slots)
+                             traced_slots=traced_slots,
+                             windowed_extract=windowed_extract)
 
     pipeline_fn = pltpu.emit_pipeline(body, grid=(num_n, num_gm, num_k),
                                       in_specs=(rhs_spec, ),
@@ -564,7 +598,7 @@ def kernel_main_fpg(
     "acc_dtype", "maybe_quantize_lhs", "zero_initialize", "fuse_act",
     "num_slots", "chunk", "coissue", "packed_pool", "issue_spread",
     "out_blocked", "stage_lhs", "coissue_rows",
-    "traced_slots", "rhs_buffers", "pool_blocked",
+    "traced_slots", "rhs_buffers", "pool_blocked", "windowed_extract",
 ])
 def fused_permute_gmm(
     lhs: jax.Array,  # [size_src, size_k] un-permuted pool
@@ -594,6 +628,7 @@ def fused_permute_gmm(
     traced_slots: bool = True,
     rhs_buffers: int = 3,
     pool_blocked: bool = False,
+    windowed_extract: bool = False,
 ) -> jax.Array:
     """Grouped matmul over `lhs[gather_indices]` without materialising it.
 
@@ -738,7 +773,8 @@ def fused_permute_gmm(
                              coissue_rows=coissue_rows,
                              traced_slots=traced_slots,
                              rhs_buffers=rhs_buffers,
-                             pool_blocked=pool_blocked),
+                             pool_blocked=pool_blocked,
+                             windowed_extract=windowed_extract),
         out_shape=out_init,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=3,
