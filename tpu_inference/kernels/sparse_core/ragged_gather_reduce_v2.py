@@ -93,6 +93,17 @@ class _Scratch:
         return getattr(self, dataclasses.fields(self)[index].name)
 
 
+# Word-slices interleaved per blocked col-loop trip: one slice leaves every
+# vld feeding two short chains with nothing to cover the load-use latency
+# (bundle density 1.59, 148 sdelay slots -> x1.68 vs the 2-D path); two
+# restores the interleave (x1.20); four and eight regress again (register
+# pressure). Even at the optimum the blocked read LOSES to the row-paired
+# 2-D path -- the kernel is issue-bound, not byte-bound (the v7 law), so
+# the halved HBM read cannot pay for the denser unpack. Kept for the
+# record; the 2-D path remains the production form.
+_BLK_UNROLL = 2
+
+
 class _CostModelConstants:
     # Limit on the number of outer loop pipeline iterations. Too many iterations
     # cause high cumulative pipeline overhead (e.g., from frequent pipeline
@@ -520,40 +531,58 @@ def main_kernel(
             prev_dst_vals_vec = prev_dst_val_vmem_sc[row_slice]
 
             def col_loop_blocked(lane_offset):
-                # One u32 word of the blocked view carries TWO logical
-                # columns of one source row (low half = block 2B, high half
-                # = block 2B+1), so each word feeds two accumulate streams;
-                # the HBM gather bytes halve vs the row-paired 2-D view.
+                # One u32 word carries TWO logical columns of one source row
+                # (low half = block 2B, high half = block 2B+1): the HBM
+                # gather bytes halve vs the row-paired 2-D view. The body
+                # processes TWO word-slices per trip: with one slice, every
+                # vld feeds two short dependent chains and the scheduler has
+                # no independent work to cover the load-use latency (SC
+                # bundle dump: density 1.59 with 148 sdelay slots vs the 2-D
+                # path's 3.13) -- the second in-flight load restores the
+                # interleave.
+                offs = tuple(lane_offset + u * num_simd_lanes
+                             for u in range(_BLK_UNROLL))
                 for blk in range(cfg.col_chunk_size // 256):
-                    word_sl = pl.ds(lane_offset, num_simd_lanes)
-                    lo_sl = pl.ds(256 * blk + lane_offset, num_simd_lanes)
-                    hi_sl = pl.ds(256 * blk + 128 + lane_offset,
-                                  num_simd_lanes)
-                    prev_lo = scratch.prev_iter_last_row_vmem[c, lo_sl]
-                    prev_hi = scratch.prev_iter_last_row_vmem[c, hi_sl]
+                    w_sls = [pl.ds(o, num_simd_lanes) for o in offs]
+                    lo_sls = [pl.ds(256 * blk + o, num_simd_lanes)
+                              for o in offs]
+                    hi_sls = [pl.ds(256 * blk + 128 + o, num_simd_lanes)
+                              for o in offs]
+                    accs = [
+                        [scratch.prev_iter_last_row_vmem[c, sl]
+                         for sl in lo_sls],
+                        [scratch.prev_iter_last_row_vmem[c, sl]
+                         for sl in hi_sls],
+                    ]
                     for row_src in range(num_simd_lanes):
-                        word = gather_ref[row_src, blk, word_sl]
-                        data_lo = plsc.bitcast(
-                            jnp.bitwise_and(jnp.left_shift(word, 16),
-                                            jnp.uint32(0xFFFF0000)),
-                            jnp.float32) * tw_slice[row_src]
-                        data_hi = plsc.bitcast(
-                            jnp.bitwise_and(word, jnp.uint32(0xFFFF0000)),
-                            jnp.float32) * tw_slice[row_src]
+                        tw_row = tw_slice[row_src]
                         dst_row_hbm = dst_slice[row_src]
                         if row_src == 0:
                             prev_dst = prev_dst_vals_vec[0]
                         else:
                             prev_dst = dst_slice[row_src - 1]
                         same = dst_row_hbm == prev_dst
-                        acc_lo = jnp.where(same, prev_lo + data_lo, data_lo)
-                        acc_hi = jnp.where(same, prev_hi + data_hi, data_hi)
-                        prev_lo, prev_hi = acc_lo, acc_hi
-                        out_vmem_sc[row_src, lo_sl] = acc_lo
-                        out_vmem_sc[row_src, hi_sl] = acc_hi
-                        if row_src == num_simd_lanes - 1:
-                            scratch.prev_iter_last_row_vmem[c, lo_sl] = acc_lo
-                            scratch.prev_iter_last_row_vmem[c, hi_sl] = acc_hi
+                        words = [gather_ref[row_src, blk, sl] for sl in w_sls]
+                        for u, word in enumerate(words):
+                            data_lo = plsc.bitcast(
+                                jnp.bitwise_and(jnp.left_shift(word, 16),
+                                                jnp.uint32(0xFFFF0000)),
+                                jnp.float32) * tw_row
+                            data_hi = plsc.bitcast(
+                                jnp.bitwise_and(word,
+                                                jnp.uint32(0xFFFF0000)),
+                                jnp.float32) * tw_row
+                            accs[0][u] = jnp.where(
+                                same, accs[0][u] + data_lo, data_lo)
+                            accs[1][u] = jnp.where(
+                                same, accs[1][u] + data_hi, data_hi)
+                            out_vmem_sc[row_src, lo_sls[u]] = accs[0][u]
+                            out_vmem_sc[row_src, hi_sls[u]] = accs[1][u]
+                    for u in range(_BLK_UNROLL):
+                        scratch.prev_iter_last_row_vmem[c, lo_sls[u]] = \
+                            accs[0][u]
+                        scratch.prev_iter_last_row_vmem[c, hi_sls[u]] = \
+                            accs[1][u]
 
             def col_loop(col_compute_offset):
                 col_slice = pl.ds(col_compute_offset, num_simd_lanes)
@@ -604,7 +633,8 @@ def main_kernel(
 
             if cfg.x_blocked:
                 plsc.parallel_loop(0, 128,
-                                   step=num_simd_lanes)(col_loop_blocked)
+                                   step=_BLK_UNROLL * num_simd_lanes)(
+                    col_loop_blocked)
             else:
                 plsc.parallel_loop(0, col_chunk_size,
                                    step=num_simd_lanes)(col_loop)
