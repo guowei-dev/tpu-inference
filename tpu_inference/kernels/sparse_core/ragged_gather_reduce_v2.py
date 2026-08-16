@@ -38,6 +38,7 @@ class _Config:
     in_dtype: Any
     core_axis_name: str
     subcore_axis_name: str
+    x_blocked: bool = False
 
     @property
     def row_chunk_size(self) -> int:
@@ -49,8 +50,12 @@ class _Config:
         """log2 of how many source rows pack into one uint32 gather element.
 
     The SparseCore indirect DMA requires 32-bit elements: bfloat16 packs two
-    source rows per uint32 (shift 1), float32 is 1:1 (shift 0).
+    source rows per uint32 (shift 1), float32 is 1:1 (shift 0). A blocked
+    bf16[rows, H//128, 128] input carries its (2,1) packing on the BLOCK
+    axis under the u32 view, so a u32 row IS one source row (shift 0).
     """
+        if self.x_blocked:
+            return 0
         input_packing = 32 // jax.dtypes.itemsize_bits(self.in_dtype)
         return input_packing.bit_length() - 1
 
@@ -114,6 +119,8 @@ def _fallback_implementation(
     valid_rows_mask: jax.Array,
     reduce_group_size: int,
 ) -> jax.Array:
+    if x.ndim == 3:
+        x = x.reshape(x.shape[0], -1)
     out = x[indices] * topk_weights[:, None].astype(jnp.float32)
     out = jnp.where(valid_rows_mask[:, None], out, 0)
     out = out.reshape(-1, reduce_group_size, out.shape[-1])
@@ -467,10 +474,22 @@ def main_kernel(
             dma_dst_row_vmem_sc[sub] = _pack_scalars_to_vector(
                 dma_dst_rows[s], num_simd_lanes)
 
-        @functools.partial(
-            pltpu.emit_pipeline,
-            grid=(num_row_subchunks, num_col_chunks),
-            in_specs=pl.BlockSpec(
+        if cfg.x_blocked:
+            # One u32 word of the blocked view carries logical columns
+            # (256B + l, low half) and (256B + 128 + l, high half) of ONE
+            # source row; a chunk of col_chunk_size logical columns is
+            # col_chunk_size // 256 whole u32 blocks.
+            in_spec = pl.BlockSpec(
+                (pl.Indirect(num_simd_lanes), col_chunk_size // 256, 128),
+                lambda s, c: (
+                    src_indices_vmem_sc[pl.ds(s * num_simd_lanes,
+                                              num_simd_lanes)],
+                    col_start // col_chunk_size + c,
+                    0,
+                ),
+            )
+        else:
+            in_spec = pl.BlockSpec(
                 (pl.Indirect(num_simd_lanes), col_chunk_size),
                 lambda s, c: (
                     jnp.bitwise_right_shift(
@@ -480,7 +499,12 @@ def main_kernel(
                     ),
                     col_start // col_chunk_size + c,
                 ),
-            ),
+            )
+
+        @functools.partial(
+            pltpu.emit_pipeline,
+            grid=(num_row_subchunks, num_col_chunks),
+            in_specs=in_spec,
             out_specs=(),
         )
         def col_pipeline(gather_ref, sem_inner):
@@ -494,6 +518,42 @@ def main_kernel(
             dst_slice = dst_indices_vmem_sc[row_slice]
             src_idx_slice = src_indices_vmem_sc[row_slice]
             prev_dst_vals_vec = prev_dst_val_vmem_sc[row_slice]
+
+            def col_loop_blocked(lane_offset):
+                # One u32 word of the blocked view carries TWO logical
+                # columns of one source row (low half = block 2B, high half
+                # = block 2B+1), so each word feeds two accumulate streams;
+                # the HBM gather bytes halve vs the row-paired 2-D view.
+                for blk in range(cfg.col_chunk_size // 256):
+                    word_sl = pl.ds(lane_offset, num_simd_lanes)
+                    lo_sl = pl.ds(256 * blk + lane_offset, num_simd_lanes)
+                    hi_sl = pl.ds(256 * blk + 128 + lane_offset,
+                                  num_simd_lanes)
+                    prev_lo = scratch.prev_iter_last_row_vmem[c, lo_sl]
+                    prev_hi = scratch.prev_iter_last_row_vmem[c, hi_sl]
+                    for row_src in range(num_simd_lanes):
+                        word = gather_ref[row_src, blk, word_sl]
+                        data_lo = plsc.bitcast(
+                            jnp.bitwise_and(jnp.left_shift(word, 16),
+                                            jnp.uint32(0xFFFF0000)),
+                            jnp.float32) * tw_slice[row_src]
+                        data_hi = plsc.bitcast(
+                            jnp.bitwise_and(word, jnp.uint32(0xFFFF0000)),
+                            jnp.float32) * tw_slice[row_src]
+                        dst_row_hbm = dst_slice[row_src]
+                        if row_src == 0:
+                            prev_dst = prev_dst_vals_vec[0]
+                        else:
+                            prev_dst = dst_slice[row_src - 1]
+                        same = dst_row_hbm == prev_dst
+                        acc_lo = jnp.where(same, prev_lo + data_lo, data_lo)
+                        acc_hi = jnp.where(same, prev_hi + data_hi, data_hi)
+                        prev_lo, prev_hi = acc_lo, acc_hi
+                        out_vmem_sc[row_src, lo_sl] = acc_lo
+                        out_vmem_sc[row_src, hi_sl] = acc_hi
+                        if row_src == num_simd_lanes - 1:
+                            scratch.prev_iter_last_row_vmem[c, lo_sl] = acc_lo
+                            scratch.prev_iter_last_row_vmem[c, hi_sl] = acc_hi
 
             def col_loop(col_compute_offset):
                 col_slice = pl.ds(col_compute_offset, num_simd_lanes)
@@ -542,8 +602,12 @@ def main_kernel(
                         scratch.prev_iter_last_row_vmem[
                             c, col_slice] = accumulated_data
 
-            plsc.parallel_loop(0, col_chunk_size,
-                               step=num_simd_lanes)(col_loop)
+            if cfg.x_blocked:
+                plsc.parallel_loop(0, 128,
+                                   step=num_simd_lanes)(col_loop_blocked)
+            else:
+                plsc.parallel_loop(0, col_chunk_size,
+                                   step=num_simd_lanes)(col_loop)
 
             # Scatter every source row's reduced value to its output row. Rows
             # that share a group write the same value (idempotent); rows routed to
@@ -619,7 +683,21 @@ def ragged_gather_reduce(
                                         valid_rows_mask, reduce_group_size)
 
     # Step 2: Derive the kernel configuration (core grid and column tiling).
-    hidden_size = x.shape[-1]
+    x_blocked = x.ndim == 3
+    if x_blocked:
+        # bf16[rows, H//128, 128]: the fused-GMM family's blocked producer
+        # contract. Halves the gather's HBM bytes (one u32 row per source
+        # row instead of a row pair).
+        if x.dtype != jnp.bfloat16 or x.shape[-1] != 128:
+            raise ValueError(
+                f"blocked x must be bf16[rows, H//128, 128]; got {x.shape} "
+                f"{x.dtype}")
+        hidden_size = x.shape[1] * x.shape[2]
+        if hidden_size % 256:
+            raise ValueError(f"blocked x needs hidden % 256 == 0; got "
+                             f"{hidden_size}")
+    else:
+        hidden_size = x.shape[-1]
     input_size = indices.size
     num_simd_lanes = sc_info.num_lanes
     num_lanes = pltpu.get_tpu_info().num_lanes
@@ -636,6 +714,15 @@ def ragged_gather_reduce(
     aligned_hidden_size = _align_to(hidden_size, 128 * num_column_partitions)
     col_size = aligned_hidden_size // num_column_partitions
     col_chunk_size = _calculate_col_chunk_size(col_size, num_simd_lanes)
+    if x_blocked:
+        if aligned_hidden_size != hidden_size:
+            raise ValueError(
+                f"blocked x needs hidden ({hidden_size}) already aligned to "
+                f"{128 * num_column_partitions}")
+        if col_chunk_size % 256 or col_size % 256:
+            raise ValueError(
+                f"blocked x needs 256-aligned column tiling; got "
+                f"col_size={col_size} col_chunk_size={col_chunk_size}")
 
     # Step 3: Pre-process inputs (weights, padding, sort by validity).
     # The kernel gathers x through a uint32 reinterpretation; carry the weights
@@ -685,6 +772,7 @@ def ragged_gather_reduce(
         in_dtype=x.dtype,
         core_axis_name=vector_mesh.core_axis_name,
         subcore_axis_name=vector_mesh.subcore_axis_name,
+        x_blocked=x_blocked,
     )
 
     # The output gets one extra row: the kernel's garbage scatter destination.

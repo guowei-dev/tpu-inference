@@ -371,6 +371,32 @@ def generate_block_specs(
 # Define kernels.
 
 
+def _blocked_out_spec(metadata_ref, cfgs):
+    """gmm_v2's out BlockSpec with a trailing `LANES` minor dimension.
+
+    A 2-D bf16[M, N] ref is tiled (16,128) with (2,1) packing: two adjacent
+    ROWS share each 32-bit word, and rows are the axis the output DMA slices.
+    Splitting the last dim moves the packing to the second-minor axis, wholly
+    inside one M index, so the sliced axis becomes word-addressable.
+
+    Caveat at THIS geometry: bf16's tiled pair is (16,128), so the
+    second-minor dim is padded up to 16. With `out_size_n = 1024` that is
+    8 -> 16, which DOUBLES the output array; blockpack only pays for itself
+    when `aligned_n` is a multiple of 2048.
+    """
+    index_map = IndexMaps(metadata_ref, cfgs)
+    bounded = pl.BoundedSlice(cfgs.tiles.tile_m // cfgs.dims.size_lhs_sublane)
+
+    def out_index_map(n_id, gm_id, k_id):
+        rows, _, n = index_map.out_index_map(n_id, gm_id, k_id)
+        return (rows, 0, n, 0)
+
+    return pl.BlockSpec(
+        (bounded, cfgs.dims.size_lhs_sublane,
+         cfgs.tiles.tile_n // pltpu.get_tpu_info().num_lanes,
+         pltpu.get_tpu_info().num_lanes), out_index_map)
+
+
 def inner_kernel(
     # In
     tiled_lhs_ref: jax.Array,
@@ -881,6 +907,7 @@ def kernel_main(
     semaphore_ref: jax.Array | None,  # [1]
     *,
     cfgs: GmmConfigs,
+    out_blocked: int = 0,
 ):
     """Entry point for GMM kernel.
 
@@ -931,6 +958,8 @@ def kernel_main(
         )
 
     (lhs_spec, rhs_spec), out_spec = generate_block_specs(metadata_ref, cfgs)
+    if out_blocked:
+        out_spec = _blocked_out_spec(metadata_ref, cfgs)
 
     if cfgs.fuse_act is not None:
         rhs_up_ref = jax.tree.map(lambda x: x.at[..., cfgs.out_size_n:],
@@ -944,7 +973,7 @@ def kernel_main(
 
     # Execute the inner kernel.
     pipeline_fn = pltpu.emit_pipeline(
-        functools.partial(inner_kernel, cfgs=cfgs),
+        functools.partial(inner_kernel, cfgs=cfgs, out_blocked=out_blocked),
         grid=(num_n, num_gm, num_k),
         in_specs=(lhs_spec, rhs_spec),
         out_specs=out_spec,
@@ -953,7 +982,12 @@ def kernel_main(
     # Bounded slice requires second last dim to be aligned to the sublane size.
     # rhs_ref uses static tiling thus reshape is not needed.
     lhs_in = lhs_ref.reshape(-1, cfgs.dims.size_lhs_sublane, lhs_ref.shape[-1])
-    out_in = out_ref.reshape(-1, cfgs.dims.size_lhs_sublane, out_ref.shape[-1])
+    if out_blocked:
+        out_in = out_ref.reshape(-1, cfgs.dims.size_lhs_sublane,
+                                 out_ref.shape[-2], out_ref.shape[-1])
+    else:
+        out_in = out_ref.reshape(-1, cfgs.dims.size_lhs_sublane,
+                                 out_ref.shape[-1])
     scratches = [partial_out_ref, acc_ref, metadata_ref]
     pipeline_fn(lhs_in, rhs_ref, out_in, scratches=scratches)
 
@@ -1561,6 +1595,7 @@ def get_metadata(cfgs: GmmConfigs) -> dict[str, str | int | float]:
     "maybe_quantize_lhs",
     "zero_initialize",
     "fuse_act",
+    "out_blocked",
 ])
 def gmm_v2(
     lhs: jax.Array,  # [size_m, size_k]
@@ -1580,6 +1615,7 @@ def gmm_v2(
     zero_initialize: bool = True,
     fuse_act: str | None = None,
     gather_indices: jax.Array | None = None,
+    out_blocked: bool = False,
 ) -> jax.Array:
     """GMM kernel implemented with emit_pipeline.
 
@@ -1661,7 +1697,11 @@ def gmm_v2(
     max_num_gm = dims.size_group + pl.cdiv(dims.size_m, tiles.tile_m) - 1
     acc_cols = 2 * tiles.tile_n if cfgs.fuse_act is not None else tiles.tile_n
     scratch_shapes = [
-        # partial_out_ref
+        # partial_out_ref (blocked to match the out declaration when asked)
+        pltpu.VMEM((dims.size_lhs_sublane,
+                    tiles.tile_n // pltpu.get_tpu_info().num_lanes,
+                    pltpu.get_tpu_info().num_lanes),
+                   cfgs.out_dtype) if out_blocked else
         pltpu.VMEM((dims.size_lhs_sublane, tiles.tile_n), cfgs.out_dtype),
         # acc_ref
         pltpu.VMEM((tiles.tile_m, acc_cols), cfgs.acc_dtype),
@@ -1699,7 +1739,22 @@ def gmm_v2(
         scratch_shapes += [None, None]
 
     aligned_n = align_to(cfgs.out_size_n, num_lanes)
-    out_init = jax.ShapeDtypeStruct((dims.size_m, aligned_n), cfgs.out_dtype)
+    if out_blocked:
+        # bf16[M, aligned_n//128, 128]: the sub-word packing moves off the
+        # axis the output DMA slices (the fused kernel's blocked-out form).
+        # Restricted to the plain path with an exact n fit, so the final
+        # column slice below never has to slice a blocked ref.
+        if gather_indices is not None:
+            raise NotImplementedError("out_blocked on the gather path")
+        if aligned_n != cfgs.out_size_n:
+            raise ValueError(
+                f"out_blocked needs out_size_n ({cfgs.out_size_n}) aligned "
+                f"to {num_lanes}")
+        out_init = jax.ShapeDtypeStruct(
+            (dims.size_m, aligned_n // num_lanes, num_lanes), cfgs.out_dtype)
+    else:
+        out_init = jax.ShapeDtypeStruct((dims.size_m, aligned_n),
+                                        cfgs.out_dtype)
     rhs_weights = WeightsRef(weight=rhs, scale=rhs_scale, bias=rhs_bias)
 
     if gather_indices is not None:
@@ -1750,8 +1805,9 @@ def gmm_v2(
         )(group_sizes, group_offset, pool, idx, idx[:, None],
           rhs_weights)[:, :cfgs.out_size_n]
 
-    return pl.pallas_call(
-        functools.partial(kernel_main, cfgs=cfgs),
+    out = pl.pallas_call(
+        functools.partial(kernel_main, cfgs=cfgs,
+                          out_blocked=num_lanes if out_blocked else 0),
         out_shape=out_init,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=2,
@@ -1773,4 +1829,7 @@ def gmm_v2(
         name=get_scope_name(cfgs),
         cost_estimate=get_cost_estimate(cfgs),
         metadata=get_metadata(cfgs),
-    )(group_sizes, group_offset, lhs, rhs_weights)[:, :cfgs.out_size_n]
+    )(group_sizes, group_offset, lhs, rhs_weights)
+    if out_blocked:
+        return out  # bf16[M, out_size_n // 128, 128]; exact fit enforced
+    return out[:, :cfgs.out_size_n]

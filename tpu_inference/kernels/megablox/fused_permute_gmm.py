@@ -103,7 +103,7 @@ from jax.experimental.pallas import tpu as pltpu
 
 from tpu_inference.kernels.megablox.gmm_v2 import (
     FusedWeightsRef,
-    IndexMaps,
+    IndexMaps, _blocked_out_spec,
     GmmConfigs,
     MetadataRef,
     TileSizes,
@@ -155,31 +155,6 @@ def gather_tiling(size_m: int, size_group: int) -> int:
 
 
 LANES = 128
-
-
-def _blocked_out_spec(metadata_ref, cfgs):
-    """gmm_v2's out BlockSpec with a trailing `LANES` minor dimension.
-
-    A 2-D bf16[M, N] ref is tiled (16,128) with (2,1) packing: two adjacent
-    ROWS share each 32-bit word, and rows are the axis the output DMA slices.
-    Splitting the last dim moves the packing to the second-minor axis, wholly
-    inside one M index, so the sliced axis becomes word-addressable.
-
-    Caveat at THIS geometry: bf16's tiled pair is (16,128), so the
-    second-minor dim is padded up to 16. With `out_size_n = 1024` that is
-    8 -> 16, which DOUBLES the output array; blockpack only pays for itself
-    when `aligned_n` is a multiple of 2048.
-    """
-    index_map = IndexMaps(metadata_ref, cfgs)
-    bounded = pl.BoundedSlice(cfgs.tiles.tile_m // cfgs.dims.size_lhs_sublane)
-
-    def out_index_map(n_id, gm_id, k_id):
-        rows, _, n = index_map.out_index_map(n_id, gm_id, k_id)
-        return (rows, 0, n, 0)
-
-    return pl.BlockSpec(
-        (bounded, cfgs.dims.size_lhs_sublane, cfgs.tiles.tile_n // LANES,
-         LANES), out_index_map)
 
 
 def _fused_permute_gmm_inner(
