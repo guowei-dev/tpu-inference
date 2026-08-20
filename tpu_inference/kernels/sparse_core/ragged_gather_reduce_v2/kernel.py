@@ -95,7 +95,11 @@ def _window_kernel(
     # can detect a group continuing across the window boundary. Clamped, so the
     # last window fetches a harmless past-the-end row instead.
     last_start = sorted_by_validity.shape[0] - num_simd_lanes
-    next_window_start = jnp.minimum(window_start + window_words, last_start)
+    # Derived from the partition base rather than from window_start so the two DMA addresses do
+    # not share a dependence chain; the extra multiply pays for itself in scheduling.
+    next_window_start = jnp.minimum(
+        row_partition_id * cfg.row_partition_size_padded +
+        (window_id + 1) * window_words, last_start)
     next_window_rows = sorted_by_validity.at[pl.ds(next_window_start,
                                                    num_simd_lanes)]
     next_window_dma = pltpu.make_async_copy(
