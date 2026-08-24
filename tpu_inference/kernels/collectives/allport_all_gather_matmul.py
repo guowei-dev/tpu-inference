@@ -161,6 +161,7 @@ def _allport_ag_kernel(
     n_blocks,
     bm,
     xs_slots,
+    arm_ahead,
     axis_name,
     ablate,
 ):
@@ -273,12 +274,13 @@ def _allport_ag_kernel(
             o_live[os_] = None
         col, width = n_blocks[nb]
         win = y_win(width)
-        # fp32 accumulate, then one narrowing store. Mosaic's tpu.matmul
-        # rejects a non-fp32 preferred_element_type, so the [bm, bn] fp32
-        # landing value is structural, not a choice.
-        o_vmem[os_, pl.ds(0, rows), win] = jnp.dot(
-            xs_vmem[xs, pl.ds(0, rows), slice(None)], y_vmem[:, win],
-            preferred_element_type=jnp.float32).astype(o_vmem.dtype)
+        if ablate != 4:
+            # fp32 accumulate, then one narrowing store. Mosaic's tpu.matmul
+            # rejects a non-fp32 preferred_element_type, so the [bm, bn] fp32
+            # landing value is structural, not a choice.
+            o_vmem[os_, pl.ds(0, rows), win] = jnp.dot(
+                xs_vmem[xs, pl.ds(0, rows), slice(None)], y_vmem[:, win],
+                preferred_element_type=jnp.float32).astype(o_vmem.dtype)
         started, at = [], 0
         for (pi, poff, prows) in batch:
             p = pieces[pi]
@@ -294,7 +296,7 @@ def _allport_ag_kernel(
         o_live[os_] = started
         dot_i[0] += 1
 
-    def run(batch_list, nb, arm=None):  # noqa: C901
+    def run(batch_list, nb, arm=None, ahead=1):  # noqa: C901
         """Software-pipelined dot loop.
 
         `arm(i)` runs before batch i's staging load is issued and is where the
@@ -310,17 +312,23 @@ def _allport_ag_kernel(
                     arm(i)
             return
         depth = min(xs_slots - 1, len(batch_list))
-        for i in range(depth):
+        # The arrival waits run `ahead` batches in front of the staging loads,
+        # because an arrival is not only a dot's operand: the actions behind it
+        # ISSUE the next rounds' messages. Tying the waits to the staging depth
+        # made the dot loop gate when the wire advances, which is why the wire
+        # inside the full kernel is longer than the wire measured alone.
+        lead = min(max(depth, depth * ahead), len(batch_list))
+        for i in range(lead):
             if arm:
                 arm(i)
+        for i in range(depth):
             start_load(batch_list[i])
         for i, batch in enumerate(batch_list):
             emit_dot(batch, nb)
-            j = i + depth
-            if j < len(batch_list):
-                if arm:
-                    arm(j)
-                start_load(batch_list[j])
+            if arm and i + lead < len(batch_list):
+                arm(i + lead)
+            if i + depth < len(batch_list):
+                start_load(batch_list[i + depth])
         for os_ in range(2):
             if o_live[os_] is not None:
                 for cp in o_live[os_]:
@@ -341,7 +349,8 @@ def _allport_ag_kernel(
     def ici_arrival(s, b, j, fwd_slot, fwd_label):
         def go():
             ici_op((s, b, j)).wait()
-            tw_op(fwd_slot, fwd_label, b).start()
+            if ablate != 5:
+                tw_op(fwd_slot, fwd_label, b).start()
             # This arrival fills ladder position j + 2^s, which is the payload
             # of that position's message in EVERY later round — start them all
             # now. With the j == 0 messages issued up front, that covers the
@@ -354,7 +363,8 @@ def _allport_ag_kernel(
 
     def tw_arrival(slot, label, band):
         def go():
-            tw_op(slot, label, band).wait()
+            if ablate != 5:
+                tw_op(slot, label, band).wait()
 
         return go
 
@@ -386,7 +396,7 @@ def _allport_ag_kernel(
 
     # ---- program -------------------------------------------------------
     y_load(0).start()
-    if ablate != 1:
+    if ablate not in (1, 5):
         for slot, label, band in tw_own:
             tw_op(slot, label, band).start()
 
@@ -402,7 +412,7 @@ def _allport_ag_kernel(
     # boundary — and with half the data arriving in the last round that is
     # where the overlap has to hold.
     bl = _batches(pieces, bm, m_per)
-    run(bl, 0, arm=None if ablate == 1 else arm_for(0, bl))
+    run(bl, 0, arm=None if ablate == 1 else arm_for(0, bl), ahead=arm_ahead)
 
     for nb in range(1, len(n_blocks)):
         if ablate == 2:
@@ -461,13 +471,18 @@ def allport_all_gather_matmul(
     mesh,
     axis_name,
     collective_id: int = _COLLECTIVE_ID,
+    arm_ahead: int = 1,
     ablate: int = 0,
 ):
     """all_gather(x, axis=0) @ y, all-port parity-plane kernel.
 
     ablate (instrumentation only — the RESULT IS WRONG for ablate != 0):
     1 = compute path with no wire at all, 2 = wire path with no dots or
-    staging. Ops are skipped identically on every device, so neither deadlocks.
+    staging, 4 = everything EXCEPT the MXU (full wire, full staging and output
+    DMA traffic, no dot) — the discriminator between resource contention and
+    scheduling stalls, 5 = full minus the D2D twin forwards, which is the one
+    part of the wire whose issue point sits INSIDE the peer's dot loop. Ops are
+    skipped identically on every device, so none of them deadlocks.
 
     x: [M, k] P(axis, None), y: [k, n] P(None, axis) -> out [M, n // tp]
     P(None, axis). Mesh from topology.make_collective_mesh('hier').
@@ -525,6 +540,7 @@ def allport_all_gather_matmul(
             n_blocks=n_blocks,
             bm=bm,
             xs_slots=xs_slots,
+            arm_ahead=arm_ahead,
             axis_name=axis_name,
             ablate=ablate,
         )
