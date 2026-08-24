@@ -30,7 +30,7 @@ jax.config.parse_flags_with_absl()
 
 def _simulate(num_dims, m_per):
     """Run the static program on every device; return the plan it ran."""
-    ladder, pieces, groups, loc = aag._plan(num_dims, m_per)
+    ladder, pieces, loc = aag._plan(num_dims, m_per)
     num_bands = ladder["num_bands"]
     ndev = 2 << num_dims
     # gather[dev][row] = (source device, source row within its chunk)
@@ -130,6 +130,41 @@ class AllportAgScheduleTest(parameterized.TestCase):
         self.assertEqual(aag._plan(3, 512)[0]["num_bands"], 3)
         self.assertEqual(aag._plan(3, 32)[0]["num_bands"], 2)
         self.assertEqual(aag._plan(3, 16)[0]["num_bands"], 1)
+
+    def test_consumption_orders(self):
+        """`order` decides when a piece is WAITED, so it decides whether ready
+        rows sit unread. A message goes out when ladder position j is in hand,
+        so every round's j == 0 message is issued at t = 0 — `issue` puts them
+        all at the head, `head` moves only those, `round` moves none."""
+        keys = {o: [p["key"] for p in aag._plan(3, 512, o)[1]
+                    if p["key"] is not None]
+                for o in ("round", "issue", "head")}
+        rounds = {o: [k[0] for k in v] for o, v in keys.items()}
+        self.assertEqual(rounds["round"], sorted(rounds["round"]))
+        self.assertEqual([k[2] for k in keys["issue"]],
+                         sorted(k[2] for k in keys["issue"]))
+        for o in ("issue", "head"):
+            # 2 parities x num_bands x one message per round at the head
+            self.assertEqual(sorted({k[0] for k in keys[o][:2 * 3 * 3]}),
+                             [0, 1, 2], o)
+        # `head` keeps round order behind that prefix
+        tail = rounds["head"][2 * 3 * 3:]
+        self.assertEqual(tail, sorted(tail))
+        for o in ("round", "issue", "head"):
+            self.assertEqual(sorted(keys[o]), sorted(keys["round"]), o)
+
+    @parameterized.parameters("round", "issue", "head")
+    def test_every_order_gathers_correctly(self, order):
+        ladder, pieces, loc = aag._plan(3, 512, order)
+        self.assertLen({(p["par"], p["label"], p["band"]) for p in pieces},
+                       len(pieces))
+        offs = sorted((p["g_off"], p["rows"]) for p in pieces)
+        at = 0
+        for off, rows in offs:  # a partition of [0, m) with no hole or overlap
+            self.assertEqual(off, at)
+            at += rows
+        self.assertEqual(at, 512 * 16)
+        self.assertLen(loc, len(pieces))
 
 
 if __name__ == "__main__":

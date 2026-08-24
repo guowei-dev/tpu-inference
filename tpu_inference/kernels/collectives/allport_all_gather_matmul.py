@@ -74,43 +74,81 @@ def _band_rows(m_per, num_bands):
             for i in range(num_bands)]
 
 
-def _plan(num_dims, m_per):
-    """Static gather-buffer layout, in ARRIVAL order.
+def _plan(num_dims, m_per, order="head"):
+    """Static gather-buffer layout, in expected-ARRIVAL order.
 
-    Rows [0, m_per) hold the local chunk and [m_per, 2 m_per) the twin's; then
-    one contiguous block per round, own parity before the twin forwards. A
-    round's arrivals are therefore a contiguous row range, which is what lets
-    the compute batch them into full-height dots without a gather.
+    Rows [0, m_per) are the local chunk and [m_per, 2 m_per) the twin's; the
+    remaining pieces are laid out in the order the compute wants to consume
+    them, which is the order they are expected to LAND.
+
+    `order` picks that consumption order, and the right key is a message's
+    ISSUE time, not the round that carries it: message (s, b, j) goes out as
+    soon as ladder position j is in hand, so every round's `j == 0` message is
+    issued at t = 0 and a round-2 arrival lands alongside a round-0 one, on a
+    different port. (Ordering by DELIVERY position would be no different from
+    round order: round s delivers exactly positions [2^s, 2^(s+1)).)
+
+      round  the ladder's own order. A batch never spans two rounds, so it
+             never waits on a late piece to dot early rows — but the MXU
+             starves early, because only num_bands pieces per parity are at
+             the head of the buffer.
+      issue  sort by j: 3 x num_bands pieces per parity at the head. Measured
+             a large-M lever and a mid-M regression (h8192_d20736 X=8192
+             657 -> 590 us, X=1024 115 -> 129), because once rounds interleave
+             a bm-row batch can span them and waits for the latest.
+      head   only the j == 0 messages move to the front; the rest keep round
+             order. THE DEFAULT: measured against `round` at 12 cells it wins
+             9-11% from X = 4096 (h8192_d20736 X=8192 657 -> 605, X=4096
+             342 -> 320, h4096_d20736 X=8192 384 -> 348) and is within noise
+             everywhere else — no measured regression. `issue` beats it again
+             on h8192 (581 / 304 / 174 at X = 8192 / 4096 / 2048) but costs
+             +3.3% at h4096_d20736 X=2048, so it stays opt-in.
     """
     num_bands = max(1, min(num_dims, m_per // _ROW_GRAN))
     ladder = topology.allport_ag_ladder(num_dims, num_bands)
     rows = _band_rows(m_per, num_bands)
     starts = [sum(rows[:b]) for b in range(num_bands)]
-    pieces, groups = [], []
+    pieces = []
 
-    def add(par, label, band):
+    def add(par, label, band, key):
         pieces.append(
-            dict(par=par, label=label, band=band, rows=rows[band],
+            dict(par=par, label=label, band=band, rows=rows[band], key=key,
                  out_off=starts[band],
                  g_off=(pieces[-1]["g_off"] +
                         pieces[-1]["rows"] if pieces else 0)))
 
     for par in (0, 1):
         for b in range(num_bands):
-            add(par, 0, b)
-    groups.append((0, len(pieces)))
-    for s in range(num_dims):
-        lo = len(pieces)
+            add(par, 0, b, None)
+    arrivals = [(s, b, j) for s in range(num_dims)
+                for b in range(num_bands) for j in range(1 << s)]
+    # k = (s, b, j); k[2] == j is the position whose payload the message
+    # carries, so it is also when the message can be issued.
+    sort_key, wave_of = {
+        "round": (lambda k: (k[0], k[2], k[1]), lambda k: k[0]),
+        "issue": (lambda k: (k[2], k[0], k[1]), lambda k: k[2]),
+        "head": (lambda k: (min(k[2], 1), k[0], k[2], k[1]),
+                 lambda k: (min(k[2], 1), k[0])),
+    }[order]
+    arrivals.sort(key=sort_key)
+    # Within a wave the ICI arrivals come before the D2D forwards of the same
+    # wave, because a forward is that arrival relayed by the twin and can only
+    # land later. Interleaving the two parities instead costs 12-16% at mid M.
+    i = 0
+    while i < len(arrivals):
+        j = i
+        while (j < len(arrivals)
+               and wave_of(arrivals[j]) == wave_of(arrivals[i])):
+            j += 1
         for par in (0, 1):
-            for j in range(1 << s):
-                for b in range(num_bands):
-                    add(par, ladder["recvs"][(s, b, j)], b)
-        groups.append((lo, len(pieces)))
+            for key in arrivals[i:j]:
+                add(par, ladder["recvs"][key], key[1], key)
+        i = j
 
     loc = {(p["par"], p["label"], p["band"]): (p["g_off"], p["rows"])
            for p in pieces}
     assert pieces[-1]["g_off"] + pieces[-1]["rows"] == m_per * (2 << num_dims)
-    return ladder, pieces, groups, loc
+    return ladder, pieces, loc
 
 
 def _batches(pieces, bm, split_at):
@@ -155,7 +193,6 @@ def _allport_ag_kernel(
     *,
     ladder,
     pieces,
-    groups,
     loc,
     m_per,
     n_blocks,
@@ -370,16 +407,23 @@ def _allport_ag_kernel(
 
     for b in range(num_bands):
         act(num_bands + b, tw_arrival(*tw_own[b]))
+    fwd = {}  # (s, b, j) -> its twin-forward slot
     for s in range(num_dims):
-        lo = groups[s + 1][0]
-        n_par = num_bands << s
         t = 0
         for j in range(1 << s):
             for b in range(num_bands):
-                fwd_slot, fwd_label, _ = tw_keys[s][t]
-                act(lo + t, ici_arrival(s, b, j, fwd_slot, fwd_label))
-                act(lo + n_par + t, tw_arrival(*tw_keys[s][t]))
+                fwd[(s, b, j)] = tw_keys[s][t]
                 t += 1
+    # The plan lays pieces out in expected-arrival order, so wire each action
+    # to the piece it belongs to rather than to a round's offset.
+    for i, pc in enumerate(pieces):
+        if pc["key"] is None:
+            continue
+        slot, label, band = fwd[pc["key"]]
+        if pc["par"] == 0:
+            act(i, ici_arrival(*pc["key"], slot, label))
+        else:
+            act(i, tw_arrival(slot, label, band))
 
     def arm_for(lo, batch_list):
         """arm(i): run every pending action for the pieces batch i reads."""
@@ -472,6 +516,7 @@ def allport_all_gather_matmul(
     axis_name,
     collective_id: int = _COLLECTIVE_ID,
     arm_ahead: int = 1,
+    order: str = "head",
     ablate: int = 0,
 ):
     """all_gather(x, axis=0) @ y, all-port parity-plane kernel.
@@ -512,7 +557,7 @@ def allport_all_gather_matmul(
     if num_dims == 0 or (1 << num_dims) != num_chips:
         raise ValueError("all-port AG-MM needs a power-of-two chip count >= 2")
 
-    ladder, pieces, groups, loc = _plan(num_dims, m_per)
+    ladder, pieces, loc = _plan(num_dims, m_per, order)
     n_blocks, bm, xs_slots, vmem_need = _pick_config(m, m_per, n_per, k,
                                                      x.dtype.itemsize)
 
@@ -534,7 +579,6 @@ def allport_all_gather_matmul(
             _allport_ag_kernel,
             ladder=ladder,
             pieces=pieces,
-            groups=groups,
             loc=loc,
             m_per=m_per,
             n_blocks=n_blocks,
