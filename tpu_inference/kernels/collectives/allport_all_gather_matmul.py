@@ -65,6 +65,10 @@ _VMEM_SLACK_BYTES = 6 * 1024 * 1024
 # boundaries, so every band is a multiple of 16 rows.
 _ROW_GRAN = 16
 
+# One MXU pass. A dot shorter than this runs at roughly bm / 128 occupancy, so
+# it is the threshold _pick_config trades an extra n block against.
+_MXU_ROWS = 128
+
 
 def _band_rows(m_per, num_bands):
     """Split m_per rows into num_bands pieces, each a multiple of _ROW_GRAN."""
@@ -467,7 +471,7 @@ def _allport_ag_kernel(
 
 
 def _pick_config(m, m_per, n_per, k, itemsize):
-    """(n blocks, bm, xs_slots, vmem bytes) — first configuration that fits.
+    """(n blocks, bm, xs_slots, vmem bytes) — the best configuration that fits.
 
     A lane-ragged n // tp can only be sliced two ways: at a 128-aligned offset
     with a 128-multiple width, or as a ref's whole extent. So every block but
@@ -475,8 +479,19 @@ def _pick_config(m, m_per, n_per, k, itemsize):
     and the VMEM buffers are sized to that last block — the ragged block is
     then the buffer's full extent while the aligned ones are legal
     sub-windows. Nothing is re-computed and no column is padded.
+
+    Taking the FIRST grid_n that fits is wrong, and expensively so: where the
+    whole-y block only just fits (56.0 of the 57.9 MiB budget at k=8192,
+    n_per=3584) grid_n=1 leaves the staging pipeline 1.9 MiB and bm collapses
+    to 16 rows — an MXU at ~bm/128 occupancy while the wire account still looks
+    perfect. Measured 532 -> 165 us at m=1024 on that shape, ABBA, spread 0.05%.
+    So: the smallest grid_n whose dot reaches a full MXU pass (each extra block
+    re-streams the gathered rows, and grid_n 3/4 measured 185/184 against
+    grid_n 2's 165), falling back to the tallest dot when none does. Selects
+    the identical config at all 96 cells of the recorded (H, D) x X grid.
     """
     budget = _VMEM_CAP_BYTES - _VMEM_SLACK_BYTES
+    cands = []
     for grid_n in (1, 2, 3, 4, 6, 8):
         if grid_n == 1:
             head, bn = n_per, n_per
@@ -494,19 +509,26 @@ def _pick_config(m, m_per, n_per, k, itemsize):
         # (301 -> 330 us at h4096_d20736 X=8192). The prefetch is worth more
         # than the reload.
         for xs_slots in (3, 2):
-            for bm in (512, 384, 256, 192, 128, 64, 32, 16):
-                if bm > m or bm % _ROW_GRAN:
-                    continue
-                need = (y_bytes + xs_slots * bm * k * itemsize +
-                        bm * bn * 4 + 2 * bm * bn * itemsize)
-                if need <= budget:
-                    blocks = [(j * head, head) for j in range(grid_n - 1)]
-                    blocks.append(((grid_n - 1) * head, bn))
-                    return blocks, bm, xs_slots, need
-    raise ValueError(
-        f"all-port AG-MM does not fit at m_per={m_per}, n_per={n_per}, "
-        f"k={k}: one 128-column block of y alone needs "
-        f"{k * 128 * itemsize / 2**20:.1f} MiB.")
+            best = next((bm for bm in (512, 384, 256, 192, 128, 64, 32, 16)
+                         if bm <= m and not bm % _ROW_GRAN
+                         and y_bytes + xs_slots * bm * k * itemsize
+                         + bm * bn * 4 + 2 * bm * bn * itemsize <= budget), None)
+            if best is not None:
+                cands.append((grid_n, head, bn, best, xs_slots,
+                              y_bytes + xs_slots * best * k * itemsize
+                              + best * bn * 4 + 2 * best * bn * itemsize))
+                break
+    if not cands:
+        raise ValueError(
+            f"all-port AG-MM does not fit at m_per={m_per}, n_per={n_per}, "
+            f"k={k}: one 128-column block of y alone needs "
+            f"{k * 128 * itemsize / 2**20:.1f} MiB.")
+    full = [c for c in cands if c[3] >= _MXU_ROWS]
+    grid_n, head, bn, bm, xs_slots, need = (
+        full[0] if full else max(cands, key=lambda c: (c[3], -c[0])))
+    blocks = [(j * head, head) for j in range(grid_n - 1)]
+    blocks.append(((grid_n - 1) * head, bn))
+    return blocks, bm, xs_slots, need
 
 
 def allport_all_gather_matmul(

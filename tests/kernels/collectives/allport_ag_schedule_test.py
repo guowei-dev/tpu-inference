@@ -153,6 +153,47 @@ class AllportAgScheduleTest(parameterized.TestCase):
         for o in ("round", "issue", "head"):
             self.assertEqual(sorted(keys[o]), sorted(keys["round"]), o)
 
+    def test_pick_config_reaches_a_full_mxu_pass(self):
+        """A whole-y block that only just fits starves the dot, so grid_n = 1
+        is not automatically the right choice.
+
+        At k=8192, n_per=3584 the weight takes 56.0 of the 57.9 MiB budget and
+        the first-fit rule left bm = 16 — an MXU at ~12% occupancy, measured
+        532 us against 165 for the same call at grid_n = 2."""
+        for m in (256, 1024, 8192):
+            blocks, bm, _, need = aag._pick_config(m, m // 8, 3584, 8192, 2)
+            self.assertGreater(len(blocks), 1, m)
+            self.assertGreaterEqual(bm, aag._MXU_ROWS, m)
+            self.assertLessEqual(need,
+                                 aag._VMEM_CAP_BYTES - aag._VMEM_SLACK_BYTES)
+
+    def test_pick_config_prefers_the_fewest_blocks_that_do(self):
+        """Each extra n block re-streams the gathered rows (grid_n 3/4 measured
+        185/184 us against grid_n 2's 165), so the search stops at the first
+        grid_n reaching a pass rather than maximising the dot height."""
+        blocks, bm, _, _ = aag._pick_config(1024, 128, 3584, 8192, 2)
+        self.assertLen(blocks, 2)
+        self.assertEqual(bm, 384)          # grid_n 3 would give bm 512
+
+    def test_pick_config_falls_back_to_the_tallest_dot(self):
+        """When no split reaches a full pass the rule must still return the
+        best available config, not the first one."""
+        blocks, bm, _, _ = aag._pick_config(64, 64, 3584, 8192, 2)
+        self.assertEqual(bm, 64)           # m caps it below _MXU_ROWS
+        self.assertGreater(len(blocks), 1)
+
+    def test_pick_config_unchanged_on_the_measured_grid(self):
+        """The recorded (H, D) x X table was measured at the first-fit configs;
+        the rule must reproduce every one of them or the table is stale."""
+        want = {(4096, 20736, 8192): (1, 512), (4096, 43776, 8192): (1, 192),
+                (8192, 20736, 8192): (1, 256), (8192, 43776, 8192): (2, 192),
+                (8192, 44544, 2048): (2, 128), (4096, 22272, 2048): (1, 512),
+                (8192, 45056, 256): (2, 192)}
+        for (h, d, x), (grid_n, bm) in want.items():
+            blocks, got_bm, _, _ = aag._pick_config(x, x // 16, 2 * d // 16, h,
+                                                    2)
+            self.assertEqual((len(blocks), got_bm), (grid_n, bm), (h, d, x))
+
     @parameterized.parameters("round", "issue", "head")
     def test_every_order_gathers_correctly(self, order):
         ladder, pieces, loc = aag._plan(3, 512, order)
